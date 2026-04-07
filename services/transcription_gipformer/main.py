@@ -1,7 +1,7 @@
-"""Native GIPFormer Vietnamese ASR service with speaker diarization.
+"""Native GIPFormer Vietnamese ASR service.
 
-Runs on the host (not Docker) — uses sherpa-onnx for transcription and
-pyannote-audio for speaker diarization.
+Runs on the host (not Docker) — uses sherpa-onnx for transcription.
+Speaker diarization is handled by the standalone diarization service (port 8097).
 
 Start:
     ./scripts/start-gipformer.sh
@@ -24,7 +24,7 @@ from pydantic import BaseModel
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-app = FastAPI(title="Oasis Transcription (GIPFormer Vietnamese + Diarization)")
+app = FastAPI(title="Oasis Transcription (GIPFormer Vietnamese)")
 
 app.add_middleware(
     CORSMiddleware,
@@ -33,9 +33,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-HF_TOKEN = os.getenv("HF_TOKEN", "")
-# Set globally so pyannote's internal hf_hub_download calls also use it
-os.environ["HF_TOKEN"] = HF_TOKEN
 
 # ── GIPFormer model ─────────────────────────────────────────────────────────
 
@@ -79,34 +76,6 @@ def _ensure_recognizer():
         decoding_method="greedy_search",
     )
     logger.info("GIPFormer model ready (int8)")
-
-
-# ── Pyannote diarization ────────────────────────────────────────────────────
-
-_diarization_pipeline = None
-
-
-def _ensure_diarization():
-    """Lazy-load the pyannote speaker diarization pipeline."""
-    global _diarization_pipeline
-    if _diarization_pipeline is not None:
-        return
-
-    import torch
-    from pyannote.audio import Pipeline
-
-    logger.info("Loading pyannote speaker-diarization-3.1...")
-    _diarization_pipeline = Pipeline.from_pretrained(
-        "pyannote/speaker-diarization-3.1",
-        token=HF_TOKEN,
-    )
-
-    # Use MPS (Apple Silicon GPU) if available for faster inference
-    if torch.backends.mps.is_available():
-        _diarization_pipeline.to(torch.device("mps"))
-        logger.info("Pyannote diarization pipeline ready (MPS accelerated)")
-    else:
-        logger.info("Pyannote diarization pipeline ready (CPU)")
 
 
 # ── Core logic ──────────────────────────────────────────────────────────────
@@ -190,82 +159,11 @@ def _transcribe_samples(samples: np.ndarray, sample_rate: int) -> str:
 
 
 def _transcribe_plain(audio_path: str) -> str:
-    """Transcribe without diarization."""
+    """Transcribe audio file."""
     samples, sr = sf.read(audio_path, dtype="float32")
     if samples.ndim > 1:
         samples = samples.mean(axis=1)
     return _transcribe_samples(samples, sr)
-
-
-def _transcribe_with_diarization(audio_path: str) -> str:
-    """Diarize then transcribe each speaker segment."""
-    import torch
-    import torchaudio
-
-    _ensure_diarization()
-    _ensure_recognizer()
-
-    logger.info("Running speaker diarization on %s...", Path(audio_path).name)
-
-    # Load audio with torchaudio (bypasses broken torchcodec)
-    waveform, sr = torchaudio.load(audio_path)
-    if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=True)
-
-    # pyannote accepts pre-loaded audio as a dict to avoid torchcodec
-    output = _diarization_pipeline({"waveform": waveform, "sample_rate": sr})
-
-    # DiarizeOutput wraps an Annotation — extract it
-    diarization = getattr(output, "speaker_diarization", output)
-
-    # Convert to numpy for GIPFormer
-    samples = waveform.squeeze().numpy()
-
-    # Collect segments per speaker
-    segments: list[tuple[str, float, float]] = []
-    for turn, _, speaker in diarization.itertracks(yield_label=True):
-        segments.append((speaker, turn.start, turn.end))
-
-    if not segments:
-        logger.warning("No speakers detected, falling back to plain transcription")
-        return _transcribe_samples(samples, sr)
-
-    # Merge consecutive segments from the same speaker (within 1s gap)
-    merged: list[tuple[str, float, float]] = [segments[0]]
-    for speaker, start, end in segments[1:]:
-        prev_speaker, prev_start, prev_end = merged[-1]
-        if speaker == prev_speaker and start - prev_end < 1.0:
-            merged[-1] = (speaker, prev_start, end)
-        else:
-            merged.append((speaker, start, end))
-
-    logger.info("Diarization: %d segments, %d speakers",
-                len(merged), len(set(s for s, _, _ in merged)))
-
-    # Transcribe each segment
-    lines = []
-    skipped = 0
-    for speaker, start, end in merged:
-        start_sample = int(start * sr)
-        end_sample = int(end * sr)
-        segment_samples = samples[start_sample:end_sample]
-
-        # Skip very short segments (< 0.5s)
-        if len(segment_samples) < sr * 0.5:
-            skipped += 1
-            continue
-
-        text = _transcribe_samples(segment_samples, sr)
-        if text:
-            minutes_s = int(start) // 60
-            seconds_s = int(start) % 60
-            lines.append(f"[{minutes_s:02d}:{seconds_s:02d}] {speaker}: {text}")
-        else:
-            skipped += 1
-
-    logger.info("Transcribed %d segments, skipped %d (silent/hallucinated)", len(lines), skipped)
-
-    return "\n".join(lines)
 
 
 # ── API ──────────────────────────────────────────────────────────────────────
@@ -273,7 +171,6 @@ def _transcribe_with_diarization(audio_path: str) -> str:
 class TranscribeResponse(BaseModel):
     text: str
     duration_ms: int
-    speakers: int = 0
 
 
 @app.get("/health")
@@ -281,15 +178,14 @@ async def health():
     return {"status": "ok", "service": "transcription-gipformer", "model": REPO_ID}
 
 
-# Only allow one transcription at a time — MPS segfaults on concurrent pyannote
 _transcribe_lock = asyncio.Semaphore(1)
 
 
 @app.post("/transcribe", response_model=TranscribeResponse)
-async def transcribe(file: UploadFile, diarize: bool = True):
-    """Transcribe Vietnamese audio, optionally with speaker diarization.
+async def transcribe(file: UploadFile):
+    """Transcribe Vietnamese audio.
 
-    Query param ?diarize=false to skip diarization.
+    Speaker diarization is handled separately by the diarization service (port 8097).
     """
     suffix = Path(file.filename or "audio.wav").suffix or ".wav"
     with tempfile.NamedTemporaryFile(suffix=suffix, delete=False) as tmp:
@@ -299,9 +195,7 @@ async def transcribe(file: UploadFile, diarize: bool = True):
     t0 = time.monotonic()
     try:
         async with _transcribe_lock:
-            # Diarization is now handled by the standalone diarization service (port 8097).
-            # GIPFormer only does transcription — always use plain mode.
-            logger.info("Acquired transcribe lock for %s (diarize param ignored, using plain mode)", file.filename)
+            logger.info("Transcribing %s...", file.filename)
             text = await asyncio.wait_for(
                 asyncio.to_thread(_transcribe_plain, tmp_path),
                 timeout=600.0,
@@ -314,17 +208,8 @@ async def transcribe(file: UploadFile, diarize: bool = True):
         Path(tmp_path).unlink(missing_ok=True)
 
     elapsed_ms = int((time.monotonic() - t0) * 1000)
-
-    # Count unique speakers from diarized output
-    speaker_count = len(set(
-        line.split("] ")[1].split(":")[0]
-        for line in text.split("\n")
-        if "] " in line and ":" in line
-    )) if diarize else 0
-
-    logger.info("Transcribed %s in %dms → %d chars, %d speakers",
-                file.filename, elapsed_ms, len(text), speaker_count)
-    return TranscribeResponse(text=text, duration_ms=elapsed_ms, speakers=speaker_count)
+    logger.info("Transcribed %s in %dms → %d chars", file.filename, elapsed_ms, len(text))
+    return TranscribeResponse(text=text, duration_ms=elapsed_ms)
 
 
 if __name__ == "__main__":

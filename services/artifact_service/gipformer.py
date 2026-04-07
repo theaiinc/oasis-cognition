@@ -1,7 +1,8 @@
 """GIPFormer Vietnamese ASR — calls the native host service at port 8098.
 
 The GIPFormer service runs natively on the host (not in Docker) using
-sherpa-onnx + pyannote for transcription with speaker diarization.
+sherpa-onnx for transcription. Speaker diarization is handled by the
+standalone diarization service (port 8097).
 """
 
 from __future__ import annotations

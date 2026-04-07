@@ -1,0 +1,466 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Oasis Cognition — Live</title>
+  <script src="https://unpkg.com/livekit-client@2.9.1/dist/livekit-client.umd.js"></script>
+  <style>
+    :root {
+      --bg: #0d1117; --surface: #161b22; --border: #30363d;
+      --text: #e6edf3; --muted: #8b949e; --accent: #58a6ff;
+      --green: #3fb950; --red: #f85149; --orange: #d29922;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; display: flex; flex-direction: column; }
+
+    header { background: var(--surface); border-bottom: 1px solid var(--border); padding: 12px 24px; display: flex; align-items: center; gap: 16px; }
+    header h1 { font-size: 18px; font-weight: 600; }
+    header h1 span { color: var(--accent); }
+    .status-badge { font-size: 12px; padding: 2px 10px; border-radius: 12px; background: var(--border); color: var(--muted); }
+    .status-badge.connected { background: rgba(63,185,80,0.15); color: var(--green); }
+    .status-badge.error { background: rgba(248,81,73,0.15); color: var(--red); }
+
+    main { flex: 1; display: flex; padding: 16px; gap: 16px; }
+
+    /* Left: video/screen area */
+    .media-panel { flex: 2; display: flex; flex-direction: column; gap: 12px; }
+    .video-grid { flex: 1; display: grid; grid-template-columns: 1fr; gap: 8px; min-height: 300px; }
+    .video-grid.has-screen { grid-template-columns: 1fr 1fr; }
+    .video-slot { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; position: relative; display: flex; align-items: center; justify-content: center; min-height: 200px; }
+    .video-slot video { width: 100%; height: 100%; object-fit: contain; }
+    .video-slot .label { position: absolute; bottom: 8px; left: 8px; background: rgba(0,0,0,0.7); color: #fff; font-size: 12px; padding: 2px 8px; border-radius: 4px; }
+    .video-slot .placeholder { color: var(--muted); font-size: 14px; }
+
+    /* Controls */
+    .controls { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+    .controls button { padding: 8px 16px; border-radius: 6px; border: 1px solid var(--border); background: var(--surface); color: var(--text); cursor: pointer; font-size: 13px; display: flex; align-items: center; gap: 6px; transition: all 0.15s; }
+    .controls button:hover { border-color: var(--accent); }
+    .controls button.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+    .controls button.danger { border-color: var(--red); color: var(--red); }
+    .controls button.danger:hover { background: var(--red); color: #fff; }
+    .controls button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Right: chat panel */
+    .chat-panel { flex: 1; min-width: 320px; display: flex; flex-direction: column; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+    .chat-header { padding: 12px 16px; border-bottom: 1px solid var(--border); font-weight: 600; font-size: 14px; display: flex; justify-content: space-between; align-items: center; }
+    .chat-messages { flex: 1; overflow-y: auto; padding: 12px; display: flex; flex-direction: column; gap: 8px; }
+    .msg { max-width: 85%; padding: 8px 12px; border-radius: 8px; font-size: 14px; line-height: 1.5; word-break: break-word; }
+    .msg.user { align-self: flex-end; background: var(--accent); color: #fff; border-bottom-right-radius: 2px; }
+    .msg.assistant { align-self: flex-start; background: var(--border); border-bottom-left-radius: 2px; }
+    .msg.system { align-self: center; background: transparent; color: var(--muted); font-size: 12px; font-style: italic; }
+    .msg .meta { font-size: 11px; color: rgba(255,255,255,0.5); margin-top: 4px; }
+    .msg.assistant .meta { color: var(--muted); }
+    
+    /* Thinking animation */
+    .thinking { font-style: italic; color: var(--muted); display: flex; align-items: center; gap: 8px; }
+    .thinking::after { content: ''; width: 4px; height: 4px; border-radius: 50%; background: var(--muted); box-shadow: 8px 0 var(--muted), 16px 0 var(--muted); animation: pulse 1.5s infinite; }
+    @keyframes pulse {
+      0% { opacity: 0.2; }
+      50% { opacity: 1; }
+      100% { opacity: 0.2; }
+    }
+
+    .chat-input { display: flex; border-top: 1px solid var(--border); }
+    .chat-input input { flex: 1; padding: 12px 16px; border: none; background: transparent; color: var(--text); font-size: 14px; outline: none; }
+    .chat-input button { padding: 12px 20px; border: none; background: var(--accent); color: #fff; cursor: pointer; font-weight: 600; }
+    .chat-input button:disabled { opacity: 0.4; cursor: not-allowed; }
+
+    /* Config bar */
+    .config-bar { padding: 8px 16px; background: var(--surface); border-top: 1px solid var(--border); display: flex; gap: 12px; align-items: center; font-size: 12px; color: var(--muted); flex-wrap: wrap; }
+    .config-bar label { display: flex; align-items: center; gap: 4px; }
+    .config-bar input[type="text"] { background: var(--bg); border: 1px solid var(--border); color: var(--text); padding: 4px 8px; border-radius: 4px; font-size: 12px; width: 160px; }
+
+    /* Volume meter */
+    .volume-meter { width: 100px; height: 8px; background: var(--border); border-radius: 4px; overflow: hidden; position: relative; }
+    .volume-bar { height: 100%; width: 0%; background: var(--green); transition: width 0.1s; }
+    
+    /* VAD indicator */
+    .vad-indicator { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--muted); }
+    .vad-blob { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+    .vad-blob.active { background: var(--green); box-shadow: 0 0 8px var(--green); }
+
+    @media (max-width: 900px) {
+      main { flex-direction: column; }
+      .chat-panel { min-width: unset; }
+    }
+  </style>
+</head>
+<body>
+  <header>
+    <h1><span>Oasis</span> Cognition — Live</h1>
+    <span id="status" class="status-badge">Disconnected</span>
+  </header>
+
+  <main>
+    <div class="media-panel">
+      <div class="video-grid" id="videoGrid">
+        <div class="video-slot" id="screenSlot">
+          <span class="placeholder" id="screenPlaceholder">Screen share will appear here</span>
+          <span class="label" id="screenLabel" style="display:none">Your screen</span>
+        </div>
+      </div>
+      <div class="controls">
+        <button id="btnConnect">Connect</button>
+        <button id="btnMic" disabled>Mic Off</button>
+        <button id="btnScreen" disabled>Share Screen</button>
+        <button id="btnDisconnect" class="danger" disabled>Disconnect</button>
+        <div class="vad-indicator">
+          <div id="vadBlob" class="vad-blob"></div>
+          <span id="micStatus"></span>
+        </div>
+        <div class="volume-meter" id="volMeter" style="display:none">
+          <div class="volume-bar" id="volBar"></div>
+        </div>
+      </div>
+    </div>
+
+    <div class="chat-panel">
+      <div class="chat-header">
+        Chat
+        <span style="font-size:12px;color:var(--muted)" id="chatMode">text mode</span>
+      </div>
+      <div class="chat-messages" id="messages">
+        <div class="msg system">Send a message or connect with voice &amp; screen share.</div>
+      </div>
+      <div class="chat-input">
+        <input id="chatInput" type="text" placeholder="Type a message..." />
+        <button id="btnSend">Send</button>
+      </div>
+    </div>
+  </main>
+
+  <div class="config-bar">
+    <label>Room: <input type="text" id="cfgRoom" value="oasis-voice" /></label>
+    <label>Voice Agent: <input type="text" id="cfgVoiceAgent" value="http://localhost:8090" /></label>
+    <label>Oasis API: <input type="text" id="cfgApi" value="http://localhost:8000" /></label>
+    <label>LiveKit: <input type="text" id="cfgLiveKit" value="ws://localhost:7880" /></label>
+  </div>
+
+  <script>
+    const $ = (s) => document.querySelector(s);
+    const LivekitClient = window.LivekitClient;
+
+    // State
+    let room = null;
+    let localScreenTrack = null;
+    let micEnabled = false;
+    let sessionId = crypto.randomUUID();
+
+    // Elements
+    const statusEl = $('#status');
+    const messagesEl = $('#messages');
+    const chatInput = $('#chatInput');
+    const btnConnect = $('#btnConnect');
+    const btnMic = $('#btnMic');
+    const btnScreen = $('#btnScreen');
+    const btnDisconnect = $('#btnDisconnect');
+    const btnSend = $('#btnSend');
+    const videoGrid = $('#videoGrid');
+    const screenSlot = $('#screenSlot');
+    const screenPlaceholder = $('#screenPlaceholder');
+    const screenLabel = $('#screenLabel');
+    const micStatus = $('#micStatus');
+    const chatMode = $('#chatMode');
+
+    // --- Chat (text, via Oasis API directly) ---
+
+    function parseInteractionNdjson(text, contentType) {
+      const ct = contentType || '';
+      if (!ct.includes('ndjson')) return JSON.parse(text);
+      let last = null;
+      for (const line of text.split('\n')) {
+        const s = line.trim();
+        if (!s) continue;
+        let o;
+        try { o = JSON.parse(s); } catch { continue; }
+        if (o._oasis_keepalive) continue;
+        if (o._oasis_error) {
+          const b = o.body || {};
+          const d = b.detail != null ? (typeof b.detail === 'string' ? b.detail : JSON.stringify(b.detail)) : (b.error || JSON.stringify(b));
+          throw new Error(String(d));
+        }
+        last = o;
+      }
+      if (!last) throw new Error('Empty interaction response');
+      return last;
+    }
+
+    async function sendMessage() {
+      const text = chatInput.value.trim();
+      if (!text) return;
+      chatInput.value = '';
+      addMessage(text, 'user');
+      btnSend.disabled = true;
+      showThinking();
+
+      try {
+        const api = $('#cfgApi').value;
+        const res = await fetch(`${api}/api/v1/interaction`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ user_message: text, session_id: sessionId, context: { source: 'web-client' } }),
+        });
+        const raw = await res.text();
+        const data = parseInteractionNdjson(raw, res.headers.get('content-type'));
+        hideThinking();
+        const confidence = data.confidence != null ? `${(data.confidence * 100).toFixed(0)}%` : '';
+        addMessage(data.response || data.error || 'No response', 'assistant', confidence);
+      } catch (e) {
+        hideThinking();
+        addMessage(`Error: ${e.message}`, 'system');
+      }
+      btnSend.disabled = false;
+    }
+
+    btnSend.addEventListener('click', sendMessage);
+    chatInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendMessage(); });
+
+    function addMessage(text, role, meta) {
+      const div = document.createElement('div');
+      div.className = `msg ${role}`;
+      div.textContent = text;
+      if (meta) {
+        const m = document.createElement('div');
+        m.className = 'meta';
+        m.textContent = `confidence: ${meta}`;
+        div.appendChild(m);
+      }
+      messagesEl.appendChild(div);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+      return div;
+    }
+
+    let thinkingEl = null;
+    function showThinking() {
+      if (thinkingEl) return;
+      thinkingEl = document.createElement('div');
+      thinkingEl.className = 'msg assistant thinking';
+      thinkingEl.textContent = 'Thinking';
+      messagesEl.appendChild(thinkingEl);
+      messagesEl.scrollTop = messagesEl.scrollHeight;
+    }
+
+    function hideThinking() {
+      if (thinkingEl) {
+        thinkingEl.remove();
+        thinkingEl = null;
+      }
+    }
+
+    // --- LiveKit connection ---
+
+    btnConnect.addEventListener('click', async () => {
+      try {
+        setStatus('Connecting...', '');
+        const voiceUrl = $('#cfgVoiceAgent').value;
+        const roomName = $('#cfgRoom').value;
+
+        // 1. Request the voice agent to join the room
+        await fetch(`${voiceUrl}/join?room_name=${encodeURIComponent(roomName)}&participant_name=oasis-agent`, { method: 'POST' });
+
+        // 2. Get a token for ourselves
+        const tokenRes = await fetch(`${voiceUrl}/token?room_name=${encodeURIComponent(roomName)}&participant_name=user-${Date.now()}`, { method: 'POST' });
+        const tokenData = await tokenRes.json();
+
+        // 3. Connect to LiveKit
+        room = new LivekitClient.Room({
+          adaptiveStream: true,
+          dynacast: true,
+        });
+
+        room.on(LivekitClient.RoomEvent.Connected, () => {
+          setStatus('Connected', 'connected');
+          btnConnect.disabled = true;
+          btnMic.disabled = false;
+          btnScreen.disabled = false;
+          btnDisconnect.disabled = false;
+          chatMode.textContent = 'voice + text';
+          addMessage('Connected to room. You can now share your screen and talk.', 'system');
+        });
+
+        room.on(LivekitClient.RoomEvent.Disconnected, () => {
+          setStatus('Disconnected', '');
+          resetControls();
+          addMessage('Disconnected from room.', 'system');
+        });
+
+        room.on(LivekitClient.RoomEvent.TrackSubscribed, (track, publication, participant) => {
+          if (track.kind === 'audio') {
+            const el = track.attach();
+            document.body.appendChild(el);
+          }
+        });
+
+        room.on(LivekitClient.RoomEvent.TrackUnsubscribed, (track) => {
+          track.detach().forEach((el) => el.remove());
+        });
+
+        room.on(LivekitClient.RoomEvent.DataReceived, (data, participant) => {
+          try {
+            const msg = JSON.parse(new TextDecoder().decode(data));
+            if (msg.type === 'oasis-thinking') {
+              // User spoke via voice, now AI is thinking
+              if (msg.text) addMessage(msg.text, 'user');
+              showThinking();
+            } else if (msg.type === 'oasis-response') {
+              hideThinking();
+              addMessage(msg.text, 'assistant', msg.confidence ? `${(msg.confidence * 100).toFixed(0)}%` : '');
+            }
+          } catch {}
+        });
+
+        // Volume monitoring helper
+        const meterInterval = setInterval(() => {
+          if (room && micEnabled) {
+            const lp = room.localParticipant;
+            const level = lp.audioLevel || 0;
+            const bar = $('#volBar');
+            if (bar) bar.style.width = `${Math.min(100, level * 500)}%`;
+            const blob = $('#vadBlob');
+            if (blob) {
+               if (level > 0.02) blob.classList.add('active');
+               else blob.classList.remove('active');
+            }
+          }
+        }, 100);
+
+        room.on(LivekitClient.RoomEvent.Disconnected, () => {
+          clearInterval(meterInterval);
+          setStatus('Disconnected', '');
+          resetControls();
+          addMessage('Disconnected from room.', 'system');
+        });
+
+        const livekitUrl = tokenData.url || $('#cfgLiveKit').value;
+        await room.connect(livekitUrl, tokenData.token);
+
+      } catch (e) {
+        setStatus('Error', 'error');
+        addMessage(`Connection failed: ${e.message}`, 'system');
+        console.error(e);
+      }
+    });
+
+    // --- Mic toggle ---
+
+    btnMic.addEventListener('click', async () => {
+      if (!room) return;
+      try {
+        micEnabled = !micEnabled;
+        await room.localParticipant.setMicrophoneEnabled(micEnabled);
+        btnMic.textContent = micEnabled ? 'Mic On' : 'Mic Off';
+        btnMic.classList.toggle('active', micEnabled);
+        micStatus.textContent = micEnabled ? 'Listening' : '';
+        $('#volMeter').style.display = micEnabled ? 'block' : 'none';
+      } catch (e) {
+        addMessage(`Mic error: ${e.message}`, 'system');
+      }
+    });
+
+    // --- Screen share ---
+
+    btnScreen.addEventListener('click', async () => {
+      if (!room) return;
+
+      if (localScreenTrack) {
+        // Stop sharing
+        await room.localParticipant.unpublishTrack(localScreenTrack);
+        localScreenTrack.stop();
+        localScreenTrack = null;
+        screenSlot.querySelectorAll('video').forEach(v => v.remove());
+        screenPlaceholder.style.display = '';
+        screenLabel.style.display = 'none';
+        btnScreen.textContent = 'Share Screen';
+        btnScreen.classList.remove('active');
+        addMessage('Screen sharing stopped.', 'system');
+        return;
+      }
+
+      try {
+        // Request screen capture
+        const stream = await navigator.mediaDevices.getDisplayMedia({
+          video: { width: { ideal: 1920 }, height: { ideal: 1080 }, frameRate: { ideal: 15 } },
+          audio: false,
+        });
+
+        const track = stream.getVideoTracks()[0];
+        localScreenTrack = track;
+
+        // Show local preview
+        const videoEl = document.createElement('video');
+        videoEl.srcObject = new MediaStream([track]);
+        videoEl.autoplay = true;
+        videoEl.muted = true;
+        videoEl.playsInline = true;
+        screenPlaceholder.style.display = 'none';
+        screenLabel.style.display = '';
+        screenSlot.appendChild(videoEl);
+
+        // Publish to LiveKit room
+        const pub = await room.localParticipant.publishTrack(track, {
+          source: LivekitClient.Track.Source.ScreenShare,
+          screenShareEncoding: {
+            maxBitrate: 3_000_000,
+            maxFramerate: 15,
+          },
+        });
+
+        btnScreen.textContent = 'Stop Sharing';
+        btnScreen.classList.add('active');
+        addMessage('Screen sharing started. The AI agent can see your screen.', 'system');
+
+        // Handle user stopping via browser UI
+        track.onended = () => {
+          localScreenTrack = null;
+          screenSlot.querySelectorAll('video').forEach(v => v.remove());
+          screenPlaceholder.style.display = '';
+          screenLabel.style.display = 'none';
+          btnScreen.textContent = 'Share Screen';
+          btnScreen.classList.remove('active');
+          addMessage('Screen sharing stopped.', 'system');
+        };
+      } catch (e) {
+        if (e.name !== 'NotAllowedError') {
+          addMessage(`Screen share error: ${e.message}`, 'system');
+        }
+      }
+    });
+
+    // --- Disconnect ---
+
+    btnDisconnect.addEventListener('click', async () => {
+      if (localScreenTrack) {
+        localScreenTrack.stop();
+        localScreenTrack = null;
+      }
+      if (room) {
+        await room.disconnect();
+        room = null;
+      }
+    });
+
+    function resetControls() {
+      btnConnect.disabled = false;
+      btnMic.disabled = true;
+      btnScreen.disabled = true;
+      btnDisconnect.disabled = true;
+      btnMic.textContent = 'Mic Off';
+      btnMic.classList.remove('active');
+      btnScreen.textContent = 'Share Screen';
+      btnScreen.classList.remove('active');
+      micStatus.textContent = '';
+      chatMode.textContent = 'text mode';
+      screenSlot.querySelectorAll('video').forEach(v => v.remove());
+      screenPlaceholder.style.display = '';
+      screenLabel.style.display = 'none';
+      micEnabled = false;
+    }
+
+    function setStatus(text, cls) {
+      statusEl.textContent = text;
+      statusEl.className = `status-badge ${cls}`;
+    }
+  </script>
+</body>
+</html>

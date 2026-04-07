@@ -1,0 +1,6 @@
+#!/bin/bash
+# Launcher for Oasis Screen Capture — uses a local copy of Python so that
+# macOS TCC attributes Screen Recording permission to this .app bundle
+# ("Oasis Screen Capture") rather than to Terminal or the system Python.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/python3" "$DIR/capture.py" "$@"

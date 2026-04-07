@@ -1,0 +1,481 @@
+services:
+  # ==========================================================================
+  # INFRASTRUCTURE
+  # ==========================================================================
+
+  # Ollama runs natively on the host for Metal GPU acceleration.
+  # Start with: OLLAMA_HOST=0.0.0.0:11434 ollama serve
+  # Services reach it via OASIS_OLLAMA_HOST=http://host.docker.internal:11434
+
+  neo4j:
+    image: neo4j:5-community
+    restart: unless-stopped
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/${OASIS_NEO4J_PASSWORD:-oasis-cognition}
+      - NEO4J_PLUGINS=["apoc"]
+    volumes:
+      - ./data/neo4j:/data
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p ${OASIS_NEO4J_PASSWORD:-oasis-cognition} 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Postgres for Langfuse
+  langfuse-db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    ports:
+      - "5433:5432"
+    environment:
+      POSTGRES_DB: langfuse
+      POSTGRES_USER: langfuse
+      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse}
+    volumes:
+      - ./data/postgres-langfuse:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U langfuse"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  # ==========================================================================
+  # OASIS CORE MICROSERVICES
+  # ==========================================================================
+
+  interpreter:
+    build:
+      context: .
+      dockerfile: services/interpreter/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    environment:
+      - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:8b}
+      - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
+      - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
+      - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
+      - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
+      - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  graph-builder:
+    build:
+      context: .
+      dockerfile: services/graph_builder/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8002:8002"
+    environment:
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8002/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  logic-engine:
+    build:
+      context: .
+      dockerfile: services/logic_engine/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8003:8003"
+    environment:
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+      - OASIS_WEIGHT_EVIDENCE=${OASIS_WEIGHT_EVIDENCE:-0.4}
+      - OASIS_WEIGHT_MEMORY=${OASIS_WEIGHT_MEMORY:-0.25}
+      - OASIS_WEIGHT_RULE_MATCH=${OASIS_WEIGHT_RULE_MATCH:-0.25}
+      - OASIS_WEIGHT_CONTRADICTION_PENALTY=${OASIS_WEIGHT_CONTRADICTION_PENALTY:-0.1}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8003/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  memory-service:
+    build:
+      context: .
+      dockerfile: services/memory_service/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8004:8004"
+    environment:
+      - OASIS_NEO4J_URI=bolt://neo4j:7687
+      - OASIS_NEO4J_USER=neo4j
+      - OASIS_NEO4J_PASSWORD=oasis-cognition
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+      - OASIS_MEMORY_MAX_AGE_HOURS=${OASIS_MEMORY_MAX_AGE_HOURS:-24}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8004/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  code-indexer:
+    build:
+      context: .
+      dockerfile: services/code_indexer/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8010:8010"
+    volumes:
+      - .:/workspace:ro
+      # Mount user home for per-project indexing (read-only).
+      # The /workspace/switch endpoint changes which path the indexer scans.
+      - ${HOME:-/Users}:/host-home:ro
+    environment:
+      - OASIS_NEO4J_URI=bolt://neo4j:7687
+      - OASIS_NEO4J_USER=neo4j
+      - OASIS_NEO4J_PASSWORD=oasis-cognition
+      - OASIS_WORKSPACE_PATH=/workspace
+      - OASIS_CODE_INDEXER_INDEX_ON_START=${OASIS_CODE_INDEXER_INDEX_ON_START:-false}
+      - OASIS_CODE_INDEXER_WATCH=${OASIS_CODE_INDEXER_WATCH:-false}
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+    depends_on:
+      neo4j:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8010/health')\""]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 40s
+
+  # ui-parser: runs NATIVELY (not Docker) for GroundingDINO GPU access
+  # Started by `make up` → ui-parser-start (port 8011)
+  # API gateway reaches it via UI_PARSER_URL=http://host.docker.internal:8011
+
+  response-generator:
+    build:
+      context: .
+      dockerfile: services/response_generator/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8005:8005"
+    volumes:
+      - ./.oasis-context.md:/workspace/.oasis-context.md:ro
+      - ${HOME:-/Users}:/host-home:ro
+    environment:
+      - OASIS_RESPONSE_LLM_PROVIDER=${OASIS_RESPONSE_LLM_PROVIDER:-ollama}
+      - OASIS_RESPONSE_LLM_MODEL=${OASIS_RESPONSE_LLM_MODEL:-qwen3:8b}
+      - OASIS_TOOL_PLAN_LLM_PROVIDER=${OASIS_TOOL_PLAN_LLM_PROVIDER:-ollama}
+      # Default aligns with packages/shared-utils/config.py — pull: ollama pull qwen3:8b
+      - OASIS_TOOL_PLAN_LLM_MODEL=${OASIS_TOOL_PLAN_LLM_MODEL:-qwen3:8b}
+      - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
+      - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
+      - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
+      - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
+      - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_VISION_LLM_MODEL=${OASIS_VISION_LLM_MODEL:-}
+      - OASIS_COMPUTER_USE_LLM_MODEL=${OASIS_COMPUTER_USE_LLM_MODEL:-}
+      - OASIS_COMPUTER_USE_LLM_BASE_URL=${OASIS_COMPUTER_USE_LLM_BASE_URL:-}
+      - OASIS_CONTEXT_WINDOW=${OASIS_CONTEXT_WINDOW:-131072}
+      - OASIS_HOST_HOME=${HOME:-/Users}
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8005/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  teaching-service:
+    build:
+      context: .
+      dockerfile: services/teaching-service/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8006:8006"
+    environment:
+      - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:8b}
+      - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
+      - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
+      - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
+      - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
+      - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+      - OASIS_WEB_SEARCH_PROVIDER=${OASIS_WEB_SEARCH_PROVIDER:-duckduckgo}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8006/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  tool-executor:
+    build:
+      context: .
+      dockerfile: services/tool-executor/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8007:8007"
+    volumes:
+      - .:/workspace:ro
+      # Mount user home so tool-executor can access per-project files (read-only).
+      - ${HOME:-/Users}:/host-home:ro
+    environment:
+      - TOOL_ALLOWED_DIRS=/app,/tmp,/workspace,/host-home
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8007/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  observer-service:
+    build:
+      context: .
+      dockerfile: services/observer-service/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8009:8009"
+    environment:
+      - GRAPH_BUILDER_URL=http://graph-builder:8002
+      - LOGIC_ENGINE_URL=http://logic-engine:8003
+      - OBSERVER_HTTP_TIMEOUT_SECONDS=${OBSERVER_HTTP_TIMEOUT_SECONDS:-120}
+      - OBSERVER_HTTP_CONNECT_TIMEOUT_SECONDS=${OBSERVER_HTTP_CONNECT_TIMEOUT_SECONDS:-15}
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8009/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  artifact-service:
+    build:
+      context: .
+      dockerfile: services/artifact_service/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8012:8012"
+    volumes:
+      - ./data/artifacts:/data/artifacts
+    environment:
+      - OASIS_ARTIFACT_STORAGE_PATH=/data/artifacts
+      - OASIS_EMBEDDING_MODEL=${OASIS_EMBEDDING_MODEL:-sentence-transformers/all-MiniLM-L6-v2}
+      - OASIS_GIPFORMER_SERVICE_URL=http://host.docker.internal:8098
+      - OASIS_TRANSCRIPTION_SERVICE_URL=http://host.docker.internal:8099
+      - OASIS_DIARIZATION_SERVICE_URL=http://host.docker.internal:8097
+      - MEMORY_URL=http://memory-service:8004
+      - RESPONSE_GENERATOR_URL=http://response-generator:8005
+      - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
+    depends_on:
+      memory-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8012/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+
+  # NestJS API Gateway
+  api-gateway:
+    build:
+      context: apps/api-gateway
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - PORT=8000
+      - INTERPRETER_URL=http://interpreter:8001
+      - GRAPH_BUILDER_URL=http://graph-builder:8002
+      - LOGIC_ENGINE_URL=http://logic-engine:8003
+      - MEMORY_URL=http://memory-service:8004
+      - RESPONSE_URL=http://response-generator:8005
+      - TEACHING_URL=http://teaching-service:8006
+      - TOOL_EXECUTOR_URL=http://tool-executor:8007
+      - DEV_AGENT_URL=http://host.docker.internal:8008
+      - MOBILE_RELAY_URL=http://host.docker.internal:8015
+      - OBSERVER_URL=http://observer-service:8009
+      - CODE_INDEXER_URL=http://code-indexer:8010
+      - UI_PARSER_URL=http://host.docker.internal:8011
+      - ARTIFACT_SERVICE_URL=http://artifact-service:8012
+      - VOICE_AGENT_URL=http://voice-agent:8090
+      - REDIS_URL=redis://redis:6379
+      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-true}
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-oasis}
+      # Frequent NDJSON chunks during long tool_use so proxies don’t see an idle POST
+      - OASIS_INTERACTION_KEEPALIVE_MS=${OASIS_INTERACTION_KEEPALIVE_MS:-12000}
+      # Optional: set to 1 to also abort on res/socket stream "close" (can false-positive with NDJSON)
+      - OASIS_STRICT_STREAM_CLOSE_ABORT=${OASIS_STRICT_STREAM_CLOSE_ABORT:-0}
+      # Observer runs graph-builder then logic-engine; allow headroom over OBSERVER_HTTP_TIMEOUT_SECONDS*2
+      - OBSERVER_VALIDATE_TIMEOUT_MS=${OBSERVER_VALIDATE_TIMEOUT_MS:-180000}
+      # Langfuse tool-plan spans: set true to attach truncated full request + model output (PII / size)
+      - OASIS_DEBUG_TOOL_PLAN_PAYLOAD=${OASIS_DEBUG_TOOL_PLAN_PAYLOAD:-false}
+      - OASIS_DEBUG_TOOL_PLAN_MAX_CHARS=${OASIS_DEBUG_TOOL_PLAN_MAX_CHARS:-16000}
+      # Neo4j code index → tool-plan knowledge_summary (memory-service /internal/memory/code/symbols)
+      - OASIS_CONTEXT_WINDOW=${OASIS_CONTEXT_WINDOW:-131072}
+      - OASIS_CONTEXT_WINDOW_TOOL_PLAN=${OASIS_CONTEXT_WINDOW_TOOL_PLAN:-131072}
+      - OASIS_CODE_KNOWLEDGE_IN_TOOL_PLAN=${OASIS_CODE_KNOWLEDGE_IN_TOOL_PLAN:-true}
+      - OASIS_CODE_KNOWLEDGE_TIMEOUT_MS=${OASIS_CODE_KNOWLEDGE_TIMEOUT_MS:-2500}
+    depends_on:
+      interpreter:
+        condition: service_healthy
+      graph-builder:
+        condition: service_healthy
+      logic-engine:
+        condition: service_healthy
+      memory-service:
+        condition: service_healthy
+      response-generator:
+        condition: service_healthy
+      teaching-service:
+        condition: service_healthy
+      tool-executor:
+        condition: service_healthy
+      observer-service:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"const http = require('http'); http.get('http://localhost:8000/api/v1/health', r => { process.exit(r.statusCode === 200 ? 0 : 1) }).on('error', () => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
+  # ==========================================================================
+  # UI & INTEGRATION LAYER
+  # ==========================================================================
+
+  # New React-based Oasis UI
+  oasis-ui:
+    build:
+      context: .
+      dockerfile: apps/oasis-ui-react/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000:80"
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+      voice-agent:
+        condition: service_healthy
+
+  # Langfuse — Observability dashboard
+  langfuse:
+    image: langfuse/langfuse:2
+    restart: unless-stopped
+    ports:
+      - "3100:3000"
+    environment:
+      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfuse}@langfuse-db:5432/langfuse
+      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-oasis-langfuse-secret-change-me}
+      - NEXTAUTH_URL=http://localhost:3100
+      - SALT=${LANGFUSE_SALT:-oasis-salt-change-me}
+      - TELEMETRY_ENABLED=false
+      # Seed initial project API keys for Oasis integration
+      - LANGFUSE_INIT_ORG_ID=oasis-org
+      - LANGFUSE_INIT_ORG_NAME=Oasis Cognition
+      - LANGFUSE_INIT_PROJECT_ID=oasis-project
+      - LANGFUSE_INIT_PROJECT_NAME=Oasis Reasoning
+      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}
+      - LANGFUSE_INIT_PROJECT_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-oasis}
+      - LANGFUSE_INIT_USER_EMAIL=${LANGFUSE_INIT_USER_EMAIL:-admin@oasis.local}
+      - LANGFUSE_INIT_USER_NAME=${LANGFUSE_INIT_USER_NAME:-admin}
+      - LANGFUSE_INIT_USER_PASSWORD=${LANGFUSE_INIT_USER_PASSWORD:-changeme}
+    depends_on:
+      langfuse-db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 30s
+
+  # LiveKit — Real-time voice and video server
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50600-50700:50600-50700/udp"
+    volumes:
+      - ./config/livekit/livekit.yaml:/etc/livekit.yaml
+    command: ["--config", "/etc/livekit.yaml"]
+    environment:
+      # Override keys via env so voice-agent and LiveKit use identical credentials
+      - "LIVEKIT_KEYS=${LIVEKIT_API_KEY:-devkey}: ${LIVEKIT_API_SECRET:-oasis-livekit-dev-secret-min-32-chars}"
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:7880 || true"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  # Pipecat Voice Agent — Voice pipeline connected to Oasis
+  voice-agent:
+    build:
+      context: .
+      dockerfile: services/voice_agent/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8090:8090"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    environment:
+      - OASIS_API_URL=http://api-gateway:8000
+      - RESPONSE_GENERATOR_URL=http://response-generator:8005
+      - LIVEKIT_URL=ws://livekit:7880
+      - LIVEKIT_EXTERNAL_URL=ws://localhost:7880
+      - LIVEKIT_API_KEY=${LIVEKIT_API_KEY:-devkey}
+      - LIVEKIT_API_SECRET=${LIVEKIT_API_SECRET:-oasis-livekit-dev-secret-min-32-chars}
+      - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
+      - TRANSCRIPTION_URL=http://host.docker.internal:8099
+      - XTTS_URL=${XTTS_URL:-http://localhost:8020}
+      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-true}
+      - LANGFUSE_HOST=http://langfuse:3000
+      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}
+      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-oasis}
+      - VOICE_PROFILE_PATH=/data/voice-profile.npy
+    volumes:
+      - ./data/voice-agent:/data
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8090/health')\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+# All persistent data is bind-mounted to ./data/ so it survives container destruction.
+# See: data/neo4j, data/postgres-langfuse, data/artifacts, data/voice-agent

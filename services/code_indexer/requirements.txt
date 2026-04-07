@@ -1,0 +1,20 @@
+# FastAPI and server
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+
+# Neo4j
+neo4j==5.27.0
+
+# Data validation
+pydantic==2.10.0
+pydantic-settings==2.7.0
+
+# Tree-sitter for AST parsing
+tree-sitter==0.24.0
+tree-sitter-typescript==0.23.0
+
+# File watching (for Phase 3)
+watchdog==6.0.0
+
+# Redis (for Phase 3)
+redis==5.2.0

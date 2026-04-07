@@ -1,0 +1,34 @@
+# Persistent data (bind-mounted Docker volumes)
+data/
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+.pytest_cache/
+*.db
+
+# Node
+node_modules/
+dist/
+.nest/
+
+# Environment
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+*.log
+
+# OS
+.DS_Store
+
+# Dev agent worktrees
+.oasis-worktrees/
+.oasis-context.md
+tsconfig.tsbuildinfo
+.venv-gipformer

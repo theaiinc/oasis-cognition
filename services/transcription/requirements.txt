@@ -1,0 +1,7 @@
+mlx-whisper>=0.4.0
+mlx>=0.16.0
+fastapi>=0.100.0
+uvicorn>=0.23.0
+pydantic>=2.0
+numpy
+scipy

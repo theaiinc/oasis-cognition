@@ -1,0 +1,6 @@
+#!/bin/bash
+# Launcher for Oasis Computer Control — uses a local copy of Python so that
+# macOS TCC attributes Accessibility permission to this .app bundle
+# ("Oasis Computer Control") rather than to Terminal or the system Python.
+DIR="$(cd "$(dirname "$0")" && pwd)"
+exec "$DIR/python3" "$DIR/control.py" "$@"

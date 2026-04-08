@@ -177,6 +177,18 @@ async def execute_tool(req: ExecuteRequest) -> dict[str, Any]:
             return {"success": True, "output": result["output"], "blocked": False, "reason": ""}
         return {"success": False, "output": result.get("error", result["output"]), "blocked": result.get("blocked", False), "reason": result.get("error", "")}
 
+    elif req.tool == "web_search":
+        if not req.command:  # reuse command field for the search query
+            return {"success": False, "output": "No search query provided", "blocked": False, "reason": ""}
+        result = await executor.web_search(req.command, num_results=5)
+        if result["success"]:
+            formatted = "\n\n".join(
+                f"{i+1}. {r['title']}\n   {r['snippet']}\n   {r['url']}"
+                for i, r in enumerate(result["results"])
+            )
+            return {"success": True, "output": formatted or "No results found", "blocked": False, "reason": "", "results": result["results"]}
+        return {"success": False, "output": result.get("error", "Search failed"), "blocked": False, "reason": ""}
+
     elif req.tool == "browse_url":
         if not req.url:
             return {"success": False, "output": "No URL provided", "blocked": False, "reason": ""}

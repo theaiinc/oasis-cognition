@@ -115,32 +115,43 @@ if (chrome.alarms) {
 async function findTargetTab(urlHint) {
   const allTabs = await chrome.tabs.query({});
 
-  // 1. Match by URL hint
+  // 1. Prefer the active tab in the last focused window if it matches the hint
+  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
+
   if (urlHint) {
     const hint = urlHint.toLowerCase();
-    for (const tab of allTabs) {
-      if (tab.url && tab.url.toLowerCase().includes(hint)) {
-        return tab;
-      }
+
+    // Check active tab first
+    if (activeTab?.url?.toLowerCase().includes(hint)) {
+      return activeTab;
+    }
+
+    // Then check all tabs, preferring active ones
+    const matches = allTabs.filter(t => t.url && t.url.toLowerCase().includes(hint));
+    // Prefer active tabs over inactive ones
+    const activeMatch = matches.find(t => t.active);
+    if (activeMatch) return activeMatch;
+    if (matches.length > 0) return matches[0];
+  }
+
+  // 2. Active tab if it's a real page (not localhost/chrome)
+  if (activeTab?.url) {
+    const url = activeTab.url.toLowerCase();
+    if (!url.includes("localhost") && !url.includes("127.0.0.1") &&
+        !url.startsWith("chrome://") && !url.startsWith("chrome-extension://")) {
+      return activeTab;
     }
   }
 
-  // 2. First non-localhost, non-extension tab
+  // 3. First non-localhost, non-extension tab
   for (const tab of allTabs) {
     const url = (tab.url || "").toLowerCase();
-    if (
-      url &&
-      !url.includes("localhost") &&
-      !url.includes("127.0.0.1") &&
-      !url.startsWith("chrome://") &&
-      !url.startsWith("chrome-extension://")
-    ) {
+    if (url && !url.includes("localhost") && !url.includes("127.0.0.1") &&
+        !url.startsWith("chrome://") && !url.startsWith("chrome-extension://")) {
       return tab;
     }
   }
 
-  // 3. Active tab in the last focused window
-  const [activeTab] = await chrome.tabs.query({ active: true, lastFocusedWindow: true });
   return activeTab || allTabs[0] || null;
 }
 
@@ -157,6 +168,121 @@ async function ensureContentScript(tabId) {
     });
     // Small delay for script to initialize
     await new Promise((r) => setTimeout(r, 100));
+  }
+}
+
+/* ── CDP (Chrome DevTools Protocol) helpers for trusted events ──────────── */
+
+// Track attached debugger sessions to avoid re-attaching
+const attachedTabs = new Set();
+
+async function cdpAttach(tabId) {
+  if (attachedTabs.has(tabId)) return;
+  try {
+    await chrome.debugger.attach({ tabId }, "1.3");
+    attachedTabs.add(tabId);
+  } catch (e) {
+    // Already attached or permission denied
+    if (e.message?.includes("Already attached")) {
+      attachedTabs.add(tabId);
+    } else {
+      throw e;
+    }
+  }
+}
+
+function cdpSend(tabId, method, params = {}) {
+  return chrome.debugger.sendCommand({ tabId }, method, params);
+}
+
+async function cdpDetach(tabId) {
+  if (!attachedTabs.has(tabId)) return;
+  try {
+    await chrome.debugger.detach({ tabId });
+  } catch { /* ignore */ }
+  attachedTabs.delete(tabId);
+}
+
+// Clean up on tab close
+chrome.tabs.onRemoved.addListener((tabId) => {
+  attachedTabs.delete(tabId);
+});
+
+/**
+ * Click an element via CDP trusted mouse events.
+ * First finds the element bounds via content script, then dispatches
+ * trusted mousePressed/mouseReleased via CDP.
+ */
+async function cdpClickElement(tabId, textMatch, selector, index) {
+  // 1. Find element bounds via content script
+  await ensureContentScript(tabId);
+  const boundsResult = await chrome.tabs.sendMessage(tabId, {
+    command: "get_element_bounds",
+    text_match: textMatch,
+    selector,
+    index,
+  });
+
+  if (!boundsResult?.success || !boundsResult?.payload) {
+    return { success: false, error: boundsResult?.error || "Element not found" };
+  }
+
+  const bounds = boundsResult.payload;
+  if (!bounds.visible) {
+    // Scroll element into view first
+    await chrome.tabs.sendMessage(tabId, {
+      command: "scroll_to_element",
+      text_match: textMatch,
+      selector,
+      index,
+    });
+    await new Promise(r => setTimeout(r, 300));
+  }
+
+  // 2. Get fresh bounds after potential scroll
+  const freshBounds = await chrome.tabs.sendMessage(tabId, {
+    command: "get_element_bounds",
+    text_match: textMatch,
+    selector,
+    index,
+  });
+  const b = freshBounds?.payload || bounds;
+
+  // Viewport-relative coords for CDP (from content script)
+  const vpX = b.vpX || (b.centerX - b.x + (b.width / 2));
+  const vpY = b.vpY || (b.centerY - b.y + (b.height / 2));
+
+  // 3. Attach debugger and dispatch trusted click
+  try {
+    await cdpAttach(tabId);
+
+    // Mouse move first (some sites need hover)
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseMoved", x: vpX, y: vpY, button: "none",
+    });
+    await new Promise(r => setTimeout(r, 50));
+
+    // Click
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
+      type: "mousePressed", x: vpX, y: vpY, button: "left", clickCount: 1,
+    });
+    await cdpSend(tabId, "Input.dispatchMouseEvent", {
+      type: "mouseReleased", x: vpX, y: vpY, button: "left", clickCount: 1,
+    });
+
+    return { success: true, bounds: b };
+  } catch (e) {
+    // CDP failed — fall back to content script .click()
+    console.warn("[OasisBridge] CDP click failed, falling back to DOM click:", e.message);
+    const clickResult = await chrome.tabs.sendMessage(tabId, {
+      command: "click_element",
+      text_match: textMatch,
+      selector,
+      index,
+    });
+    return clickResult?.success
+      ? { success: true, bounds: b, method: "dom_fallback" }
+      : { success: false, error: clickResult?.error || "Click failed" };
   }
 }
 
@@ -251,14 +377,14 @@ async function handleCommand(msg) {
           sendResponse(id, command, false, null, "No suitable tab found");
           return;
         }
-        await ensureContentScript(tab.id);
-        const clickResult = await chrome.tabs.sendMessage(tab.id, {
-          command: "click_element",
-          selector: payload.selector,
-          text_match: payload.text_match,
-          index: payload.index,
-        });
-        sendResponse(id, command, clickResult?.success ?? false, clickResult?.payload, clickResult?.error);
+        // Use CDP trusted events (falls back to DOM .click() if CDP fails)
+        const clickResult = await cdpClickElement(
+          tab.id,
+          payload.text_match,
+          payload.selector,
+          payload.index,
+        );
+        sendResponse(id, command, clickResult.success, clickResult, clickResult.error);
         break;
       }
 

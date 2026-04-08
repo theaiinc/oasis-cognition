@@ -5,9 +5,9 @@ WORKDIR /app
 COPY services/memory_service/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY packages/reasoning-schema/ ./packages/reasoning_schema/
-COPY packages/event-types/ ./packages/event_types/
-COPY packages/shared-utils/ ./packages/shared_utils/
+COPY packages/reasoning_schema/ ./packages/reasoning_schema/
+COPY packages/event_types/ ./packages/event_types/
+COPY packages/shared_utils/ ./packages/shared_utils/
 RUN touch packages/__init__.py
 
 COPY services/memory_service/ ./services/memory_service/

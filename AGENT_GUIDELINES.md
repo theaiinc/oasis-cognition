@@ -2,6 +2,49 @@
 
 This file is a running devlog/compass for Oasis Cognition agent work. Keep it updated with “aha” moments, interface contracts, and any conventions that are easy to forget.
 
+### 2026-04-08 — Chrome Bridge extension for computer-use
+
+- **Problem**: CU page text extraction relied on AppleScript JS injection into Chrome, which requires the hidden “Allow JavaScript from Apple Events” setting. Without it, `get_page_text` returned empty and CU fell back to macOS OCR (garbled, unreliable).
+- **Solution**: Manifest V3 Chrome extension (`extensions/oasis-chrome-bridge/`) connects to dev-agent via WebSocket (`ws://localhost:8008/ws/chrome-bridge`). Content script extracts DOM text, meta tags (e.g. GitHub `user-login`), element bounds. Background service worker routes commands. Falls back to AppleScript when extension isn’t connected.
+- **Key files**: `services/dev_agent/chrome_bridge.py` (WS bridge singleton), `services/dev_agent/main.py` (`/ws/chrome-bridge` endpoint), `services/dev_agent/computer_use.py` (extension-first routing for `get_page_text`, `chrome_navigate`, `chrome_set_url`).
+- **Install**: Chrome → `chrome://extensions` → Developer mode → Load unpacked → `extensions/oasis-chrome-bridge`. Green “ON” badge = connected.
+- **UI**: Computer Use panel shows “Chrome Bridge connected” (green) or install instructions (amber warning).
+
+### 2026-04-08 — CU discovery token resolution
+
+- **Problem**: `__DISCOVERED_USERNAME__` tokens in plan step URLs were used literally when regex extraction failed on garbled OCR, causing 404 navigations and cascading failures.
+- **Fix (3 layers)**: (1) Guard in `executeSteps` detects unresolved tokens before executing, runs a discovery `read_screen`, and triggers plan revision if still unresolved. (2) LLM fallback in `replaceDiscoveryTokens` asks the model to extract usernames when regex fails. (3) Revision prompt includes discovered values and instructs LLM to use click-based navigation instead of `__DISCOVERED_*__` tokens when discovery fails.
+
+### 2026-04-08 — CU 2FA / verification detection
+
+- **Problem**: When sites redirect through 2FA (e.g. Facebook `two_step_verification`), the agent captured the transient auth URL and panicked into a revision loop.
+- **Fix**: (1) `read_screen` retries up to 3 times with 3s waits when it detects transient auth/redirect URLs (2FA, checkpoint, OAuth, SSO). (2) After any step completes, if the output matches verification patterns, the session **pauses** with a user-facing message (“Please complete verification in the browser, then resume”). User handles 2FA, clicks Resume, agent continues.
+
+### 2026-04-08 — Global emergency stop hotkey
+
+- **Problem**: The emergency pause hotkey (Cmd+Escape) only worked when the Oasis UI tab was focused (JS `keydown` listener). Useless when the CU agent is controlling another app.
+- **Fix**: `services/dev_agent/global_hotkey.py` uses `pynput.keyboard.GlobalHotKeys` to listen at the OS level in a daemon thread. Works regardless of which app is focused.
+- **Hotkey sync**: UI panel pushes hotkey changes to `POST /internal/dev-agent/cu-panic-key`. Dev-agent restarts the listener with the new combo. Supports all UI options: `meta+Escape`, `ctrl+Escape`, `meta+shift+Escape`, `meta+.`.
+- **Env override**: `OASIS_CU_PANIC_HOTKEY=meta+Escape` (UI format) sets the default.
+
+### 2026-04-08 — CU pre-plan web research
+
+- **Problem**: The CU planner generated plans from pure LLM general knowledge without consulting any documentation. For tasks like "close my Facebook page", it guessed UI steps that didn't match the actual Facebook interface, then falsely reported success.
+- **Fix**: Added a `researchGoal()` phase before plan generation. The CU controller asks the LLM to generate a search query, then calls the tool-executor's `web_search` tool (DuckDuckGo) to find step-by-step guides. Results are injected into the plan prompt as `WEB RESEARCH` context.
+- **Architecture**: Web search goes through `tool-executor` (port 8007) via `POST /internal/tool/execute` with `tool: "web_search"`. This keeps tool execution centralized — no search code in dev-agent or teaching-service.
+- **Flow**: Goal → LLM generates search query → tool-executor DuckDuckGo search → results injected into plan prompt + stored on session for revisions/goal-satisfaction checks.
+- **Stored on session**: `(session as any)._research` — reused in revision prompts so the LLM stays grounded in the same documentation across retries.
+
+### 2026-04-08 — Symlink consolidation
+
+- Removed Python package symlinks (`packages/event_types` → `event-types`, etc.). Renamed hyphenated directories to underscored names directly (`packages/shared_utils/`, `packages/event_types/`, `packages/reasoning_schema/`). Updated all 10 Dockerfiles.
+- Removed unused `apps/api_gateway` symlink and tracked `packages/ui-kit/node_modules` symlink.
+
+### 2026-04-08 — Dedicated CU LLM routing
+
+- `services/response_generator/service.py` creates a separate `LLMClient` for CU calls when `OASIS_COMPUTER_USE_LLM_MODEL` and `OASIS_COMPUTER_USE_LLM_BASE_URL` are set. Allows using a fast remote vision model (e.g. `qwen3-vl-flash` via llmapi.ai) for CU while keeping other LLM calls on the default provider.
+- `.env` vars: `OASIS_COMPUTER_USE_LLM_MODEL`, `OASIS_COMPUTER_USE_LLM_BASE_URL`. Docker-compose passes them to response-generator.
+
 ### 2026-03-29 — Teaching-service Docker image goes stale (fixes “don’t apply”)
 
 - **Symptom**: Repo `services/teaching-service/service.py` is updated but behavior in Compose is unchanged; `docker logs` still show old validation patterns.

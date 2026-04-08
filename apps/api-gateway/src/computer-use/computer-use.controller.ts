@@ -32,6 +32,7 @@ import { evaluateStepPolicy, validateSessionForExecution } from './computer-use.
 const RESPONSE_URL = process.env.RESPONSE_URL || 'http://localhost:8005';
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
 const UI_PARSER_URL = process.env.UI_PARSER_URL || 'http://localhost:8011';
+const TOOL_EXECUTOR_URL = process.env.TOOL_EXECUTOR_URL || 'http://localhost:8007';
 const LLM_TIMEOUT_MS = 60_000;
 const ACTION_TIMEOUT_MS = 30_000;
 
@@ -204,10 +205,14 @@ export class ComputerUseController {
     session.visionGranted = true;
     session.status = 'executing';
     session.updated_at = new Date().toISOString();
-    this.logger.log(`Session ${id} approved with vision grant — starting execution`);
+    this.logger.log(`Session ${id} approved with vision grant — starting adaptive execution`);
 
-    // Begin execution (non-blocking)
-    this.executeSteps(id).catch((err) => {
+    // Begin adaptive execution (non-blocking)
+    // Mark pre-planned steps as 'skipped' — the adaptive loop creates its own steps dynamically
+    for (const step of session.plan) {
+      if (step.status === 'pending') step.status = 'skipped';
+    }
+    this.executeAdaptiveLoop(id).catch((err) => {
       this.logger.error(`Execution failed for ${id}: ${err.message}`);
       session.status = 'failed';
       session.error = err.message;
@@ -273,9 +278,9 @@ export class ComputerUseController {
       throw new HttpException(`Cannot resume: status is "${session.status}"`, HttpStatus.CONFLICT);
     }
     session.status = 'executing';
-    session.error = undefined; // clear any "screen sharing stopped" error
+    session.error = undefined; // clear any pause/verification error
     session.updated_at = new Date().toISOString();
-    this.executeSteps(id).catch(() => {});
+    this.executeAdaptiveLoop(id).catch(() => {});
     return { status: 'executing' };
   }
 
@@ -401,6 +406,59 @@ export class ComputerUseController {
    * Ask the LLM to draft a step-by-step plan for the goal.
    * Sends the current screen-share image so the plan is grounded in reality.
    */
+  /**
+   * Research the goal via web search before planning.
+   * Returns formatted guide text to inject into the plan prompt.
+   */
+  private async researchGoal(goal: string): Promise<string> {
+    try {
+      // Generate a search query focused on "how to" steps
+      const queryRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+        user_message:
+          `Generate a short web search query to find step-by-step instructions for this task:\n` +
+          `"${goal}"\n\n` +
+          `Reply with ONLY the search query (one line, no quotes). ` +
+          `Focus on the specific UI steps needed. ` +
+          `Example: for "close my Facebook page" → "how to close deactivate Facebook page step by step 2025"`,
+        context: { system_override: 'Generate a web search query. Reply with ONLY the query.', max_tokens: 60 },
+      }, { timeout: 15000 });
+      const searchQuery = (queryRes.data?.response_text || queryRes.data?.response || '').trim();
+      if (!searchQuery) return '';
+
+      this.logger.log(`CU research: searching for "${searchQuery}"`);
+
+      // Web search via tool-executor
+      const searchRes = await axios.post(`${TOOL_EXECUTOR_URL}/internal/tool/execute`, {
+        tool: 'web_search',
+        command: searchQuery,
+      }, { timeout: 15000 });
+
+      if (!searchRes.data?.success) return '';
+
+      // Tool-executor returns results array + formatted output
+      const results = searchRes.data?.results || [];
+      if (results.length > 0) {
+        const guide = results
+          .map((r: { title: string; snippet: string; url: string }, i: number) =>
+            `${i + 1}. ${r.title}\n   ${r.snippet}\n   Source: ${r.url}`)
+          .join('\n');
+        this.logger.log(`CU research: found ${results.length} results for "${searchQuery}"`);
+        return `WEB RESEARCH (how to achieve this goal):\n${guide}\n`;
+      }
+
+      // Fallback: use the formatted output string
+      const output = searchRes.data?.output || '';
+      if (output && output !== 'No results found') {
+        this.logger.log(`CU research: got formatted results for "${searchQuery}"`);
+        return `WEB RESEARCH (how to achieve this goal):\n${output}\n`;
+      }
+      return '';
+    } catch (err: any) {
+      this.logger.warn(`CU research failed: ${err.message} — planning without research`);
+      return '';
+    }
+  }
+
   private async draftPlan(
     sessionId: string,
     goal: string,
@@ -413,8 +471,15 @@ export class ComputerUseController {
     const hasScreen = !!screenImage;
     const shareCtx = this.getShareContext(sessionId);
 
+    // ── Pre-plan research: search the web for how to accomplish the goal ──
+    const researchContext = await this.researchGoal(goal);
+    if (researchContext) {
+      (session as any)._research = researchContext;
+    }
+
     const systemPrompt =
       `You are a computer-use planner. You create SHORT, efficient step-by-step plans to control a real computer.\n\n` +
+      (researchContext ? `${researchContext}\nUse the research above to inform your plan. Follow the documented steps from trusted sources rather than guessing.\n\n` : '') +
       `SHARED SCREEN CONTEXT:\n${shareCtx}\n\n` +
       `${hasScreen ? 'A screenshot of the current screen is attached. ANALYZE IT FIRST before planning:\n' +
         '1. What application/browser is currently open?\n' +
@@ -438,8 +503,9 @@ export class ComputerUseController {
       `2. NEVER use "screenshot" as a standalone step — "read_screen" already captures the screen AND extracts text. Use read_screen instead.\n` +
       `3. NEVER put "wait" after "navigate" — the navigate action already waits for page load.\n` +
       `4. NEVER put "screenshot" before "read_screen" — read_screen already takes a screenshot.\n` +
-      `5. ALWAYS prefer "navigate" with a direct URL over "click" for reaching pages. Direct URLs are 10x more reliable.\n` +
+      `5. Prefer "navigate" with a KNOWN direct URL over "click" — but NEVER fabricate URLs. Only use URLs you know are correct (from research, from the current page, or from standard well-known patterns like github.com/USERNAME). If unsure of the URL, use "click" to navigate via the UI instead.\n` +
       `6. For GitHub: use direct URLs like https://github.com/orgs/ORGNAME/repositories or https://github.com/USERNAME?tab=repositories\n` +
+      `6b. For complex web apps (Facebook, Google, etc.): prefer "click" navigation via UI menus/links over guessing URLs. These apps have dynamic routes that change frequently.\n` +
       `7. One "read_screen" is enough per page — do NOT repeat read_screen unless you scrolled.\n` +
       `8. Only scroll if you have evidence the content continues below the fold. Don't preemptively scroll.\n` +
       `9. Plans execute LINEARLY — NO conditional logic.\n\n` +
@@ -451,7 +517,10 @@ export class ComputerUseController {
       `  STEP: navigate | https://github.com/__DISCOVERED_USERNAME__?tab=repositories | Go to repos page\n` +
       `  The execution engine replaces __DISCOVERED_*__ tokens with values from read_screen.\n` +
       `- End with "read_screen" to capture the final result.\n` +
-      `- NEVER interact with localhost:3000 (Oasis UI).\n\n` +
+      `- NEVER interact with localhost:3000 (Oasis UI).\n` +
+      `- NEVER fabricate or guess URLs for web apps like Facebook, Instagram, Twitter, etc. Their URLs are unpredictable.\n` +
+      `  Instead, navigate to the homepage and use "click" to find your way through the UI menus and sidebar.\n` +
+      `  For Facebook page management: go to facebook.com → look for the page in "Your shortcuts" sidebar → click it → use Page Settings.\n\n` +
       `EXAMPLE — "list repos for org theaiinc":\n` +
       `STEP: navigate | https://github.com/orgs/theaiinc/repositories | Go directly to org repos page\n` +
       `STEP: read_screen | | Read all visible repository names\n` +
@@ -885,6 +954,19 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         ? `\n⚠️ SCREEN_UNCHANGED: The screen looks IDENTICAL to before your last action. Your previous action had NO effect. Do NOT repeat it. Try a completely different approach (e.g., scroll instead of click, navigate to a different URL, use a different target element).\n`
         : '';
 
+      // Get page text for richer context (Chrome Bridge or OCR)
+      let pageTextCtx = '';
+      try {
+        const ptRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+          tool: 'computer_action',
+          action: 'get_page_text',
+          text: (session as any)?._work_url_hint || '',
+        }, { timeout: 8000 });
+        if (ptRes.data?.success && ptRes.data.output) {
+          pageTextCtx = `\nCURRENT PAGE CONTENT:\n${(ptRes.data.output as string).slice(0, 3000)}\n`;
+        }
+      } catch { /* ignore — screenshot alone is enough */ }
+
       const userMessage =
         `OVERALL GOAL: ${goal}\n` +
         `CURRENT STEP (${step.index + 1}/${session.plan.length}): ${step.description}\n` +
@@ -892,6 +974,7 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         `${previousOutputs ? `\nINFO FROM PREVIOUS STEPS:\n${previousOutputs}\n` : ''}` +
         `${discoveryCtx}${feedbackContext}` +
         `SHARED SCREEN: ${shareCtx}\n` +
+        `${pageTextCtx}` +
         `${historyBlock}${deadEndWarning}\n` +
         `The primary action "${step.action}" has ALREADY been executed. Screenshot of current screen is attached.\n` +
         `${verifyHint}\n`;
@@ -971,8 +1054,293 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
     return { success: true, output: step.output };
   }
 
+  // ════════════════════════════════════════════════════════════════════════
+  // ADAPTIVE ReAct LOOP — read page → reason → act → repeat
+  //
+  // Instead of pre-planning all steps and executing linearly, this loop
+  // reads the current page state, asks the LLM what to do next, executes
+  // one action, and repeats until the goal is achieved.
+  // ════════════════════════════════════════════════════════════════════════
+
+  private static readonly REACT_SYSTEM = `\
+You are a computer-use agent controlling a real browser. You read the page, decide the next action, and execute it.
+
+OUTPUT FORMAT (one field per line, NO JSON, NO markdown):
+
+THOUGHT: what you see on the page and what you need to do next (one sentence)
+ACTION: <action_name>
+TARGET: <target value>
+
+OR when the goal is achieved:
+
+THOUGHT: the goal has been achieved because <evidence>
+ACTION: done
+TARGET: <summary of what was accomplished>
+
+OR when stuck:
+
+THOUGHT: I cannot complete this because <reason>
+ACTION: failed
+TARGET: <explanation>
+
+VALID ACTIONS:
+- click | TARGET = text of the element to click (button label, link text, menu item)
+- navigate | TARGET = full URL
+- type | TARGET = text to type into the focused field
+- scroll | TARGET = up or down
+- read_screen | TARGET = (empty) — re-read the page to see updated content
+
+RULES:
+- You can ONLY see the page content provided. You CANNOT see screenshots.
+- Click elements by their EXACT visible text or aria-label from the page content.
+- NEVER fabricate or guess URLs. Only use URLs visible in the page content or that you know are 100% correct.
+- For complex web apps (Facebook, Google, etc.), always navigate via clicking UI elements, not by guessing URLs.
+- When you see a list of clickable elements, pick the most relevant one.
+- If a click didn't change the page, try a different element or scroll to find more options.
+- If you hit an error page ("not available", "not found"), go back and try a different approach.
+- If clicking a UI element has no visible effect after 2 attempts, the element may open a panel/dialog within the same page. Try scrolling to see if new content appeared, or try a direct URL approach.
+- For Facebook page management: if clicking "Settings" on a Page doesn't work, try navigating to https://business.facebook.com/latest/settings/ (Meta Business Suite) instead.
+- Maximum actions per goal: 25. Be efficient.`;
+
+  private async executeAdaptiveLoop(sessionId: string): Promise<void> {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+
+    const guard = validateSessionForExecution(session);
+    if (!guard.allowed) {
+      session.status = 'failed';
+      session.error = guard.reason;
+      session.updated_at = new Date().toISOString();
+      return;
+    }
+
+    const researchCtx = (session as any)._research || '';
+    const MAX_ITERATIONS = 25;
+    const actionHistory: string[] = [];
+    let iteration = 0;
+    let prevPageText = '';
+
+    while (iteration < MAX_ITERATIONS && session.status === 'executing') {
+      iteration++;
+
+      // 1. Read current page state via Chrome Bridge
+      let pageText = '';
+      try {
+        const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+          tool: 'computer_action',
+          action: 'get_page_text',
+        }, { timeout: 15000 });
+        if (pageRes.data?.success) {
+          pageText = pageRes.data.output as string;
+        }
+      } catch { /* ignore */ }
+
+      if (!pageText) {
+        // Fallback to screenshot + OCR
+        try {
+          const ocrRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'ocr_screenshot',
+          }, { timeout: 30000 });
+          if (ocrRes.data?.success) pageText = ocrRes.data.output as string;
+        } catch { /* ignore */ }
+      }
+
+      // Page change detection — tell the LLM if the page is the same
+      let pageChangeNote = '';
+      if (prevPageText && iteration > 1) {
+        if (pageText === prevPageText) {
+          pageChangeNote = '\n⚠️ PAGE UNCHANGED: The page content is IDENTICAL to before your last action. Your action had NO visible effect. Try a different approach.\n';
+        } else {
+          // Find what's new
+          const prevLines = new Set(prevPageText.split('\n').map(l => l.trim()).filter(Boolean));
+          const newLines = pageText.split('\n').map(l => l.trim()).filter(l => l && !prevLines.has(l));
+          if (newLines.length > 0) {
+            pageChangeNote = `\n✓ PAGE CHANGED. New content appeared:\n${newLines.slice(0, 15).join('\n')}\n`;
+          }
+        }
+      }
+      prevPageText = pageText;
+
+      // Detect repeated actions (stuck in a loop)
+      let stuckWarning = '';
+      if (actionHistory.length >= 3) {
+        const last3 = actionHistory.slice(-3);
+        const lastActions = last3.map(h => {
+          const m = h.match(/\d+\.\s*(\S+)/);
+          return m?.[1] || '';
+        });
+        const lastTargets = last3.map(h => {
+          const m = h.match(/→\s*"([^"]+)"/);
+          return m?.[1] || '';
+        });
+        if (lastActions.every(a => a === lastActions[0]) && lastTargets.every(t => t === lastTargets[0])) {
+          stuckWarning =
+            `\n⚠️ WARNING: You have repeated the SAME action ("${lastActions[0]}" on "${lastTargets[0]}") 3 times with NO effect.\n` +
+            `Your click is NOT working on this element. You MUST try a COMPLETELY DIFFERENT approach:\n` +
+            `- Try scrolling down to see more options\n` +
+            `- Try navigating to a different URL\n` +
+            `- Try clicking a DIFFERENT element (not "${lastTargets[0]}")\n` +
+            `- If you truly cannot find the option, say ACTION: failed\n\n`;
+        }
+      }
+
+      // 2. Ask LLM: what's the next action?
+      const userPrompt =
+        `GOAL: ${session.goal}\n\n` +
+        (researchCtx ? `RESEARCH:\n${researchCtx}\n\n` : '') +
+        (actionHistory.length > 0 ? `ACTIONS TAKEN SO FAR:\n${actionHistory.slice(-10).join('\n')}\n\n` : '') +
+        stuckWarning +
+        pageChangeNote +
+        `CURRENT PAGE (iteration ${iteration}/${MAX_ITERATIONS}):\n${pageText.slice(0, 6000)}\n\n` +
+        `What is the next action to achieve the goal?`;
+
+      let llmResponse = '';
+      try {
+        const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+          user_message: userPrompt,
+          context: {
+            system_override: ComputerUseController.REACT_SYSTEM,
+            max_tokens: 512,
+          },
+        }, { timeout: LLM_TIMEOUT_MS });
+        llmResponse = res.data?.response_text || res.data?.response || '';
+      } catch (err: any) {
+        this.logger.error(`Adaptive loop LLM failed: ${err.message}`);
+        session.status = 'failed';
+        session.error = `LLM error: ${err.message}`;
+        break;
+      }
+
+      // 3. Parse the response
+      const thoughtMatch = llmResponse.match(/THOUGHT:\s*(.+)/i);
+      const actionMatch = llmResponse.match(/ACTION:\s*(\S+)/i);
+      const targetMatch = llmResponse.match(/TARGET:\s*(.+)/i);
+
+      const thought = thoughtMatch?.[1]?.trim() || '';
+      const action = actionMatch?.[1]?.trim().toLowerCase() || '';
+      const target = targetMatch?.[1]?.trim() || '';
+
+      this.logger.log(`Adaptive [${iteration}] THOUGHT: ${thought.slice(0, 100)} | ACTION: ${action} | TARGET: ${target.slice(0, 80)}`);
+
+      // Record as a plan step for the UI
+      const stepObj: PlanStep = {
+        index: session.plan.length,
+        description: thought,
+        action: action === 'done' || action === 'failed' ? 'read_screen' : action,
+        target: target,
+        status: 'running',
+        started_at: new Date().toISOString(),
+        sub_steps: [],
+      };
+      session.plan.push(stepObj);
+      session.current_step = stepObj.index;
+      session.updated_at = new Date().toISOString();
+
+      // 4. Handle terminal actions
+      if (action === 'done') {
+        stepObj.status = 'completed';
+        stepObj.output = target;
+        stepObj.completed_at = new Date().toISOString();
+        actionHistory.push(`${iteration}. ✓ DONE: ${target}`);
+
+        session.status = 'completed';
+        session.updated_at = new Date().toISOString();
+        this.logger.log(`Adaptive loop DONE: ${target}`);
+
+        this.generateSessionSummary(sessionId).catch(() => {});
+        return;
+      }
+
+      if (action === 'failed') {
+        stepObj.status = 'failed';
+        stepObj.output = target;
+        stepObj.completed_at = new Date().toISOString();
+        actionHistory.push(`${iteration}. ✗ FAILED: ${target}`);
+
+        session.status = 'failed';
+        session.error = target;
+        session.updated_at = new Date().toISOString();
+        this.logger.log(`Adaptive loop FAILED: ${target}`);
+
+        this.generateSessionSummary(sessionId).catch(() => {});
+        return;
+      }
+
+      // 4b. Hard loop breaker — if same action repeated 5 times, skip it
+      if (actionHistory.length >= 5) {
+        const recent = actionHistory.slice(-5);
+        const sameAction = recent.every(h => {
+          const m = h.match(/→\s*"([^"]+)"/);
+          return m?.[1] === target;
+        });
+        if (sameAction) {
+          this.logger.warn(`Adaptive loop: action "${action} → ${target}" repeated 5 times — forcing failure`);
+          stepObj.status = 'failed';
+          stepObj.output = `Stuck: repeated "${action}" on "${target}" 5 times with no effect`;
+          stepObj.completed_at = new Date().toISOString();
+          actionHistory.push(`${iteration}. ✗ STUCK on "${target}" — skipping`);
+          session.updated_at = new Date().toISOString();
+          continue; // Let the LLM try a different approach next iteration
+        }
+      }
+
+      // 5. Execute the action
+      try {
+        const result = await this.executeComputerAction(
+          { index: stepObj.index, description: thought, action, target, status: 'running' } as PlanStep,
+          sessionId,
+        );
+
+        stepObj.status = 'completed';
+        stepObj.output = result.output;
+        stepObj.completed_at = new Date().toISOString();
+        if (result.screenshot) session.live_screenshot = result.screenshot;
+
+        actionHistory.push(`${iteration}. ${action}${target ? ` → "${target.slice(0, 60)}"` : ''} → ${result.output.slice(0, 100)}`);
+
+        // Discovery extraction for read_screen
+        if ((action === 'read_screen' || action === 'read_page') && result.output) {
+          await this.replaceDiscoveryTokens(session, stepObj);
+        }
+
+        // 2FA/verification detection
+        const VERIFICATION_PATTERNS = [
+          /two.step.verification/i, /two.factor.auth/i, /2fa/i,
+          /verification.code/i, /enter.the.code/i, /security.check/i,
+          /confirm.your.identity/i, /\/checkpoint\//i, /captcha/i,
+        ];
+        if (VERIFICATION_PATTERNS.some(p => p.test(result.output))) {
+          session.status = 'paused';
+          session.error = 'Verification required. Please complete it in the browser, then resume.';
+          session.updated_at = new Date().toISOString();
+          return;
+        }
+
+      } catch (err: any) {
+        stepObj.status = 'failed';
+        stepObj.output = err.message;
+        stepObj.completed_at = new Date().toISOString();
+        actionHistory.push(`${iteration}. ${action} → ERROR: ${err.message.slice(0, 80)}`);
+        // Don't fail the session — let the LLM decide next action based on the error
+      }
+
+      session.updated_at = new Date().toISOString();
+
+      // Small delay between iterations
+      await new Promise(r => setTimeout(r, 500));
+    }
+
+    // Max iterations reached
+    if (session.status === 'executing') {
+      session.status = 'failed';
+      session.error = `Max iterations (${MAX_ITERATIONS}) reached without completing goal`;
+      session.updated_at = new Date().toISOString();
+      this.generateSessionSummary(sessionId).catch(() => {});
+    }
+  }
+
   /**
-   * Execute plan steps using an agentic loop per step.
+   * Execute plan steps using an agentic loop per step (legacy linear mode).
    *
    * Architecture:
    *   1. For each high-level step, run an agentic loop (LLM decides actions one at a time)
@@ -1073,6 +1441,28 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         step.status = 'completed';
         step.output = output;
         this.logger.log(`Step ${step.index + 1} COMPLETED: ${step.description} → ${output.slice(0, 200)}`);
+
+        // ── 2FA / verification detection: pause and ask user for help ──
+        const VERIFICATION_PATTERNS = [
+          /two.step.verification/i,
+          /two.factor.auth/i,
+          /2fa/i,
+          /verification.code/i,
+          /enter.the.code/i,
+          /security.check/i,
+          /confirm.your.identity/i,
+          /\/checkpoint\//i,
+          /captcha/i,
+          /verify.it.?s.you/i,
+          /login.approval/i,
+        ];
+        if (VERIFICATION_PATTERNS.some(p => p.test(output))) {
+          this.logger.log(`Step ${step.index + 1} detected verification/2FA page — pausing for user`);
+          session.status = 'paused';
+          session.error = 'The website requires verification (2FA, captcha, or identity check). Please complete it in the browser, then resume the session.';
+          session.updated_at = new Date().toISOString();
+          return;
+        }
 
         // ── Discovery: extract values from read_screen output for future steps ──
         if ((step.action === 'read_screen' || step.action === 'read_page') && output) {
@@ -1274,18 +1664,31 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
       .map(s => `  Step ${s.index + 1}: "${s.action}" ${s.description}`)
       .join('\n');
 
+    // Include research context if available for better goal verification
+    const researchCtx = (sessions.get(sessionId) as any)?._research || '';
+
+    // Include step failure context
+    const failedSteps = plan.filter(s => s.status === 'failed');
+    const failureCtx = failedSteps.length > 0
+      ? `\nFAILED STEPS:\n${failedSteps.map(s => `  Step ${s.index + 1}: "${s.description}" → ${(s.output || '').slice(0, 200)}`).join('\n')}\n`
+      : '';
+
     const prompt =
       `GOAL: ${goal}\n\n` +
+      (researchCtx ? `${researchCtx}\n` : '') +
       `COMPLETED STEPS:\n${stepSummary}\n\n` +
+      failureCtx +
       extractedData +
       `CURRENT SCREEN TEXT:\n${screenText.slice(0, 2000)}\n\n` +
       `${currentScreen ? 'A screenshot of the current screen is attached.\n\n' : ''}` +
-      `Question: Has the goal been achieved? The key question is whether the REQUESTED DATA has been captured in the step outputs above.\n\n` +
-      `Rules:\n` +
-      `- If the DATA ALREADY EXTRACTED section contains the answer to the user's goal (e.g., a list of repos, a piece of information), the goal IS satisfied — even if more data MIGHT exist.\n` +
-      `- The goal is to EXTRACT information, not to display it perfectly on screen. Data in step outputs counts.\n` +
-      `- Only say "no" if the extracted data is clearly incomplete (e.g., a "Next page" link was visible and not followed) or the steps failed to reach the right page.\n` +
-      `- When in doubt, say YES — it's better to return partial results than loop forever.\n\n` +
+      `Question: Has the goal been ACTUALLY achieved?\n\n` +
+      `CRITICAL RULES:\n` +
+      `- For ACTION goals (close page, delete item, change setting): verify the ACTION was performed. ` +
+      `Error messages like "This page isn't available" do NOT mean a page was closed — they mean navigation failed.\n` +
+      `- For DATA goals (list repos, find info): verify the data was captured in step outputs.\n` +
+      `- If ANY steps failed or showed error pages, the goal is likely NOT satisfied.\n` +
+      `- If the steps just navigated around without actually performing the requested action, say NO.\n` +
+      `- Look at the CURRENT SCREEN TEXT — does it show evidence the goal was achieved (e.g., "Page deleted", "Settings saved", confirmation dialog)?\n\n` +
       `Answer EXACTLY one line:\n` +
       `SATISFIED: yes\n` +
       `or\n` +
@@ -1296,8 +1699,9 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         user_message: prompt,
         context: {
           system_override:
-            `You check whether a computer-use goal is satisfied based on extracted data. ` +
-            `The data is in the step outputs — if it answers the user's question, say yes. ` +
+            `You verify whether a computer-use goal was ACTUALLY achieved. Be skeptical. ` +
+            `Error pages ("not available", "not found") are FAILURES, not success. ` +
+            `For action goals (close, delete, change), demand evidence of the action completing. ` +
             `Answer ONLY with "SATISFIED: yes" or "SATISFIED: no | reason".`,
           max_tokens: 256,
           ...(currentScreen ? { screen_image: currentScreen } : {}),
@@ -1369,9 +1773,13 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
       ? `\nDATA ALREADY CAPTURED (from completed read_screen steps):\n${capturedData}\n\n`
       : '';
 
+    // Include original research if available
+    const researchCtx = (session as any)?._research || '';
+
     const revisionPrompt =
       contextLine +
       `GOAL: ${goal}\n\n` +
+      (researchCtx ? `${researchCtx}\nFollow the documented steps above. Do NOT guess — use the research.\n\n` : '') +
       `SHARED SCREEN: ${shareCtx}\n\n` +
       discoveryCtx +
       capturedCtx +
@@ -2324,38 +2732,69 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
       return { output: 'Screen captured', screenshot: img };
     }
 
-    // read_screen: extract text from page via Chrome AppleScript (reliable), fall back to vision LLM
+    // read_screen: extract text from page via Chrome Bridge (reliable), fall back to OCR
     if (action === 'read_screen' || action === 'read_page' || action === 'extract_text') {
       const img = await this.getScreenImage(sid);
 
+      // Transient redirect/auth patterns — if the URL matches, wait and retry
+      const TRANSIENT_URL_PATTERNS = [
+        /\/two_step_verification\//i,
+        /\/checkpoint\//i,
+        /\/login\/.*redirect/i,
+        /\/auth\/.*callback/i,
+        /\/oauth\//i,
+        /\/sso\//i,
+        /accounts\.google\.com\/.*continue=/i,
+      ];
+
       // Step 1: Get Chrome URL/title context (fast, always works)
       const session3 = sessions.get(sid);
-      const workUrlHint = (session3 as any)?._work_url_hint || '';
+      const workUrlHint = (sessions.get(sid) as any)?._work_url_hint || '';
       let chromeContext = '';
-      try {
-        const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-          tool: 'computer_action',
-          action: 'get_page_text',
-          text: workUrlHint,
-        }, { timeout: 15000 });
-        if (pageRes.data?.success && pageRes.data.output) {
-          const raw = pageRes.data.output as string;
-          // Check if JS extraction returned actual page content
-          const contentIdx = raw.indexOf('Page content:\n');
-          if (contentIdx >= 0) {
-            const pageContent = raw.slice(contentIdx + 'Page content:\n'.length).trim();
-            if (pageContent.length > 50) {
-              // JS extraction worked — we have real page content
-              this.logger.log(`read_screen via get_page_text+JS: ${raw.length} chars (content: ${pageContent.length} chars)`);
-              return { output: raw, screenshot: img };
-            }
+      let retries = 0;
+      const MAX_TRANSIENT_RETRIES = 3;
+
+      const fetchPageText = async (): Promise<{ raw: string; pageContent: string; url: string } | null> => {
+        try {
+          const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action',
+            action: 'get_page_text',
+            text: workUrlHint,
+          }, { timeout: 15000 });
+          if (pageRes.data?.success && pageRes.data.output) {
+            const raw = pageRes.data.output as string;
+            const urlMatch = raw.match(/^URL:\s*(.+)$/m);
+            const url = urlMatch ? urlMatch[1].trim() : '';
+            const contentIdx = raw.indexOf('Page content:\n');
+            const pageContent = contentIdx >= 0 ? raw.slice(contentIdx + 'Page content:\n'.length).trim() : '';
+            return { raw, pageContent, url };
           }
-          // JS extraction didn't work — keep URL/title for context
-          chromeContext = raw.split('\n\nPage content:')[0];
-          this.logger.log(`read_screen: got Chrome URL/title (${chromeContext.length} chars) but no JS content`);
+        } catch (err: any) {
+          this.logger.warn(`get_page_text failed: ${err.message}`);
         }
-      } catch (err: any) {
-        this.logger.warn(`get_page_text failed: ${err.message}`);
+        return null;
+      };
+
+      let result = await fetchPageText();
+
+      // Retry if page is on a transient auth/redirect URL
+      while (result && retries < MAX_TRANSIENT_RETRIES) {
+        const isTransient = TRANSIENT_URL_PATTERNS.some(p => p.test(result!.url));
+        if (!isTransient) break;
+        retries++;
+        this.logger.log(`read_screen: transient URL detected (${result.url.slice(0, 80)}), waiting 3s and retrying (${retries}/${MAX_TRANSIENT_RETRIES})`);
+        await new Promise(r => setTimeout(r, 3000));
+        result = await fetchPageText();
+      }
+
+      if (result) {
+        if (result.pageContent.length > 50) {
+          this.logger.log(`read_screen via get_page_text+JS: ${result.raw.length} chars (content: ${result.pageContent.length} chars)${retries > 0 ? ` after ${retries} retries` : ''}`);
+          return { output: result.raw, screenshot: img };
+        }
+        // JS extraction didn't work — keep URL/title for context
+        chromeContext = result.raw.split('\n\nPage content:')[0];
+        this.logger.log(`read_screen: got Chrome URL/title (${chromeContext.length} chars) but no JS content`);
       }
 
       // Step 2: Native macOS Vision OCR via dev-agent (fast, accurate, no API calls)
@@ -2496,10 +2935,69 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
 
         await new Promise(r => setTimeout(r, 2500));
         const navScreen = await this.getScreenImage(sid);
-        return { output: `Navigated to ${url}`, screenshot: navScreen };
+
+        // Read page text after navigation to give the LLM actual content
+        let navOutput = `Navigated to ${url}`;
+        try {
+          const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action',
+            action: 'get_page_text',
+            text: session2 ? (session2 as any)._work_url_hint || '' : '',
+          }, { timeout: 10000 });
+          if (pageRes.data?.success && pageRes.data.output) {
+            const pageTitle = (pageRes.data.output as string).match(/^Title:\s*(.+)$/m)?.[1]?.trim();
+            navOutput = pageTitle ? `${pageTitle}` : navOutput;
+          }
+        } catch { /* ignore */ }
+
+        return { output: navOutput, screenshot: navScreen };
       }
 
       case 'click': {
+        // ── Strategy 1: Chrome Bridge DOM click (fast, precise, no coordinate guessing) ──
+        try {
+          const bridgeClickRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action',
+            action: 'chrome_bridge_click',
+            text: target,
+          }, { timeout: 15000 });
+
+          if (bridgeClickRes.data?.success) {
+            this.logger.log(`DOM click via Chrome Bridge: "${target}" → success`);
+            await new Promise(r => setTimeout(r, 800));
+            // Read page text after click to capture the result (not just screenshot)
+            let postClickOutput = '';
+            try {
+              const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action',
+                action: 'get_page_text',
+                text: (sessions.get(sid) as any)?._work_url_hint || '',
+              }, { timeout: 10000 });
+              if (pageRes.data?.success) {
+                postClickOutput = pageRes.data.output;
+                // Update work URL hint from the new page
+                const urlMatch = (pageRes.data.output as string).match(/^URL:\s*(.+)$/m);
+                if (urlMatch) {
+                  try {
+                    const parsed = new URL(urlMatch[1].trim());
+                    const s = sessions.get(sid);
+                    if (s) (s as any)._work_url_hint = parsed.hostname + parsed.pathname;
+                  } catch { /* ignore */ }
+                }
+              }
+            } catch { /* ignore */ }
+            const postClickScreen = await this.getScreenImage(sid);
+            return {
+              output: postClickOutput || `Clicked "${target}" via DOM`,
+              screenshot: postClickScreen,
+            };
+          }
+          this.logger.log(`Chrome Bridge click failed for "${target}": ${bridgeClickRes.data?.output || 'element not found'} — falling back to pixel click`);
+        } catch (err: any) {
+          this.logger.log(`Chrome Bridge click unavailable: ${err.message} — falling back to pixel click`);
+        }
+
+        // ── Strategy 2: Pixel-coordinate click (screenshot → Florence-2/Vision LLM → click) ──
         const screenB64 = await this.getScreenImage(sid);
         if (!screenB64) {
           return { output: `Click failed: no screen image available to locate "${target}"` };
@@ -2511,7 +3009,6 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         }
 
         // The vision model returns coordinates WITHIN the captured image.
-        // The image shows only the shared window content.
         // We must offset to the window's absolute position on screen (multi-monitor).
         let clickX = coords.x;
         let clickY = coords.y;
@@ -2521,7 +3018,7 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
           this.logger.log(`Click offset: image(${coords.x},${coords.y}) + window(${windowBounds.x},${windowBounds.y}) = screen(${clickX},${clickY})`);
         }
 
-        this.logger.log(`Clicking "${target}" at absolute (${clickX}, ${clickY})`);
+        this.logger.log(`Pixel-clicking "${target}" at absolute (${clickX}, ${clickY})`);
         const clickRes = await axios.post(
           `${DEV_AGENT_URL}/internal/dev-agent/execute`,
           { tool: 'computer_action', action: 'click', x: clickX, y: clickY },
@@ -2529,10 +3026,10 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         );
 
         await new Promise(r => setTimeout(r, 500));
-        const postClickScreen = await this.getScreenImage(sid);
+        const postClickScreen2 = await this.getScreenImage(sid);
         return {
           output: clickRes.data?.output || `Clicked "${target}" at (${clickX}, ${clickY})`,
-          screenshot: postClickScreen || clickRes.data?.screenshot,
+          screenshot: postClickScreen2 || clickRes.data?.screenshot,
         };
       }
 

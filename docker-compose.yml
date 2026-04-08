@@ -188,7 +188,7 @@ services:
       - OASIS_RESPONSE_LLM_PROVIDER=${OASIS_RESPONSE_LLM_PROVIDER:-ollama}
       - OASIS_RESPONSE_LLM_MODEL=${OASIS_RESPONSE_LLM_MODEL:-qwen3:8b}
       - OASIS_TOOL_PLAN_LLM_PROVIDER=${OASIS_TOOL_PLAN_LLM_PROVIDER:-ollama}
-      # Default aligns with packages/shared-utils/config.py — pull: ollama pull qwen3:8b
+      # Default aligns with packages/shared_utils/config.py — pull: ollama pull qwen3:8b
       - OASIS_TOOL_PLAN_LLM_MODEL=${OASIS_TOOL_PLAN_LLM_MODEL:-qwen3:8b}
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434

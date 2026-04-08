@@ -5,9 +5,9 @@ WORKDIR /app
 COPY services/graph_builder/requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
-COPY packages/reasoning-schema/ ./packages/reasoning_schema/
-COPY packages/event-types/ ./packages/event_types/
-COPY packages/shared-utils/ ./packages/shared_utils/
+COPY packages/reasoning_schema/ ./packages/reasoning_schema/
+COPY packages/event_types/ ./packages/event_types/
+COPY packages/shared_utils/ ./packages/shared_utils/
 RUN touch packages/__init__.py
 
 COPY services/graph_builder/ ./services/graph_builder/

@@ -24,11 +24,52 @@
       meta["data-login"] = loginEl.getAttribute("data-login");
     }
 
+    // Build a structured snapshot of interactive elements (like an accessibility tree)
+    const interactiveEls = [];
+    const selectors = 'a[href], button, input, select, textarea, [role="button"], [role="link"], [role="tab"], [role="menuitem"], [role="option"], [onclick], [data-testid], [tabindex="0"]';
+    const seen = new Set();
+    for (const el of document.querySelectorAll(selectors)) {
+      if (interactiveEls.length >= 100) break;
+      const rect = el.getBoundingClientRect();
+      // Skip invisible/off-screen elements
+      if (rect.width === 0 || rect.height === 0 || rect.top > window.innerHeight + 200 || rect.bottom < -200) continue;
+      const label =
+        el.getAttribute("aria-label") ||
+        el.getAttribute("title") ||
+        el.getAttribute("alt") ||
+        el.getAttribute("data-tooltip") ||
+        el.textContent?.trim().substring(0, 80) ||
+        "";
+      if (!label || label.length < 2) continue;
+      // Deduplicate by label but keep different tags/roles
+      const key = label.substring(0, 40);
+      if (seen.has(key)) continue;
+      seen.add(key);
+      interactiveEls.push({
+        tag: el.tagName.toLowerCase(),
+        role: el.getAttribute("role") || "",
+        label,
+        href: el.getAttribute("href") || "",
+        type: el.getAttribute("type") || "",
+      });
+    }
+
     return {
       url: location.href,
       title: document.title,
-      text: (document.body ? document.body.innerText : "").substring(0, 12000),
+      text: (() => {
+        let text = document.body ? document.body.innerText : "";
+        // Also capture dialog/modal content that might be in portals
+        for (const el of document.querySelectorAll('[role="dialog"], [role="alertdialog"], [aria-modal="true"], .modal, [data-testid*="dialog"]')) {
+          const dialogText = (el.innerText || "").trim();
+          if (dialogText && !text.includes(dialogText.substring(0, 50))) {
+            text = `[DIALOG] ${dialogText}\n\n${text}`;
+          }
+        }
+        return text;
+      })().substring(0, 8000),
       meta,
+      interactive: interactiveEls,
     };
   }
 
@@ -42,9 +83,37 @@
       return els[idx] || null;
     }
 
-    // Text content walk
+    // Text content walk — finds clickable elements matching the text
     if (textMatch) {
-      const lowerMatch = textMatch.toLowerCase();
+      const lowerMatch = textMatch.toLowerCase().trim();
+
+      // Strategy 1: search interactive elements by aria-label, text, title (most precise)
+      const interactiveSelectors = 'a[href], button, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [tabindex="0"], [onclick]';
+      const candidates = [];
+      for (const el of document.querySelectorAll(interactiveSelectors)) {
+        const rect = el.getBoundingClientRect();
+        if (rect.width === 0 || rect.height === 0) continue;
+
+        const label = (el.getAttribute("aria-label") || "").toLowerCase();
+        const title = (el.getAttribute("title") || "").toLowerCase();
+        const text = (el.textContent || "").trim().toLowerCase();
+
+        // Exact match (highest priority)
+        if (label === lowerMatch || title === lowerMatch || text === lowerMatch) {
+          candidates.unshift(el);
+          continue;
+        }
+        // Contains match
+        if (label.includes(lowerMatch) || title.includes(lowerMatch) || text.includes(lowerMatch)) {
+          candidates.push(el);
+        }
+      }
+      if (candidates.length > 0) {
+        const idx = index || 0;
+        return candidates[Math.min(idx, candidates.length - 1)];
+      }
+
+      // Strategy 2: tree walker fallback for non-interactive elements
       const walk = document.createTreeWalker(
         document.body,
         NodeFilter.SHOW_ELEMENT,
@@ -55,10 +124,9 @@
               return NodeFilter.FILTER_REJECT;
             }
             const text = (node.textContent || "").trim().toLowerCase();
-            if (text === lowerMatch || text.startsWith(lowerMatch)) {
+            if (text === lowerMatch || text.includes(lowerMatch)) {
               return NodeFilter.FILTER_ACCEPT;
             }
-            // Check aria-label
             const label = (node.getAttribute("aria-label") || "").toLowerCase();
             if (label === lowerMatch || label.startsWith(lowerMatch)) {
               return NodeFilter.FILTER_ACCEPT;
@@ -94,13 +162,17 @@
     if (!el) return null;
     const rect = el.getBoundingClientRect();
     return {
+      // Screen-absolute coordinates
       x: Math.round(rect.left + window.screenX),
       y: Math.round(rect.top + window.screenY),
       width: Math.round(rect.width),
       height: Math.round(rect.height),
       centerX: Math.round(rect.left + rect.width / 2 + window.screenX),
       centerY: Math.round(rect.top + rect.height / 2 + window.screenY),
-      visible: rect.width > 0 && rect.height > 0,
+      // Viewport-relative coordinates (for CDP Input.dispatchMouseEvent)
+      vpX: Math.round(rect.left + rect.width / 2),
+      vpY: Math.round(rect.top + rect.height / 2),
+      visible: rect.width > 0 && rect.height > 0 && rect.top < window.innerHeight && rect.bottom > 0,
       tag: el.tagName.toLowerCase(),
       text: (el.textContent || "").trim().substring(0, 200),
     };
@@ -145,6 +217,17 @@
             success: true,
             payload: getElementBounds(el2),
           });
+          break;
+        }
+
+        case "scroll_to_element": {
+          const el3 = findElement(msg.selector, msg.text_match, msg.index);
+          if (el3) {
+            el3.scrollIntoView({ block: "center", behavior: "instant" });
+            sendResponse({ success: true });
+          } else {
+            sendResponse({ success: false, error: "Element not found" });
+          }
           break;
         }
 

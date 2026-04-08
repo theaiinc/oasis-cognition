@@ -339,6 +339,12 @@ export function ComputerUsePanel({
     }
   }, [activeSession?.session_id]);
 
+  /* ── Sync panic key to dev-agent on mount ── */
+  useEffect(() => {
+    const devAgentUrl = `${window.location.protocol}//${window.location.hostname}:8008`;
+    axios.post(`${devAgentUrl}/internal/dev-agent/cu-panic-key`, { hotkey: panicKey }).catch(() => {});
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   /* ── Check Chrome Bridge extension status ── */
   useEffect(() => {
     const check = async () => {
@@ -450,6 +456,9 @@ export function ComputerUsePanel({
   const updatePanicKey = (newKey: string) => {
     setPanicKey(newKey);
     localStorage.setItem('cu-panic-key', newKey);
+    // Sync to dev-agent so the global OS-level hotkey updates too
+    const devAgentUrl = `${window.location.protocol}//${window.location.hostname}:8008`;
+    axios.post(`${devAgentUrl}/internal/dev-agent/cu-panic-key`, { hotkey: newKey }).catch(() => {});
   };
 
   /* ── Create session (stays in sidebar; no chat involved) ── */

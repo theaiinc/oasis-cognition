@@ -665,3 +665,26 @@ class ToolExecutorService:
             return {"success": False, "output": "", "error": f"Find timed out after {COMMAND_TIMEOUT_SECONDS}s", "blocked": False}
         except Exception as e:
             return {"success": False, "output": "", "error": str(e), "blocked": False}
+
+    async def web_search(self, query: str, num_results: int = 5) -> dict[str, Any]:
+        """Search the web via DuckDuckGo. Used by CU pre-plan research."""
+        # Try the newer 'ddgs' package first, fall back to 'duckduckgo_search'
+        for pkg in ("ddgs", "duckduckgo_search"):
+            try:
+                mod = __import__(pkg, fromlist=["DDGS"])
+                DDGS = getattr(mod, "DDGS")
+                results = []
+                for r in DDGS().text(query, max_results=num_results):
+                    results.append({
+                        "title": r.get("title", ""),
+                        "url": r.get("href", r.get("url", "")),
+                        "snippet": r.get("body", r.get("snippet", "")),
+                    })
+                return {"success": True, "results": results}
+            except ImportError:
+                continue
+            except Exception as e:
+                logger.error("Web search failed (%s): %s", pkg, e)
+                return {"success": False, "results": [], "error": str(e)}
+        logger.warning("No web search package available (pip install ddgs)")
+        return {"success": False, "results": [], "error": "ddgs package not installed"}

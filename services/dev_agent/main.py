@@ -200,6 +200,11 @@ async def lifespan(app: FastAPI):
             logger.warning("Failed to notify Docker services on startup: %s", e)
 
     logger.info("Dev Agent started (project_root=%s, project_id=%s)", PROJECT_ROOT, pid)
+
+    # Start global emergency stop hotkey listener (Cmd+Escape by default)
+    from services.dev_agent.global_hotkey import start_global_hotkey_listener
+    start_global_hotkey_listener()
+
     yield
 
 
@@ -836,6 +841,20 @@ async def health():
         "tunnel": tunnel_manager.status(),
         "chrome_bridge": chrome_bridge.connected,
     }
+
+
+@app.get("/internal/dev-agent/cu-panic-key")
+async def get_panic_key():
+    from services.dev_agent.global_hotkey import get_current_hotkey
+    return {"hotkey": get_current_hotkey()}
+
+
+@app.post("/internal/dev-agent/cu-panic-key")
+async def set_panic_key(body: dict):
+    from services.dev_agent.global_hotkey import update_hotkey
+    ui_key = body.get("hotkey", "meta+Escape")
+    pynput_key = update_hotkey(ui_key)
+    return {"hotkey": pynput_key, "ui_format": ui_key}
 
 
 if __name__ == "__main__":

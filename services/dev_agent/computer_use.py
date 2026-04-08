@@ -765,15 +765,30 @@ except Exception as e:
                     if meta.get("data-login"):
                         meta_lines.append(f"Signed in as {meta['data-login']}")
                     meta_prefix = "\n".join(meta_lines) + "\n" if meta_lines else ""
+                    # Build interactive elements section for the LLM
+                    interactive = p.get("interactive", [])
+                    interactive_lines = ""
+                    if interactive:
+                        items = []
+                        for el in interactive[:60]:
+                            parts = [el.get("tag", "")]
+                            if el.get("role"):
+                                parts.append(f'role="{el["role"]}"')
+                            if el.get("href"):
+                                parts.append(f'href="{el["href"][:80]}"')
+                            items.append(f'  [{" ".join(parts)}] {el.get("label", "")}')
+                        interactive_lines = "\n\nClickable elements:\n" + "\n".join(items)
+
                     # Format to match the expected output the CU controller parses
                     output = (
                         f"URL: {p.get('url', '')}\n"
                         f"Title: {p.get('title', '')}\n\n"
                         f"Open tabs:\n{tabs_str}\n\n"
                         f"Page content:\n{meta_prefix}{page_text}"
+                        f"{interactive_lines}"
                     )
-                    logger.info("get_page_text via Chrome Bridge: %d chars", len(output))
-                    return {"success": True, "output": output[:8000], "screenshot": ""}
+                    logger.info("get_page_text via Chrome Bridge: %d chars (%d interactive elements)", len(output), len(interactive))
+                    return {"success": True, "output": output[:12000], "screenshot": ""}
                 else:
                     logger.warning("Chrome Bridge get_page_text failed: %s", resp.get("error"))
             except Exception as e:
@@ -920,6 +935,29 @@ except Exception as e:
             return {"success": True, "output": f"Opened Chrome window at ({scr_x},{scr_y}) → {url}", "screenshot": ""}
         except Exception as e:
             return {"success": False, "output": f"chrome_navigate error: {e}", "screenshot": ""}
+
+    if action == "chrome_bridge_click":
+        # Click an element via the Chrome Bridge extension using text match.
+        # Falls back gracefully if the bridge isn't connected.
+        if not text:
+            return {"success": False, "output": "chrome_bridge_click requires text (element description)", "screenshot": ""}
+        if not chrome_bridge.connected:
+            return {"success": False, "output": "Chrome Bridge not connected", "screenshot": ""}
+        try:
+            resp = await chrome_bridge.send_command("click_element", {
+                "text_match": text,
+            }, timeout=10)
+            if resp.get("success"):
+                payload = resp.get("payload", {})
+                logger.info("Chrome Bridge click: '%s' → success (bounds: %s)", text, payload.get("bounds"))
+                return {"success": True, "output": f"Clicked '{text}' via DOM", "screenshot": ""}
+            else:
+                error = resp.get("error", "element not found")
+                logger.info("Chrome Bridge click failed: '%s' → %s", text, error)
+                return {"success": False, "output": error, "screenshot": ""}
+        except Exception as e:
+            logger.warning("Chrome Bridge click error: %s", e)
+            return {"success": False, "output": str(e), "screenshot": ""}
 
     if action == "chrome_set_url":
         if not text:

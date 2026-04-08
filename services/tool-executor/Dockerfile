@@ -21,7 +21,7 @@ ENV PLAYWRIGHT_BROWSERS_PATH=/opt/playwright-browsers
 RUN mkdir -p /opt/playwright-browsers \
     && playwright install --with-deps chromium
 
-COPY packages/shared-utils/ ./packages/shared_utils/
+COPY packages/shared_utils/ ./packages/shared_utils/
 RUN touch packages/__init__.py
 
 COPY services/tool-executor/ ./services/tool_executor/

@@ -408,15 +408,19 @@ export class ComputerUseController {
    */
   private async researchGoal(goal: string): Promise<string> {
     try {
-      // Generate a search query focused on "how to" steps
+      // Generate a search query focused on the ACTION the user wants to perform
       const queryRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
         user_message:
-          `Generate a short web search query to find step-by-step instructions for this task:\n` +
+          `Generate a web search query to find step-by-step instructions for this task:\n` +
           `"${goal}"\n\n` +
-          `Reply with ONLY the search query (one line, no quotes). ` +
-          `Focus on the specific UI steps needed. ` +
-          `Example: for "close my Facebook page" → "how to close deactivate Facebook page step by step 2025"`,
-        context: { system_override: 'Generate a web search query. Reply with ONLY the query.', max_tokens: 60 },
+          `Reply with ONLY the search query (one line, no quotes).\n` +
+          `IMPORTANT: Focus on the PRIMARY ACTION (delete, close, deactivate, create, change, etc.) not on secondary details.\n` +
+          `Always include the year (2025) and "step by step" for better results.\n` +
+          `Examples:\n` +
+          `- "close my Facebook page Kive" → "how to delete deactivate Facebook page step by step 2025"\n` +
+          `- "list all my github repos" → "how to view all repositories on GitHub 2025"\n` +
+          `- "change my Twitter display name" → "how to change display name on Twitter X step by step 2025"`,
+        context: { system_override: 'Generate a web search query focused on the primary ACTION. Reply with ONLY the query.', max_tokens: 60 },
       }, { timeout: 15000 });
       const searchQuery = (queryRes.data?.response_text || queryRes.data?.response || '').trim();
       if (!searchQuery) return '';
@@ -439,7 +443,27 @@ export class ComputerUseController {
             `${i + 1}. ${r.title}\n   ${r.snippet}\n   Source: ${r.url}`)
           .join('\n');
         this.logger.log(`CU research: found ${results.length} results for "${searchQuery}"`);
-        return `WEB RESEARCH (how to achieve this goal):\n${guide}\n`;
+
+        // Fetch detailed content from the most relevant result (official help pages first)
+        let detailedGuide = '';
+        const officialUrl = results.find((r: { url: string }) =>
+          /facebook\.com\/help|meta\.com|support\.|help\.|wikihow|localiq/i.test(r.url))?.url
+          || results[0]?.url;
+
+        if (officialUrl) {
+          try {
+            const browseRes = await axios.post(`${TOOL_EXECUTOR_URL}/internal/tool/execute`, {
+              tool: 'browse_url',
+              url: officialUrl,
+            }, { timeout: 20000 });
+            if (browseRes.data?.success && browseRes.data.output) {
+              detailedGuide = `\nDETAILED GUIDE (from ${officialUrl}):\n${(browseRes.data.output as string).slice(0, 3000)}\n`;
+              this.logger.log(`CU research: fetched ${detailedGuide.length} chars from ${officialUrl}`);
+            }
+          } catch { /* browsing failed — use snippets only */ }
+        }
+
+        return `WEB RESEARCH (how to achieve this goal):\n${guide}\n${detailedGuide}`;
       }
 
       // Fallback: use the formatted output string

@@ -49,15 +49,32 @@ function createWindow() {
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
+      webSecurity: false, // Allow fetch from file:// to http://localhost
     },
   });
 
-  // Pass config via query params in the URL
-  const htmlPath = path.join(__dirname, "index.html");
-  const fileUrl = `file://${htmlPath}?port=${DEV_AGENT_PORT}&gateway=${GATEWAY_PORT}&session=${SESSION_ID}`;
-  mainWindow.loadURL(fileUrl);
+  // Load from localhost to avoid file:// CORS issues with fetch
+  // Try dev-agent served version first, fall back to file://
+  const httpUrl = `http://localhost:${DEV_AGENT_PORT}/cu-overlay?gateway=${GATEWAY_PORT}&session=${SESSION_ID}`;
+  const fileUrl = `file://${path.join(__dirname, "index.html")}?port=${DEV_AGENT_PORT}&gateway=${GATEWAY_PORT}&session=${SESSION_ID}`;
 
-  // Debug: open devtools to check WS connection
+  mainWindow.loadURL(httpUrl).catch(() => {
+    // Dev-agent doesn't serve the overlay — fall back to file://
+    mainWindow.loadURL(fileUrl);
+  });
+
+  // Force always-on-top at the floating panel level (above normal windows)
+  mainWindow.setAlwaysOnTop(true, "floating");
+  mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+
+  // Re-assert always-on-top periodically (some macOS window managers reset it)
+  setInterval(() => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.setAlwaysOnTop(true, "floating");
+    }
+  }, 5000);
+
+  // Debug: open devtools to check connection
   if (process.argv.includes('--devtools')) {
     mainWindow.webContents.openDevTools({ mode: 'detach' });
   }

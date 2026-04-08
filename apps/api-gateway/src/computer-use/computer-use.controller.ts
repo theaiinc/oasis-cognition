@@ -89,13 +89,29 @@ export class ComputerUseController {
   /** Get the most recent non-terminal session (for panel reconnection after tab switch). */
   @Get('sessions/active')
   getActiveSession() {
+    // Return any non-terminal session first
     const active = [...sessions.values()]
       .filter(s => !['completed', 'failed', 'cancelled'].includes(s.status))
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
-    if (active.length === 0) return { session: null };
-    // Strip heavy screenshot for the list response
-    const { live_screenshot, ...rest } = active[0];
-    return { session: rest };
+    if (active.length > 0) {
+      const { live_screenshot, ...rest } = active[0];
+      return { session: rest };
+    }
+
+    // If no active session, return the most recently completed one
+    // (within last 30s) so the overlay can show the final state
+    const recent = [...sessions.values()]
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    if (recent.length > 0) {
+      const latest = recent[0];
+      const age = Date.now() - new Date(latest.updated_at).getTime();
+      if (age < 30_000) {
+        const { live_screenshot, ...rest } = latest;
+        return { session: rest };
+      }
+    }
+
+    return { session: null };
   }
 
   /** Get a single session (includes live screenshot). */

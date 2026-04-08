@@ -217,6 +217,18 @@ app.add_middleware(
 )
 
 CODE_INDEXER_URL = os.getenv("CODE_INDEXER_URL", "http://localhost:8010")
+
+# ── Serve CU overlay HTML ──────────────────────────────────────────────────────
+from fastapi.responses import FileResponse
+
+@app.get("/cu-overlay")
+async def serve_cu_overlay():
+    """Serve the CU overlay HTML from the apps/cu-overlay directory."""
+    overlay_path = os.path.join(os.path.dirname(__file__), "../../apps/cu-overlay/index.html")
+    overlay_path = os.path.abspath(overlay_path)
+    if os.path.exists(overlay_path):
+        return FileResponse(overlay_path, media_type="text/html")
+    return {"error": "overlay not found"}
 TOOL_EXECUTOR_URL = os.getenv("TOOL_EXECUTOR_URL", "http://localhost:8007")
 
 

@@ -419,7 +419,10 @@
   // Poll active session via HTTP (more reliable than WebSocket in Electron)
   async function pollSession() {
     try {
-      const resp = await fetch(`${GW_URL}/api/v1/computer-use/sessions/active`, { signal: AbortSignal.timeout(5000) });
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      const resp = await fetch(`${GW_URL}/api/v1/computer-use/sessions/active`, { signal: controller.signal });
+      clearTimeout(timer);
       if (!resp.ok) { updateUI({ type: 'idle' }); return; }
       const data = await resp.json();
       const session = data.session;
@@ -430,7 +433,7 @@
         .filter(s => s.status !== 'skipped')
         .map(s => ({ index: s.index, status: s.status, description: s.description || '', action: s.action || '' }));
 
-      updateUI({
+      const state = {
         type: 'session_state',
         session_id: session.session_id,
         status: session.status,
@@ -438,17 +441,19 @@
         steps,
         current_step: session.current_step || 0,
         error: session.error,
-      });
+      };
+      console.log(`[Poll] ${state.status} step=${state.current_step+1}/${steps.length} statuses=${steps.map(s=>s.status[0]).join('')}`);
+      updateUI(state);
     } catch {
       // Gateway unreachable — show idle
       updateUI({ type: 'idle' });
     }
   }
 
-  // Poll every 2 seconds
+  // Poll every 1.5 seconds for faster updates
   pollSession();
-  setInterval(pollSession, 2000);
-  console.log('[Overlay] Polling', GW_URL, 'every 2s');
+  setInterval(pollSession, 1500);
+  console.log('[Overlay] Polling', GW_URL, 'every 1.5s');
 
   // Emergency stop / resume
   stopBtn.addEventListener('click', async () => {

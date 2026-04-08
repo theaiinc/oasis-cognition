@@ -324,6 +324,117 @@ async def chrome_bridge_ws(ws: WebSocket):
         chrome_bridge.disconnect()
 
 
+# ── CU Overlay WebSocket feed ──────────────────────────────────────────────────
+
+_overlay_clients: set[WebSocket] = set()
+
+API_GATEWAY_URL = os.getenv("API_GATEWAY_URL", "http://localhost:8000")
+
+@app.websocket("/ws/cu-overlay")
+async def cu_overlay_ws(ws: WebSocket):
+    """Stream live CU session state to the overlay window."""
+    import asyncio as _asyncio
+
+    await ws.accept()
+    _overlay_clients.add(ws)
+    logger.info("CU overlay client connected (%d total)", len(_overlay_clients))
+    try:
+        while True:
+            # Poll the active CU session from the gateway
+            try:
+                async with httpx.AsyncClient(timeout=5) as client:
+                    resp = await client.get(f"{API_GATEWAY_URL}/api/v1/computer-use/sessions/active")
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        session = data.get("session")
+                        if session:
+                            # Filter steps to skip 'skipped' pre-plan steps
+                            steps = [
+                                {"index": s["index"], "status": s["status"], "description": s.get("description", ""), "action": s.get("action", "")}
+                                for s in session.get("plan", [])
+                                if s.get("status") != "skipped"
+                            ]
+                            await ws.send_json({
+                                "type": "session_state",
+                                "session_id": session.get("session_id"),
+                                "status": session.get("status"),
+                                "goal": session.get("goal", ""),
+                                "steps": steps,
+                                "current_step": session.get("current_step", 0),
+                                "error": session.get("error"),
+                            })
+                        else:
+                            await ws.send_json({"type": "idle"})
+                    else:
+                        await ws.send_json({"type": "idle"})
+            except Exception:
+                await ws.send_json({"type": "idle"})
+
+            await _asyncio.sleep(2)
+    except WebSocketDisconnect:
+        pass
+    except Exception as e:
+        logger.debug("CU overlay WS: %s", e)
+    finally:
+        _overlay_clients.discard(ws)
+        logger.info("CU overlay client disconnected (%d remaining)", len(_overlay_clients))
+
+
+# ── CU Overlay launch/close endpoints ─────────────────────────────────────────
+
+_overlay_process = None
+
+@app.post("/internal/dev-agent/cu-overlay/launch")
+async def launch_cu_overlay(body: dict = {}):
+    """Launch the Electron overlay window."""
+    import subprocess as _subprocess
+    global _overlay_process
+
+    session_id = body.get("session_id", "")
+    gateway_port = body.get("gateway_port", "8000")
+
+    # If already running, close it first (new session replaces old overlay)
+    if _overlay_process and _overlay_process.poll() is None:
+        _overlay_process.terminate()
+        _overlay_process = None
+        await asyncio.sleep(0.5)
+
+    overlay_dir = os.path.join(os.path.dirname(__file__), "../../apps/cu-overlay")
+    overlay_dir = os.path.abspath(overlay_dir)
+
+    # Check if electron is installed
+    npx = "npx"
+    electron_bin = os.path.join(overlay_dir, "node_modules", ".bin", "electron")
+    if os.path.exists(electron_bin):
+        cmd = [electron_bin, "main.js", f"--session={session_id}", f"--gateway={gateway_port}"]
+    else:
+        cmd = [npx, "electron", "main.js", f"--session={session_id}", f"--gateway={gateway_port}"]
+
+    try:
+        _overlay_process = _subprocess.Popen(
+            cmd,
+            cwd=overlay_dir,
+            stdout=_subprocess.DEVNULL,
+            stderr=_subprocess.DEVNULL,
+        )
+        logger.info("CU overlay launched (pid=%d, session=%s)", _overlay_process.pid, session_id)
+        return {"status": "launched", "pid": _overlay_process.pid}
+    except Exception as e:
+        logger.error("Failed to launch CU overlay: %s", e)
+        return {"status": "error", "error": str(e)}
+
+
+@app.post("/internal/dev-agent/cu-overlay/close")
+async def close_cu_overlay():
+    """Close the overlay window."""
+    global _overlay_process
+    if _overlay_process and _overlay_process.poll() is None:
+        _overlay_process.terminate()
+        _overlay_process = None
+        return {"status": "closed"}
+    return {"status": "not_running"}
+
+
 # ── Unified tool endpoint (mirrors tool-executor pattern) ────────────────────
 
 @app.post("/internal/dev-agent/execute")

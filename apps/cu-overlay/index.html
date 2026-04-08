@@ -1,0 +1,478 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Oasis CU Overlay</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  :root {
+    --bg: rgba(10, 15, 26, 0.92);
+    --surface: rgba(22, 27, 34, 0.8);
+    --border: rgba(48, 54, 61, 0.6);
+    --text: #c9d1d9;
+    --text-dim: #6e7681;
+    --accent: #a855f7;
+    --green: #22c55e;
+    --red: #ef4444;
+    --amber: #f59e0b;
+    --blue: #3b82f6;
+  }
+  html, body {
+    background: transparent !important;
+  }
+  body {
+    font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Text', 'Segoe UI', sans-serif;
+    color: var(--text);
+    font-size: 12px;
+    line-height: 1.4;
+    overflow: hidden;
+    user-select: none;
+  }
+  .root {
+    background: rgba(10, 15, 26, 0.82);
+    backdrop-filter: blur(16px);
+    -webkit-backdrop-filter: blur(16px);
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    border-radius: 12px;
+    margin: 4px;
+    display: flex;
+    flex-direction: column;
+    height: calc(100vh - 8px);
+    overflow: hidden;
+  }
+
+  /* Header — draggable */
+  .header {
+    -webkit-app-region: drag;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .header-left {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+  .status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    background: var(--green);
+    animation: pulse 2s infinite;
+  }
+  .status-dot.paused { background: var(--amber); animation: none; }
+  .status-dot.failed { background: var(--red); animation: none; }
+  .status-dot.idle { background: var(--text-dim); animation: none; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.4; } }
+  .header-title { font-size: 11px; font-weight: 600; color: #e6edf3; }
+  .close-btn {
+    -webkit-app-region: no-drag;
+    background: none; border: none; color: var(--text-dim);
+    cursor: pointer; font-size: 14px; padding: 2px 4px; border-radius: 4px;
+  }
+  .close-btn:hover { background: rgba(255,255,255,0.1); color: var(--text); }
+
+  /* Warning banner */
+  .warning {
+    background: rgba(239, 68, 68, 0.12);
+    border-bottom: 1px solid rgba(239, 68, 68, 0.2);
+    padding: 6px 12px;
+    font-size: 10px;
+    color: #fca5a5;
+    text-align: center;
+    flex-shrink: 0;
+  }
+
+  /* Goal */
+  .goal {
+    padding: 8px 12px;
+    font-size: 11px;
+    color: var(--text);
+    border-bottom: 1px solid var(--border);
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    flex-shrink: 0;
+  }
+
+  /* Step list */
+  .steps {
+    flex: 1;
+    overflow-y: auto;
+    padding: 6px 8px;
+    scrollbar-width: thin;
+    scrollbar-color: rgba(255,255,255,0.1) transparent;
+  }
+  .steps::-webkit-scrollbar { width: 4px; }
+  .steps::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
+  .step {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 4px 6px;
+    border-radius: 6px;
+    margin-bottom: 2px;
+  }
+  .step.running { background: rgba(59, 130, 246, 0.08); border-left: 2px solid var(--blue); }
+  .step.failed { opacity: 0.6; }
+  .step-icon {
+    width: 14px; height: 14px;
+    flex-shrink: 0;
+    margin-top: 1px;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 10px;
+  }
+  .step-icon.completed { color: var(--green); }
+  .step-icon.running { color: var(--blue); animation: spin 1.2s linear infinite; }
+  .step-icon.failed { color: var(--red); }
+  .step-icon.pending { color: var(--text-dim); }
+  .step-icon.skipped { color: var(--text-dim); opacity: 0.4; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  .step-text {
+    font-size: 10px;
+    color: var(--text);
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+  }
+  .step.completed .step-text { color: var(--text-dim); }
+
+  /* Steering input */
+  .steer-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 6px 8px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .steer-input {
+    flex: 1;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 10px;
+    color: var(--text);
+    outline: none;
+  }
+  .steer-input::placeholder { color: var(--text-dim); }
+  .steer-input:focus { border-color: var(--accent); }
+  .steer-send {
+    background: var(--accent);
+    border: none;
+    border-radius: 6px;
+    padding: 5px 8px;
+    font-size: 10px;
+    color: white;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .steer-send:hover { opacity: 0.9; }
+
+  /* Controls */
+  .controls {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    padding: 8px;
+    border-top: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .btn {
+    border: none;
+    border-radius: 8px;
+    padding: 8px;
+    font-size: 11px;
+    font-weight: 600;
+    cursor: pointer;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 4px;
+    transition: all 0.15s;
+  }
+  .btn-stop {
+    flex: 1;
+    background: var(--red);
+    color: white;
+  }
+  .btn-stop:hover { background: #dc2626; }
+  .btn-stop:active { transform: scale(0.97); }
+  .btn-resume {
+    flex: 1;
+    background: var(--green);
+    color: white;
+  }
+  .btn-resume:hover { background: #16a34a; }
+  .btn-mic {
+    width: 36px; height: 36px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    color: var(--text-dim);
+  }
+  .btn-mic.active {
+    background: rgba(168, 85, 247, 0.15);
+    border-color: var(--accent);
+    color: var(--accent);
+  }
+  .btn-mic:hover { border-color: var(--accent); color: var(--accent); }
+
+  /* Status messages */
+  .status-msg {
+    padding: 12px;
+    text-align: center;
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+  .status-msg.completed { color: var(--green); }
+  .status-msg.failed { color: var(--red); }
+
+  /* No session */
+  .idle-msg {
+    flex: 1;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: var(--text-dim);
+    font-size: 11px;
+  }
+</style>
+</head>
+<body>
+<div class="root" id="app">
+  <!-- Header -->
+  <div class="header">
+    <div class="header-left">
+      <div class="status-dot" id="statusDot"></div>
+      <span class="header-title" id="headerTitle">CU Active</span>
+    </div>
+    <button class="close-btn" id="closeBtn" title="Close overlay">&#x2715;</button>
+  </div>
+
+  <!-- Warning -->
+  <div class="warning" id="warning" style="display:none">Agent is controlling the browser — avoid interacting</div>
+
+  <!-- Goal -->
+  <div class="goal" id="goal">Waiting for session...</div>
+
+  <!-- Steps -->
+  <div class="steps" id="steps">
+    <div class="idle-msg" id="idleMsg">Waiting for session data...</div>
+  </div>
+
+  <!-- Steering input -->
+  <div class="steer-bar" id="steerBar">
+    <input class="steer-input" id="steerInput" placeholder="Steer the agent..." disabled />
+    <button class="steer-send" id="steerSend" disabled>Send</button>
+  </div>
+
+  <!-- Controls -->
+  <div class="controls" id="controls">
+    <button class="btn btn-stop" id="stopBtn" disabled>EMERGENCY STOP</button>
+    <button class="btn btn-mic" id="micBtn" title="Voice steering">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" x2="12" y1="19" y2="22"/></svg>
+    </button>
+  </div>
+</div>
+
+<script>
+(function() {
+  // Parse query params
+  const params = new URLSearchParams(window.location.search);
+  const WS_PORT = params.get('port') || '8008';
+  const GW_PORT = params.get('gateway') || '8000';
+  const INITIAL_SESSION = params.get('session') || '';
+  const GW_URL = `http://localhost:${GW_PORT}`;
+  const WS_URL = `ws://localhost:${WS_PORT}/ws/cu-overlay`;
+
+  // Elements
+  const statusDot = document.getElementById('statusDot');
+  const headerTitle = document.getElementById('headerTitle');
+  const warning = document.getElementById('warning');
+  const goalEl = document.getElementById('goal');
+  const stepsEl = document.getElementById('steps');
+  const idleMsg = document.getElementById('idleMsg');
+  const steerBar = document.getElementById('steerBar');
+  const steerInput = document.getElementById('steerInput');
+  const steerSend = document.getElementById('steerSend');
+  const controls = document.getElementById('controls');
+  const stopBtn = document.getElementById('stopBtn');
+  const micBtn = document.getElementById('micBtn');
+  const closeBtn = document.getElementById('closeBtn');
+
+  let currentSessionId = INITIAL_SESSION;
+  let ws = null;
+  let autoCloseTimer = null;
+
+  // Status icons
+  const ICONS = {
+    completed: '<span style="color:#22c55e">&#10003;</span>',
+    running: '<span style="color:#3b82f6" class="step-icon running">&#9881;</span>',
+    failed: '<span style="color:#ef4444">&#10007;</span>',
+    pending: '<span style="color:#6e7681">&#9675;</span>',
+    skipped: '<span style="color:#6e7681;opacity:0.4">&#8722;</span>',
+  };
+
+  function updateUI(data) {
+    if (data.type === 'idle' || !data.session_id) {
+      statusDot.className = 'status-dot idle';
+      headerTitle.textContent = 'No Active Session';
+      goalEl.textContent = 'Waiting for a computer-use session...';
+      warning.style.display = 'none';
+      stepsEl.innerHTML = '<div class="idle-msg">No session running</div>';
+      stopBtn.disabled = true;
+      steerInput.disabled = true;
+      steerSend.disabled = true;
+      stopBtn.style.opacity = '0.4';
+      return;
+    }
+
+    currentSessionId = data.session_id;
+    const status = data.status;
+    const isActive = status === 'executing' || status === 'paused' || status === 'planning';
+    const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
+
+    // Status dot
+    statusDot.className = 'status-dot';
+    if (status === 'executing') statusDot.classList.add(''); // default green pulse
+    else if (status === 'paused') statusDot.classList.add('paused');
+    else if (status === 'failed' || status === 'cancelled') statusDot.classList.add('failed');
+    else statusDot.classList.add('idle');
+
+    // Header
+    const statusLabels = {
+      executing: 'CU Active',
+      paused: 'Paused',
+      planning: 'Planning...',
+      awaiting_approval: 'Awaiting Approval',
+      completed: 'Completed',
+      failed: 'Failed',
+      cancelled: 'Cancelled',
+    };
+    headerTitle.textContent = statusLabels[status] || status;
+
+    // Warning
+    warning.style.display = isActive && status === 'executing' ? '' : 'none';
+
+    // Goal
+    goalEl.textContent = data.goal || 'No goal';
+    goalEl.title = data.goal || '';
+
+    // Steps
+    const steps = data.steps || [];
+    if (steps.length === 0) {
+      stepsEl.innerHTML = '<div class="idle-msg">Waiting for steps...</div>';
+    } else {
+      const html = steps.map(s => {
+        const icon = ICONS[s.status] || ICONS.pending;
+        const cls = s.status === 'running' ? 'running' :
+                    s.status === 'failed' ? 'failed' :
+                    s.status === 'completed' ? 'completed' : '';
+        return `<div class="step ${cls}">
+          <div class="step-icon">${icon}</div>
+          <div class="step-text">${s.description || s.action || ''}</div>
+        </div>`;
+      }).join('');
+      stepsEl.innerHTML = html;
+
+      // Auto-scroll to running step
+      const runningEl = stepsEl.querySelector('.step.running');
+      if (runningEl) runningEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+    }
+
+    // Error display
+    if (data.error && isTerminal) {
+      stepsEl.innerHTML += `<div class="status-msg failed">${data.error}</div>`;
+    }
+    if (status === 'completed') {
+      stepsEl.innerHTML += '<div class="status-msg completed">Goal achieved</div>';
+    }
+
+    // Controls — always visible, disabled when no active session
+    stopBtn.disabled = !isActive;
+    steerInput.disabled = !isActive;
+    steerSend.disabled = !isActive;
+    stopBtn.style.opacity = isActive ? '1' : '0.4';
+
+    // Stop/Resume button
+    if (status === 'paused') {
+      stopBtn.textContent = 'RESUME';
+      stopBtn.className = 'btn btn-resume';
+    } else {
+      stopBtn.textContent = 'EMERGENCY STOP';
+      stopBtn.className = 'btn btn-stop';
+    }
+
+    // Auto-close after terminal state
+    if (isTerminal && !autoCloseTimer) {
+      autoCloseTimer = setTimeout(() => window.close(), 8000);
+    }
+  }
+
+  // WebSocket connection
+  function connectWS() {
+    try { ws = new WebSocket(WS_URL); } catch { return setTimeout(connectWS, 3000); }
+
+    ws.onopen = () => console.log('[Overlay] Connected to dev-agent');
+    ws.onclose = () => setTimeout(connectWS, 2000);
+    ws.onerror = () => {};
+    ws.onmessage = (e) => {
+      try {
+        const data = JSON.parse(e.data);
+        console.log('[Overlay] Received:', data.type, data.status || '', data.session_id || '');
+        updateUI(data);
+      } catch (err) {
+        console.error('[Overlay] Parse error:', err, e.data?.slice?.(0, 100));
+      }
+    };
+  }
+  connectWS();
+
+  // Emergency stop / resume
+  stopBtn.addEventListener('click', async () => {
+    if (!currentSessionId) return;
+    const action = stopBtn.textContent.includes('RESUME') ? 'resume' : 'pause';
+    try {
+      await fetch(`${GW_URL}/api/v1/computer-use/sessions/${currentSessionId}/${action}`, { method: 'POST' });
+    } catch (e) {
+      console.error('Stop/resume failed:', e);
+    }
+  });
+
+  // Steering input
+  async function sendSteer() {
+    const msg = steerInput.value.trim();
+    if (!msg || !currentSessionId) return;
+    try {
+      await fetch(`${GW_URL}/api/v1/computer-use/sessions/${currentSessionId}/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: msg }),
+      });
+      steerInput.value = '';
+    } catch {}
+  }
+  steerSend.addEventListener('click', sendSteer);
+  steerInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendSteer(); });
+
+  // Mic button (placeholder — toggle state visually)
+  let micActive = false;
+  micBtn.addEventListener('click', () => {
+    micActive = !micActive;
+    micBtn.classList.toggle('active', micActive);
+    // TODO: Connect to voice-agent via dev-agent relay
+  });
+
+  // Close button
+  closeBtn.addEventListener('click', () => window.close());
+})();
+</script>
+</body>
+</html>

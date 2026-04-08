@@ -1,0 +1,12 @@
+{
+  "name": "oasis-cu-overlay",
+  "version": "1.0.0",
+  "description": "Always-on-top floating overlay for Oasis computer-use sessions",
+  "main": "main.js",
+  "scripts": {
+    "start": "electron main.js"
+  },
+  "dependencies": {
+    "electron": "^33.0.0"
+  }
+}

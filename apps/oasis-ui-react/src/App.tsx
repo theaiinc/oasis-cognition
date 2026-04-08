@@ -498,6 +498,13 @@ export default function App() {
     cuReportedStepsRef.current = 0;
     cuSummaryWaitRef.current = 0;
 
+    // Launch the always-on-top overlay window via dev-agent
+    const devAgentUrl = `${window.location.protocol}//${window.location.hostname}:8008`;
+    axios.post(`${devAgentUrl}/internal/dev-agent/cu-overlay/launch`, {
+      session_id: sessionId,
+      gateway_port: new URL(OASIS_BASE_URL).port || '8000',
+    }).catch(() => { /* overlay not available — not critical */ });
+
     cuPollRef.current = setInterval(async () => {
       try {
         const res = await axios.get(`${OASIS_BASE_URL}/api/v1/computer-use/sessions/${sessionId}`, { timeout: 5000 });

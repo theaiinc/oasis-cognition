@@ -205,13 +205,9 @@ export class ComputerUseController {
     session.visionGranted = true;
     session.status = 'executing';
     session.updated_at = new Date().toISOString();
-    this.logger.log(`Session ${id} approved with vision grant — starting adaptive execution`);
+    this.logger.log(`Session ${id} approved with vision grant — starting execution`);
 
-    // Begin adaptive execution (non-blocking)
-    // Mark pre-planned steps as 'skipped' — the adaptive loop creates its own steps dynamically
-    for (const step of session.plan) {
-      if (step.status === 'pending') step.status = 'skipped';
-    }
+    // Begin execution — uses the approved plan as guidance, adapts on the fly
     this.executeAdaptiveLoop(id).catch((err) => {
       this.logger.error(`Execution failed for ${id}: ${err.message}`);
       session.status = 'failed';
@@ -1055,52 +1051,52 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
   }
 
   // ════════════════════════════════════════════════════════════════════════
-  // ADAPTIVE ReAct LOOP — read page → reason → act → repeat
+  // PLAN-GUIDED ADAPTIVE LOOP
   //
-  // Instead of pre-planning all steps and executing linearly, this loop
-  // reads the current page state, asks the LLM what to do next, executes
-  // one action, and repeats until the goal is achieved.
+  // Walks through the approved plan step by step. Before executing each
+  // step, reads the page and asks the LLM whether the planned action
+  // still makes sense. If yes, execute it. If no, the LLM can adapt:
+  // modify the action, skip the step, or insert extra steps.
+  //
+  // This combines the reliability of a pre-approved plan with the
+  // flexibility of real-time adaptation.
   // ════════════════════════════════════════════════════════════════════════
 
   private static readonly REACT_SYSTEM = `\
-You are a computer-use agent controlling a real browser. You read the page, decide the next action, and execute it.
+You are a computer-use agent controlling a real browser. You follow a plan but adapt based on what you actually see on the page.
+
+You will be given:
+1. The GOAL you're trying to achieve
+2. The CURRENT PLANNED STEP to execute
+3. The REMAINING PLAN (upcoming steps)
+4. The CURRENT PAGE CONTENT (what's actually on screen)
 
 OUTPUT FORMAT (one field per line, NO JSON, NO markdown):
 
-THOUGHT: what you see on the page and what you need to do next (one sentence)
+THOUGHT: what you see on the page and whether the planned step makes sense (one sentence)
 ACTION: <action_name>
 TARGET: <target value>
 
-OR when the goal is achieved:
-
-THOUGHT: the goal has been achieved because <evidence>
-ACTION: done
-TARGET: <summary of what was accomplished>
-
-OR when stuck:
-
-THOUGHT: I cannot complete this because <reason>
-ACTION: failed
-TARGET: <explanation>
-
 VALID ACTIONS:
-- click | TARGET = text of the element to click (button label, link text, menu item)
+- execute_plan | TARGET = (empty) — execute the planned step as-is, it makes sense
+- click | TARGET = text of the element to click (use this to ADAPT the planned step)
 - navigate | TARGET = full URL
 - type | TARGET = text to type into the focused field
 - scroll | TARGET = up or down
 - read_screen | TARGET = (empty) — re-read the page to see updated content
+- skip | TARGET = reason — skip this planned step (already done, not needed, etc.)
+- done | TARGET = summary — the goal is ALREADY achieved based on what's on the page
+- failed | TARGET = reason — cannot complete the goal
 
 RULES:
-- You can ONLY see the page content provided. You CANNOT see screenshots.
+- Prefer "execute_plan" when the planned step matches what you see on the page.
+- Use a different action to ADAPT when the planned step won't work (e.g., wrong URL, element not visible, page state changed).
 - Click elements by their EXACT visible text or aria-label from the page content.
-- NEVER fabricate or guess URLs. Only use URLs visible in the page content or that you know are 100% correct.
-- For complex web apps (Facebook, Google, etc.), always navigate via clicking UI elements, not by guessing URLs.
-- When you see a list of clickable elements, pick the most relevant one.
-- If a click didn't change the page, try a different element or scroll to find more options.
-- If you hit an error page ("not available", "not found"), go back and try a different approach.
-- If clicking a UI element has no visible effect after 2 attempts, the element may open a panel/dialog within the same page. Try scrolling to see if new content appeared, or try a direct URL approach.
-- For Facebook page management: if clicking "Settings" on a Page doesn't work, try navigating to https://business.facebook.com/latest/settings/ (Meta Business Suite) instead.
-- Maximum actions per goal: 25. Be efficient.`;
+- NEVER fabricate or guess URLs. Only use URLs visible in the page content or well-known patterns.
+- For complex web apps (Facebook, Google, etc.), prefer clicking UI elements over guessing URLs.
+- If a click doesn't change the page after the page-change indicator says UNCHANGED, try a different element or approach.
+- If you see evidence the goal is already achieved (e.g., "This is an unpublished Page"), say done immediately.
+- Be efficient — skip steps that are redundant given the current page state.`;
 
   private async executeAdaptiveLoop(sessionId: string): Promise<void> {
     const session = sessions.get(sessionId);
@@ -1115,28 +1111,33 @@ RULES:
     }
 
     const researchCtx = (session as any)._research || '';
-    const MAX_ITERATIONS = 25;
+    const MAX_EXTRA_STEPS = 15; // max adaptive steps beyond the original plan
     const actionHistory: string[] = [];
-    let iteration = 0;
     let prevPageText = '';
+    let extraStepsUsed = 0;
 
-    while (iteration < MAX_ITERATIONS && session.status === 'executing') {
-      iteration++;
+    // Launch the always-on-top overlay window via dev-agent
+    try {
+      await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-overlay/launch`, {
+        session_id: sessionId,
+        gateway_port: '8000',
+      }, { timeout: 5000 });
+      this.logger.log(`CU overlay launched for session ${sessionId}`);
+    } catch { /* overlay not available — not critical */ }
 
-      // 1. Read current page state via Chrome Bridge
+    // Walk through each planned step
+    while (session.current_step < session.plan.length && session.status === 'executing') {
+      const step = session.plan[session.current_step];
+
+      // 1. Read current page state
       let pageText = '';
       try {
         const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-          tool: 'computer_action',
-          action: 'get_page_text',
+          tool: 'computer_action', action: 'get_page_text',
         }, { timeout: 15000 });
-        if (pageRes.data?.success) {
-          pageText = pageRes.data.output as string;
-        }
+        if (pageRes.data?.success) pageText = pageRes.data.output as string;
       } catch { /* ignore */ }
-
       if (!pageText) {
-        // Fallback to screenshot + OCR
         try {
           const ocrRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
             tool: 'computer_action', action: 'ocr_screenshot',
@@ -1145,195 +1146,175 @@ RULES:
         } catch { /* ignore */ }
       }
 
-      // Page change detection — tell the LLM if the page is the same
+      // Page change detection
       let pageChangeNote = '';
-      if (prevPageText && iteration > 1) {
+      if (prevPageText && actionHistory.length > 0) {
         if (pageText === prevPageText) {
-          pageChangeNote = '\n⚠️ PAGE UNCHANGED: The page content is IDENTICAL to before your last action. Your action had NO visible effect. Try a different approach.\n';
+          pageChangeNote = '\n⚠️ PAGE UNCHANGED after last action. Try a different approach.\n';
         } else {
-          // Find what's new
           const prevLines = new Set(prevPageText.split('\n').map(l => l.trim()).filter(Boolean));
           const newLines = pageText.split('\n').map(l => l.trim()).filter(l => l && !prevLines.has(l));
           if (newLines.length > 0) {
-            pageChangeNote = `\n✓ PAGE CHANGED. New content appeared:\n${newLines.slice(0, 15).join('\n')}\n`;
+            pageChangeNote = `\n✓ PAGE CHANGED. New content:\n${newLines.slice(0, 10).join('\n')}\n`;
           }
         }
       }
       prevPageText = pageText;
 
-      // Detect repeated actions (stuck in a loop)
-      let stuckWarning = '';
-      if (actionHistory.length >= 3) {
-        const last3 = actionHistory.slice(-3);
-        const lastActions = last3.map(h => {
-          const m = h.match(/\d+\.\s*(\S+)/);
-          return m?.[1] || '';
-        });
-        const lastTargets = last3.map(h => {
-          const m = h.match(/→\s*"([^"]+)"/);
-          return m?.[1] || '';
-        });
-        if (lastActions.every(a => a === lastActions[0]) && lastTargets.every(t => t === lastTargets[0])) {
-          stuckWarning =
-            `\n⚠️ WARNING: You have repeated the SAME action ("${lastActions[0]}" on "${lastTargets[0]}") 3 times with NO effect.\n` +
-            `Your click is NOT working on this element. You MUST try a COMPLETELY DIFFERENT approach:\n` +
-            `- Try scrolling down to see more options\n` +
-            `- Try navigating to a different URL\n` +
-            `- Try clicking a DIFFERENT element (not "${lastTargets[0]}")\n` +
-            `- If you truly cannot find the option, say ACTION: failed\n\n`;
-        }
-      }
+      // Build remaining plan context
+      const remainingSteps = session.plan
+        .slice(session.current_step + 1)
+        .filter(s => s.status === 'pending')
+        .map((s, i) => `  ${session.current_step + 2 + i}. ${s.action}: ${s.description}`)
+        .join('\n');
 
-      // 2. Ask LLM: what's the next action?
+      // 2. Ask the LLM: should we execute this step as-is, adapt, or skip?
       const userPrompt =
         `GOAL: ${session.goal}\n\n` +
-        (researchCtx ? `RESEARCH:\n${researchCtx}\n\n` : '') +
-        (actionHistory.length > 0 ? `ACTIONS TAKEN SO FAR:\n${actionHistory.slice(-10).join('\n')}\n\n` : '') +
-        stuckWarning +
+        (researchCtx ? `RESEARCH:\n${researchCtx.slice(0, 1500)}\n\n` : '') +
+        (actionHistory.length > 0 ? `ACTIONS COMPLETED:\n${actionHistory.slice(-8).join('\n')}\n\n` : '') +
+        `CURRENT PLANNED STEP (${session.current_step + 1}/${session.plan.length}):\n` +
+        `  Action: ${step.action}\n` +
+        `  Target: ${step.target || '(none)'}\n` +
+        `  Description: ${step.description}\n\n` +
+        (remainingSteps ? `REMAINING PLAN:\n${remainingSteps}\n\n` : '') +
         pageChangeNote +
-        `CURRENT PAGE (iteration ${iteration}/${MAX_ITERATIONS}):\n${pageText.slice(0, 6000)}\n\n` +
-        `What is the next action to achieve the goal?`;
+        `CURRENT PAGE:\n${pageText.slice(0, 5000)}\n\n` +
+        `Should the planned step be executed as-is, adapted, or skipped?`;
+
+      step.status = 'running';
+      step.started_at = new Date().toISOString();
+      session.updated_at = new Date().toISOString();
 
       let llmResponse = '';
       try {
         const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
           user_message: userPrompt,
-          context: {
-            system_override: ComputerUseController.REACT_SYSTEM,
-            max_tokens: 512,
-          },
+          context: { system_override: ComputerUseController.REACT_SYSTEM, max_tokens: 512 },
         }, { timeout: LLM_TIMEOUT_MS });
         llmResponse = res.data?.response_text || res.data?.response || '';
       } catch (err: any) {
-        this.logger.error(`Adaptive loop LLM failed: ${err.message}`);
-        session.status = 'failed';
-        session.error = `LLM error: ${err.message}`;
-        break;
+        this.logger.error(`Adaptive LLM failed: ${err.message}`);
+        step.status = 'failed';
+        step.output = `LLM error: ${err.message}`;
+        step.completed_at = new Date().toISOString();
+        session.current_step++;
+        continue;
       }
 
-      // 3. Parse the response
-      const thoughtMatch = llmResponse.match(/THOUGHT:\s*(.+)/i);
-      const actionMatch = llmResponse.match(/ACTION:\s*(\S+)/i);
-      const targetMatch = llmResponse.match(/TARGET:\s*(.+)/i);
+      // 3. Parse response
+      const thought = llmResponse.match(/THOUGHT:\s*(.+)/i)?.[1]?.trim() || '';
+      const action = llmResponse.match(/ACTION:\s*(\S+)/i)?.[1]?.trim().toLowerCase() || 'execute_plan';
+      const target = llmResponse.match(/TARGET:\s*(.+)/i)?.[1]?.trim() || '';
 
-      const thought = thoughtMatch?.[1]?.trim() || '';
-      const action = actionMatch?.[1]?.trim().toLowerCase() || '';
-      const target = targetMatch?.[1]?.trim() || '';
+      this.logger.log(`Step ${session.current_step + 1} [${action}]: ${thought.slice(0, 100)} | target: ${target.slice(0, 60)}`);
+      step.description = thought || step.description;
 
-      this.logger.log(`Adaptive [${iteration}] THOUGHT: ${thought.slice(0, 100)} | ACTION: ${action} | TARGET: ${target.slice(0, 80)}`);
-
-      // Record as a plan step for the UI
-      const stepObj: PlanStep = {
-        index: session.plan.length,
-        description: thought,
-        action: action === 'done' || action === 'failed' ? 'read_screen' : action,
-        target: target,
-        status: 'running',
-        started_at: new Date().toISOString(),
-        sub_steps: [],
-      };
-      session.plan.push(stepObj);
-      session.current_step = stepObj.index;
-      session.updated_at = new Date().toISOString();
-
-      // 4. Handle terminal actions
+      // 4. Handle the decision
       if (action === 'done') {
-        stepObj.status = 'completed';
-        stepObj.output = target;
-        stepObj.completed_at = new Date().toISOString();
-        actionHistory.push(`${iteration}. ✓ DONE: ${target}`);
-
+        step.status = 'completed';
+        step.output = target;
+        step.completed_at = new Date().toISOString();
+        // Mark remaining steps as skipped
+        for (const s of session.plan.slice(session.current_step + 1)) {
+          if (s.status === 'pending') s.status = 'skipped';
+        }
         session.status = 'completed';
         session.updated_at = new Date().toISOString();
-        this.logger.log(`Adaptive loop DONE: ${target}`);
-
+        this.logger.log(`Goal achieved at step ${session.current_step + 1}: ${target}`);
         this.generateSessionSummary(sessionId).catch(() => {});
         return;
       }
 
       if (action === 'failed') {
-        stepObj.status = 'failed';
-        stepObj.output = target;
-        stepObj.completed_at = new Date().toISOString();
-        actionHistory.push(`${iteration}. ✗ FAILED: ${target}`);
-
+        step.status = 'failed';
+        step.output = target;
+        step.completed_at = new Date().toISOString();
         session.status = 'failed';
         session.error = target;
         session.updated_at = new Date().toISOString();
-        this.logger.log(`Adaptive loop FAILED: ${target}`);
-
         this.generateSessionSummary(sessionId).catch(() => {});
         return;
       }
 
-      // 4b. Hard loop breaker — if same action repeated 5 times, skip it
-      if (actionHistory.length >= 5) {
-        const recent = actionHistory.slice(-5);
-        const sameAction = recent.every(h => {
-          const m = h.match(/→\s*"([^"]+)"/);
-          return m?.[1] === target;
-        });
-        if (sameAction) {
-          this.logger.warn(`Adaptive loop: action "${action} → ${target}" repeated 5 times — forcing failure`);
-          stepObj.status = 'failed';
-          stepObj.output = `Stuck: repeated "${action}" on "${target}" 5 times with no effect`;
-          stepObj.completed_at = new Date().toISOString();
-          actionHistory.push(`${iteration}. ✗ STUCK on "${target}" — skipping`);
-          session.updated_at = new Date().toISOString();
-          continue; // Let the LLM try a different approach next iteration
-        }
+      if (action === 'skip') {
+        step.status = 'skipped';
+        step.output = target;
+        step.completed_at = new Date().toISOString();
+        actionHistory.push(`${session.current_step + 1}. SKIP: ${target.slice(0, 80)}`);
+        session.current_step++;
+        session.updated_at = new Date().toISOString();
+        continue;
       }
 
-      // 5. Execute the action
+      // 5. Execute — either the planned step or an adapted action
+      const execAction = action === 'execute_plan' ? step.action : action;
+      const execTarget = action === 'execute_plan' ? (step.target || '') : target;
+
+      // Update the step to reflect what we're actually doing
+      if (action !== 'execute_plan') {
+        step.action = execAction;
+        step.target = execTarget;
+      }
+
       try {
         const result = await this.executeComputerAction(
-          { index: stepObj.index, description: thought, action, target, status: 'running' } as PlanStep,
+          { ...step, action: execAction, target: execTarget } as PlanStep,
           sessionId,
         );
 
-        stepObj.status = 'completed';
-        stepObj.output = result.output;
-        stepObj.completed_at = new Date().toISOString();
+        step.status = 'completed';
+        step.output = result.output;
+        step.completed_at = new Date().toISOString();
         if (result.screenshot) session.live_screenshot = result.screenshot;
 
-        actionHistory.push(`${iteration}. ${action}${target ? ` → "${target.slice(0, 60)}"` : ''} → ${result.output.slice(0, 100)}`);
+        actionHistory.push(`${session.current_step + 1}. ${execAction}${execTarget ? ` → "${execTarget.slice(0, 50)}"` : ''} → ${result.output.slice(0, 80)}`);
 
-        // Discovery extraction for read_screen
-        if ((action === 'read_screen' || action === 'read_page') && result.output) {
-          await this.replaceDiscoveryTokens(session, stepObj);
+        // Discovery extraction
+        if ((execAction === 'read_screen' || execAction === 'read_page') && result.output) {
+          await this.replaceDiscoveryTokens(session, step);
         }
 
-        // 2FA/verification detection
+        // 2FA detection
         const VERIFICATION_PATTERNS = [
           /two.step.verification/i, /two.factor.auth/i, /2fa/i,
-          /verification.code/i, /enter.the.code/i, /security.check/i,
-          /confirm.your.identity/i, /\/checkpoint\//i, /captcha/i,
+          /verification.code/i, /confirm.your.identity/i, /captcha/i,
         ];
         if (VERIFICATION_PATTERNS.some(p => p.test(result.output))) {
           session.status = 'paused';
-          session.error = 'Verification required. Please complete it in the browser, then resume.';
+          session.error = 'Verification required. Complete it in the browser, then resume.';
           session.updated_at = new Date().toISOString();
           return;
         }
-
       } catch (err: any) {
-        stepObj.status = 'failed';
-        stepObj.output = err.message;
-        stepObj.completed_at = new Date().toISOString();
-        actionHistory.push(`${iteration}. ${action} → ERROR: ${err.message.slice(0, 80)}`);
-        // Don't fail the session — let the LLM decide next action based on the error
+        step.status = 'failed';
+        step.output = err.message;
+        step.completed_at = new Date().toISOString();
+        actionHistory.push(`${session.current_step + 1}. ${execAction} → ERROR: ${err.message.slice(0, 60)}`);
       }
 
+      session.current_step++;
       session.updated_at = new Date().toISOString();
 
-      // Small delay between iterations
+      // If we've run out of planned steps but the goal might not be done,
+      // add one final check step
+      if (session.current_step >= session.plan.length && extraStepsUsed < MAX_EXTRA_STEPS) {
+        session.plan.push({
+          index: session.plan.length,
+          description: 'Checking if goal is achieved...',
+          action: 'read_screen',
+          target: '',
+          status: 'pending',
+        });
+        extraStepsUsed++;
+      }
+
       await new Promise(r => setTimeout(r, 500));
     }
 
-    // Max iterations reached
+    // All steps done
     if (session.status === 'executing') {
-      session.status = 'failed';
-      session.error = `Max iterations (${MAX_ITERATIONS}) reached without completing goal`;
+      session.status = 'completed';
       session.updated_at = new Date().toISOString();
       this.generateSessionSummary(sessionId).catch(() => {});
     }

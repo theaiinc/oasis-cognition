@@ -5,7 +5,7 @@ import { encrypt, decrypt } from '../crypto/crypto.service';
 import { EncryptedPayload } from '../crypto/crypto.types';
 
 const GATEWAY_URL = process.env.GATEWAY_URL || 'http://localhost:8000';
-const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
+const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://127.0.0.1:8008';
 
 // Timeline event types worth forwarding to mobile
 const FORWARD_EVENT_TYPES = new Set([
@@ -380,6 +380,42 @@ export class RelayService {
   async cancelComputerUseSession(sessionId: string): Promise<any> {
     const response = await axios.delete(
       `${GATEWAY_URL}/api/v1/computer-use/sessions/${sessionId}`,
+      { timeout: 10_000 },
+    );
+    return response.data;
+  }
+
+  /**
+   * Pause a running computer-use session (emergency stop).
+   */
+  async pauseComputerUseSession(sessionId: string): Promise<any> {
+    const response = await axios.post(
+      `${GATEWAY_URL}/api/v1/computer-use/sessions/${sessionId}/pause`,
+      {},
+      { timeout: 10_000 },
+    );
+    return response.data;
+  }
+
+  /**
+   * Resume a paused computer-use session.
+   */
+  async resumeComputerUseSession(sessionId: string): Promise<any> {
+    const response = await axios.post(
+      `${GATEWAY_URL}/api/v1/computer-use/sessions/${sessionId}/resume`,
+      {},
+      { timeout: 10_000 },
+    );
+    return response.data;
+  }
+
+  /**
+   * Send steering feedback to an executing computer-use session.
+   */
+  async sendComputerUseFeedback(sessionId: string, message: string): Promise<any> {
+    const response = await axios.post(
+      `${GATEWAY_URL}/api/v1/computer-use/sessions/${sessionId}/feedback`,
+      { message },
       { timeout: 10_000 },
     );
     return response.data;

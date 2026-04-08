@@ -7,7 +7,7 @@ import {
   PairingStatusResponse,
 } from './pairing.types';
 
-const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
+const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://127.0.0.1:8008';
 const RELAY_PORT = parseInt(process.env.MOBILE_RELAY_PORT || '8015', 10);
 
 export class PairingService {

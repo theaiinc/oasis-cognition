@@ -229,6 +229,23 @@ async def serve_cu_overlay():
     if os.path.exists(overlay_path):
         return FileResponse(overlay_path, media_type="text/html")
     return {"error": "overlay not found"}
+
+
+@app.get("/cu-overlay/active-session")
+async def proxy_active_session():
+    """Proxy the gateway's active session endpoint for the overlay.
+
+    The overlay HTML is served from localhost:8008, so fetching from
+    the same origin avoids all CORS/Electron security issues.
+    """
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(f"{API_GATEWAY_URL}/api/v1/computer-use/sessions/active")
+            if resp.status_code == 200:
+                return resp.json()
+    except Exception as e:
+        logger.debug("Proxy active session failed: %s", e)
+    return {"session": None}
 TOOL_EXECUTOR_URL = os.getenv("TOOL_EXECUTOR_URL", "http://localhost:8007")
 
 

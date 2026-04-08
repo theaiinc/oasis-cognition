@@ -227,6 +227,42 @@ export function createRelayRouter(relayService: RelayService): Router {
     }
   });
 
+  /** Pause (emergency stop) a running computer-use session. */
+  router.post('/computer-use/pause', async (req: Request, res: Response) => {
+    try {
+      const { session_id } = req.body;
+      if (!session_id) { res.status(400).json({ error: 'session_id is required' }); return; }
+      const result = await relayService.pauseComputerUseSession(session_id);
+      res.json(result);
+    } catch (err: any) {
+      res.status(502).json({ error: 'Failed to pause session' });
+    }
+  });
+
+  /** Resume a paused computer-use session. */
+  router.post('/computer-use/resume', async (req: Request, res: Response) => {
+    try {
+      const { session_id } = req.body;
+      if (!session_id) { res.status(400).json({ error: 'session_id is required' }); return; }
+      const result = await relayService.resumeComputerUseSession(session_id);
+      res.json(result);
+    } catch (err: any) {
+      res.status(502).json({ error: 'Failed to resume session' });
+    }
+  });
+
+  /** Send steering feedback to an executing computer-use session. */
+  router.post('/computer-use/feedback', async (req: Request, res: Response) => {
+    try {
+      const { session_id, message } = req.body;
+      if (!session_id || !message) { res.status(400).json({ error: 'session_id and message are required' }); return; }
+      const result = await relayService.sendComputerUseFeedback(session_id, message);
+      res.json(result);
+    } catch (err: any) {
+      res.status(502).json({ error: 'Failed to send feedback' });
+    }
+  });
+
   /** Take a native screenshot from desktop (dev-agent pyautogui). */
   router.post('/screenshot', async (req: Request, res: Response) => {
     try {

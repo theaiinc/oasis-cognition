@@ -290,7 +290,9 @@
   const GW_PORT = params.get('gateway') || '8000';
   const INITIAL_SESSION = params.get('session') || '';
   const GW_URL = `http://localhost:${GW_PORT}`;
-  const WS_URL = `ws://localhost:${WS_PORT}/ws/cu-overlay`;
+  // Poll active session from dev-agent proxy (same origin as overlay HTML)
+  // to avoid cross-origin fetch issues in Electron
+  const POLL_URL = `http://localhost:${WS_PORT}/cu-overlay/active-session`;
 
   // Elements
   const statusDot = document.getElementById('statusDot');
@@ -410,10 +412,8 @@
       stopBtn.className = 'btn btn-stop';
     }
 
-    // Auto-close after terminal state
-    if (isTerminal && !autoCloseTimer) {
-      autoCloseTimer = setTimeout(() => window.close(), 8000);
-    }
+    // Don't auto-close — keep overlay alive for next session
+    // The overlay will return to "No Active Session" state naturally
   }
 
   // Poll active session via HTTP (more reliable than WebSocket in Electron)
@@ -421,7 +421,7 @@
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
-      const resp = await fetch(`${GW_URL}/api/v1/computer-use/sessions/active`, { signal: controller.signal });
+      const resp = await fetch(POLL_URL, { signal: controller.signal });
       clearTimeout(timer);
       if (!resp.ok) { updateUI({ type: 'idle' }); return; }
       const data = await resp.json();

@@ -149,10 +149,54 @@ export function MobileComputerUse({ tunnelUrl, onClose }: MobileComputerUseProps
     } catch { /* ignore */ }
   };
 
+  // Pause (emergency stop)
+  const handlePause = async () => {
+    if (!session) return;
+    try {
+      await fetch(`${relayUrl}/computer-use/pause`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: session.session_id }),
+        signal: AbortSignal.timeout(10000),
+      });
+      pollSession(session.session_id);
+    } catch { /* ignore */ }
+  };
+
+  // Resume
+  const handleResume = async () => {
+    if (!session) return;
+    try {
+      await fetch(`${relayUrl}/computer-use/resume`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: session.session_id }),
+        signal: AbortSignal.timeout(10000),
+      });
+      pollSession(session.session_id);
+    } catch { /* ignore */ }
+  };
+
+  // Send steering feedback
+  const [feedback, setFeedback] = useState('');
+  const handleSendFeedback = async () => {
+    if (!session || !feedback.trim()) return;
+    try {
+      await fetch(`${relayUrl}/computer-use/feedback`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: session.session_id, message: feedback.trim() }),
+        signal: AbortSignal.timeout(10000),
+      });
+      setFeedback('');
+    } catch { /* ignore */ }
+  };
+
   // New task
   const handleNewTask = () => {
     setSession(null);
     setGoal('');
+    setFeedback('');
     setError(null);
   };
 
@@ -319,14 +363,65 @@ export function MobileComputerUse({ tunnelUrl, onClose }: MobileComputerUseProps
 
           {/* Executing/paused controls */}
           {session && (session.status === 'executing' || session.status === 'paused') && (
-            <div className="flex gap-2">
-              <button
-                onClick={handleCancel}
-                className="flex items-center gap-1.5 px-3 py-1.5 rounded-lg border border-red-800 text-red-400 text-xs font-medium"
-              >
-                <Ban className="w-3 h-3" />
-                Cancel
-              </button>
+            <div className="flex flex-col gap-2">
+              {/* Warning banner */}
+              {session.status === 'executing' && (
+                <div className="bg-red-950/30 border border-red-800/40 rounded-lg p-2 text-center">
+                  <span className="text-[10px] text-red-300">Agent is controlling the browser — avoid interacting</span>
+                </div>
+              )}
+              {session.status === 'paused' && session.error && (
+                <div className="bg-amber-950/30 border border-amber-800/40 rounded-lg p-2">
+                  <span className="text-[10px] text-amber-300">{session.error}</span>
+                </div>
+              )}
+
+              {/* Steering input */}
+              <div className="flex items-center gap-1.5">
+                <input
+                  type="text"
+                  value={feedback}
+                  onChange={(e) => setFeedback(e.target.value)}
+                  onKeyDown={(e) => { if (e.key === 'Enter') handleSendFeedback(); }}
+                  placeholder="Steer the agent..."
+                  className="flex-1 bg-slate-900/50 border border-slate-700 rounded-lg px-2.5 py-1.5 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:border-purple-600"
+                />
+                <button
+                  onClick={handleSendFeedback}
+                  disabled={!feedback.trim()}
+                  className="px-3 py-1.5 rounded-lg bg-purple-600 text-white text-xs font-medium disabled:opacity-40"
+                >
+                  Send
+                </button>
+              </div>
+
+              {/* Action buttons */}
+              <div className="flex gap-2">
+                {session.status === 'executing' ? (
+                  <button
+                    onClick={handlePause}
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-red-600 text-white text-xs font-bold"
+                  >
+                    <Pause className="w-3.5 h-3.5" />
+                    EMERGENCY STOP
+                  </button>
+                ) : (
+                  <button
+                    onClick={handleResume}
+                    className="flex-1 flex items-center justify-center gap-1.5 px-3 py-2 rounded-lg bg-emerald-600 text-white text-xs font-bold"
+                  >
+                    <Play className="w-3.5 h-3.5" />
+                    Resume
+                  </button>
+                )}
+                <button
+                  onClick={handleCancel}
+                  className="flex items-center gap-1.5 px-3 py-2 rounded-lg border border-red-800 text-red-400 text-xs font-medium"
+                >
+                  <Ban className="w-3 h-3" />
+                  Cancel
+                </button>
+              </div>
             </div>
           )}
 

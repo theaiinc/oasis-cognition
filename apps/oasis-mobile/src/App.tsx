@@ -300,6 +300,7 @@ export default function App() {
       {showComputerUse && pairing.tunnelUrl ? (
         <MobileComputerUse
           tunnelUrl={pairing.tunnelUrl}
+          voiceChat={voice}
           onClose={() => setShowComputerUse(false)}
         />
       ) : showScanner ? (

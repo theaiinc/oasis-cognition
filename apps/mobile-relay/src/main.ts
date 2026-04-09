@@ -7,6 +7,14 @@ import { createPairingRouter } from './pairing/pairing.controller';
 import { createRelayRouter } from './relay/relay.controller';
 import { setupVoiceBridge } from './relay/voice-bridge';
 
+// Prevent crashes from unhandled rejections/exceptions
+process.on('uncaughtException', (err) => {
+  console.error('[MobileRelay] Uncaught exception (kept alive):', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[MobileRelay] Unhandled rejection (kept alive):', reason);
+});
+
 const PORT = parseInt(process.env.MOBILE_RELAY_PORT || '8015', 10);
 const MOBILE_DIST_PATH = process.env.MOBILE_DIST_PATH
   || path.resolve(__dirname, '../../oasis-mobile/dist');

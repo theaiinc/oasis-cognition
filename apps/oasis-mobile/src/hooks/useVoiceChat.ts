@@ -147,9 +147,11 @@ export function useVoiceChat({
       wsRef.current = null;
     };
 
-    ws.onerror = () => {
+    ws.onerror = (event) => {
       setIsConnecting(false);
       setStatusText('Connection failed');
+      onError(`Voice WebSocket failed to connect to ${wsUrl}`);
+      wsRef.current = null;
     };
   }, [pairing, sessionId, onError, stopAudio]); // eslint-disable-line react-hooks/exhaustive-deps
 

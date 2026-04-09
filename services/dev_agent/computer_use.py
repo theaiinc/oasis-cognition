@@ -936,6 +936,102 @@ except Exception as e:
         except Exception as e:
             return {"success": False, "output": f"chrome_navigate error: {e}", "screenshot": ""}
 
+    if action == "find_ui_element":
+        # CUA: Find a UI element — Chrome Bridge DOM first, ui_parser OCR/GroundingDINO fallback
+        if not text:
+            return {"success": False, "output": "find_ui_element requires text (element query)", "screenshot": ""}
+
+        # Strategy 1: Chrome Bridge DOM elements (fastest, most reliable)
+        if chrome_bridge.connected:
+            try:
+                resp = await chrome_bridge.send_command("get_page_text", {}, timeout=8)
+                if resp.get("success"):
+                    interactive = resp.get("payload", {}).get("interactive", [])
+                    from difflib import SequenceMatcher as _SM
+                    query_lower = text.lower().strip()
+                    matches = []
+                    for el in interactive:
+                        label = (el.get("label") or "").strip()
+                        if not label: continue
+                        label_lower = label.lower()
+                        if query_lower == label_lower: score = 1.0
+                        elif query_lower in label_lower or label_lower in query_lower: score = 0.9
+                        else: score = _SM(None, query_lower, label_lower).ratio()
+                        if score >= 0.5:
+                            matches.append({**el, "confidence": round(score, 3), "method": "dom"})
+                    matches.sort(key=lambda d: d["confidence"], reverse=True)
+                    if matches:
+                        best = matches[0]
+                        return {
+                            "success": True,
+                            "output": f"Found '{best.get('label', text)}' via DOM (confidence {best['confidence']})",
+                            "screenshot": "",
+                            "element": best,
+                        }
+            except Exception as e:
+                logger.debug("Chrome Bridge find failed: %s", e)
+
+        # Strategy 2: ui_parser OCR + GroundingDINO (needs screenshot)
+        UI_PARSER_URL = _os.getenv("UI_PARSER_URL", "http://localhost:8011")
+        try:
+            screenshot_b64 = _take_screenshot()
+            if screenshot_b64:
+                import httpx as _httpx
+                async with _httpx.AsyncClient(timeout=15) as client:
+                    resp = await client.post(f"{UI_PARSER_URL}/internal/ui-parser/ground", json={
+                        "image": screenshot_b64,
+                        "query": text,
+                    })
+                    data = resp.json()
+                    detections = data.get("detections", [])
+                    if detections:
+                        best = detections[0]
+                        return {
+                            "success": True,
+                            "output": f"Found '{best.get('label', text)}' at ({best['center'][0]}, {best['center'][1]}) via {best.get('method', 'ocr')}",
+                            "screenshot": screenshot_b64,
+                            "element": {**best, "method": best.get("method", "ocr")},
+                        }
+        except Exception as e:
+            logger.warning("ui_parser find failed: %s", e)
+
+        return {"success": False, "output": f"Element '{text}' not found on screen", "screenshot": ""}
+
+    if action == "click_ui_element":
+        # CUA: Find element then click it using the best available method
+        if not text:
+            return {"success": False, "output": "click_ui_element requires text (element query)", "screenshot": ""}
+
+        # Step 1: Find the element
+        find_result = await execute_computer_action(action="find_ui_element", text=text, x=None, y=None, **kwargs)
+        if not find_result.get("success") or not find_result.get("element"):
+            return {"success": False, "output": f"Could not find '{text}' on screen", "screenshot": find_result.get("screenshot", "")}
+
+        el = find_result["element"]
+        method = el.get("method", "")
+
+        # Step 2: Click using the best method
+        # If found via DOM → use Chrome Bridge click (trusted events)
+        if method == "dom" and chrome_bridge.connected:
+            try:
+                resp = await chrome_bridge.send_command("click_element", {"text_match": el.get("text", text)}, timeout=10)
+                if resp.get("success"):
+                    logger.info("click_ui_element: '%s' clicked via Chrome Bridge DOM", text)
+                    return {"success": True, "output": f"Clicked '{el.get('text', text)}' via DOM", "screenshot": ""}
+            except Exception:
+                pass
+
+        # Fallback: pixel click at center coordinates
+        center = el.get("center_px", el.get("center", [0, 0]))
+        if center[0] > 0 and center[1] > 0:
+            click_result = await execute_computer_action(
+                action="click", text="", x=int(center[0]), y=int(center[1]), **kwargs
+            )
+            logger.info("click_ui_element: '%s' clicked at (%d, %d) via pixel", text, center[0], center[1])
+            return {"success": True, "output": f"Clicked '{el.get('text', text)}' at ({int(center[0])}, {int(center[1])})", "screenshot": click_result.get("screenshot", "")}
+
+        return {"success": False, "output": f"Found '{text}' but could not determine click coordinates", "screenshot": ""}
+
     if action == "chrome_bridge_click":
         # Click an element via the Chrome Bridge extension using text match.
         # Falls back gracefully if the bridge isn't connected.

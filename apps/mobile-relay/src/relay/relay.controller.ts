@@ -1,4 +1,5 @@
 import { Router, Request, Response } from 'express';
+import axios from 'axios';
 import { RelayService, RelayError } from './relay.service';
 import { EncryptedPayload } from '../crypto/crypto.types';
 
@@ -260,6 +261,35 @@ export function createRelayRouter(relayService: RelayService): Router {
       res.json(result);
     } catch (err: any) {
       res.status(502).json({ error: 'Failed to send feedback' });
+    }
+  });
+
+  /** Follow up on a completed/failed CU session with user feedback. */
+  router.post('/computer-use/follow-up', async (req: Request, res: Response) => {
+    try {
+      const { session_id, message } = req.body;
+      if (!session_id || !message) { res.status(400).json({ error: 'session_id and message are required' }); return; }
+      const result = await relayService.followUpComputerUseSession(session_id, message);
+      res.json(result);
+    } catch (err: any) {
+      res.status(502).json({ error: 'Failed to follow up on session' });
+    }
+  });
+
+  /** Transcribe audio via the transcription service (HTTP-based voice for CU). */
+  router.post('/transcribe-audio', async (req: Request, res: Response) => {
+    try {
+      const { audio_data, sample_rate, format } = req.body;
+      if (!audio_data) { res.status(400).json({ error: 'audio_data is required' }); return; }
+      const TRANSCRIPTION_URL = process.env.TRANSCRIPTION_URL || 'http://127.0.0.1:8099/transcribe';
+      const result = await axios.post(TRANSCRIPTION_URL, {
+        audio_data,
+        sample_rate: sample_rate || 16000,
+        format: format || 'float32',
+      }, { timeout: 30000 });
+      res.json(result.data);
+    } catch (err: any) {
+      res.status(502).json({ error: 'Transcription failed', detail: err.message });
     }
   });
 

@@ -32,6 +32,19 @@ class OcrResult:
     text: str
     bbox: tuple[float, float, float, float]  # (x1, y1, x2, y2) in pixels
 
+_element_counter = 0
+
+def _next_element_id() -> str:
+    global _element_counter
+    _element_counter += 1
+    return f"el_{_element_counter}"
+
+def reset_element_counter():
+    """Reset counter for each new parse call."""
+    global _element_counter
+    _element_counter = 0
+
+
 @dataclass
 class UIComponent:
     """A structured UI component — the output of the parser."""
@@ -42,13 +55,25 @@ class UIComponent:
     children: list[UIComponent] = field(default_factory=list)
     # Internal — not serialised
     _bbox_px: tuple[float, float, float, float] = (0, 0, 0, 0)
+    _id: str = ""
+
+    def __post_init__(self):
+        if not self._id:
+            self._id = _next_element_id()
 
     def to_dict(self) -> dict[str, Any]:
+        cx = (self.bbox[0] + self.bbox[2]) / 2
+        cy = (self.bbox[1] + self.bbox[3]) / 2
+        cx_px = (self._bbox_px[0] + self._bbox_px[2]) / 2
+        cy_px = (self._bbox_px[1] + self._bbox_px[3]) / 2
         return {
+            "id": self._id,
             "type": self.type,
             "bbox": list(self.bbox),
             "text": self.text,
             "confidence": round(self.confidence, 3),
+            "center": [round(cx, 4), round(cy, 4)],
+            "center_px": [round(cx_px, 1), round(cy_px, 1)],
             "children": [c.to_dict() for c in self.children],
         }
 
@@ -367,6 +392,8 @@ def parse_ui(
     logger.info("parse_ui: %d detections, %d OCR results, image=%dx%d",
                 len(detections), len(ocr), int(image_width), int(image_height))
 
+    reset_element_counter()
+
     # ── Parse raw inputs ──
     dets = [
         Detection(
@@ -448,6 +475,7 @@ def parse_ui_flat(
     Same as parse_ui but returns a FLAT list (no nesting).
     Useful for coordinate lookup / automation where hierarchy isn't needed.
     """
+    reset_element_counter()
     # Reuse the full pipeline but flatten
     dets = [
         Detection(bbox=tuple(d["bbox"][:4]), label=d.get("label", "rectangle"), confidence=d.get("confidence", 0.5))

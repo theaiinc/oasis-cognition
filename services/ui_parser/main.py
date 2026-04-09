@@ -239,6 +239,120 @@ async def ground_endpoint(req: GroundRequest):
     return {"detections": detections, "count": len(detections), "query": req.query}
 
 
+# ─── CUA: find_ui_element — unified element finder ─────────────────────────
+
+class FindElementRequest(BaseModel):
+    """Find a UI element by query in a screenshot.
+
+    Combines Chrome Bridge DOM data (if available) with OCR + GroundingDINO.
+    Returns the best matching element with ID, type, text, bbox, and center coordinates.
+    """
+    image: str = Field(..., description="Base64-encoded JPEG screenshot")
+    query: str = Field(..., description="Element description: 'login button', 'Settings link', etc.")
+    image_width: Optional[int] = None
+    image_height: Optional[int] = None
+    # Optional DOM elements from Chrome Bridge (checked first for faster matching)
+    dom_elements: list[dict[str, Any]] = Field(default=[], description="Interactive elements from Chrome Bridge content script")
+
+class FindElementResponse(BaseModel):
+    found: bool
+    element: Optional[dict[str, Any]] = None
+    method: str = ""  # "dom", "ocr", "grounding_dino"
+    alternatives: list[dict[str, Any]] = []
+
+
+@app.post("/internal/ui-parser/find-element", response_model=FindElementResponse)
+async def find_element_endpoint(req: FindElementRequest):
+    """
+    CUA unified element finder.
+
+    Priority:
+      1. Chrome Bridge DOM elements (text/aria-label match — fastest, most accurate)
+      2. OCR text matching (pixel-accurate for labeled elements)
+      3. GroundingDINO visual detection (for icons, avatars, non-text elements)
+
+    Returns the single best match with coordinates for clicking.
+    """
+    query_lower = req.query.lower().strip()
+
+    # 1. Try DOM elements first (from Chrome Bridge)
+    if req.dom_elements:
+        from difflib import SequenceMatcher
+        dom_matches = []
+        for el in req.dom_elements:
+            label = (el.get("label") or el.get("text") or "").strip()
+            if not label:
+                continue
+            label_lower = label.lower()
+            if query_lower == label_lower:
+                score = 1.0
+            elif query_lower in label_lower or label_lower in query_lower:
+                score = 0.9
+            else:
+                score = SequenceMatcher(None, query_lower, label_lower).ratio()
+
+            if score >= 0.5:
+                dom_matches.append({
+                    "id": el.get("id", f"dom_{len(dom_matches)}"),
+                    "type": el.get("tag", el.get("role", "element")),
+                    "text": label,
+                    "bbox": el.get("bbox", [0, 0, 0, 0]),
+                    "center": el.get("center", [0, 0]),
+                    "center_px": el.get("center_px", el.get("center", [0, 0])),
+                    "confidence": round(score, 3),
+                    "href": el.get("href", ""),
+                    "method": "dom",
+                })
+
+        dom_matches.sort(key=lambda d: d["confidence"], reverse=True)
+        if dom_matches:
+            return {
+                "found": True,
+                "element": dom_matches[0],
+                "method": "dom",
+                "alternatives": dom_matches[1:5],
+            }
+
+    # 2. Fall back to OCR + GroundingDINO via existing ground endpoint
+    detections = grounding.ground_element(
+        req.image, req.query,
+        image_width=req.image_width,
+        image_height=req.image_height,
+    )
+
+    if detections:
+        best = detections[0]
+        return {
+            "found": True,
+            "element": {
+                "id": f"ground_{0}",
+                "type": "detected",
+                "text": best.get("label", req.query),
+                "bbox": best["bbox"],
+                "center": best["center"],
+                "center_px": best["center"],
+                "confidence": best.get("score", 0.5),
+                "method": best.get("method", "ocr"),
+            },
+            "method": best.get("method", "ocr"),
+            "alternatives": [
+                {
+                    "id": f"ground_{i+1}",
+                    "type": "detected",
+                    "text": d.get("label", ""),
+                    "bbox": d["bbox"],
+                    "center": d["center"],
+                    "center_px": d["center"],
+                    "confidence": d.get("score", 0),
+                    "method": d.get("method", "ocr"),
+                }
+                for i, d in enumerate(detections[1:5])
+            ],
+        }
+
+    return {"found": False, "element": None, "method": "none", "alternatives": []}
+
+
 @app.get("/health")
 async def health():
     return {

@@ -33,6 +33,7 @@ const RESPONSE_URL = process.env.RESPONSE_URL || 'http://localhost:8005';
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
 const UI_PARSER_URL = process.env.UI_PARSER_URL || 'http://localhost:8011';
 const TOOL_EXECUTOR_URL = process.env.TOOL_EXECUTOR_URL || 'http://localhost:8007';
+const MEMORY_URL = process.env.MEMORY_URL || 'http://localhost:8004';
 const LLM_TIMEOUT_MS = 60_000;
 const ACTION_TIMEOUT_MS = 30_000;
 
@@ -312,6 +313,103 @@ export class ComputerUseController {
     return { ok: true, queued: queue.length };
   }
 
+  /**
+   * Follow up on a completed/failed session with user feedback.
+   * Reopens the session, injects the feedback, and continues executing.
+   * Also teaches the system from the feedback for future sessions.
+   */
+  @Post('sessions/:id/follow-up')
+  async followUp(@Param('id') id: string, @Body() body: { message: string }) {
+    const session = sessions.get(id);
+    if (!session) throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
+    if (!body.message?.trim()) throw new HttpException('Feedback message required', HttpStatus.BAD_REQUEST);
+
+    const feedback = body.message.trim();
+    this.logger.log(`Follow-up on ${id}: "${feedback}"`);
+
+    // 1. Teach from the feedback — store lesson for future sessions
+    this.teachFromFeedback(session.goal, feedback, session.plan).catch(err => {
+      this.logger.warn(`Teaching from feedback failed: ${err.message}`);
+    });
+
+    // 2. Reopen the session
+    session.status = 'executing';
+    session.error = undefined;
+    session.updated_at = new Date().toISOString();
+
+    // Inject feedback as high-priority context
+    const queue: string[] = (session as any)._feedback_queue || [];
+    queue.push(`USER CORRECTION: ${feedback}`);
+    (session as any)._feedback_queue = queue;
+
+    // Add a new step to continue from
+    session.plan.push({
+      index: session.plan.length,
+      description: `Follow-up: ${feedback.slice(0, 60)}`,
+      action: 'read_screen',
+      target: '',
+      status: 'pending',
+    });
+
+    // 3. Resume adaptive execution
+    this.executeAdaptiveLoop(id).catch(() => {});
+
+    return { status: 'executing', message: 'Session reopened with your feedback' };
+  }
+
+  /**
+   * Extract a lesson from user feedback on a CU session and store it
+   * via the teaching service for future reference.
+   */
+  private async teachFromFeedback(goal: string, feedback: string, plan: PlanStep[]): Promise<void> {
+    const completedSteps = plan
+      .filter(s => s.status === 'completed' || s.status === 'failed')
+      .map(s => `${s.action}: ${s.description} → ${(s.output || '').slice(0, 100)}`)
+      .join('\n');
+
+    // Generate a condition/conclusion rule from the feedback
+    try {
+      const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+        user_message:
+          `A computer-use task was attempted but the user says it wasn't done correctly.\n\n` +
+          `GOAL: ${goal}\n` +
+          `USER FEEDBACK: ${feedback}\n` +
+          `STEPS TAKEN:\n${completedSteps.slice(0, 1500)}\n\n` +
+          `Extract a reusable rule in IF/THEN format:\n` +
+          `Line 1: CONDITION: <when this situation occurs>\n` +
+          `Line 2: CONCLUSION: <do this instead>\n\n` +
+          `Examples:\n` +
+          `CONDITION: closing a Facebook page called Kive\n` +
+          `CONCLUSION: navigate directly to facebook.com/kiveteam instead of searching, then use Meta Business Suite settings\n\n` +
+          `CONDITION: clicking Settings on a Facebook page\n` +
+          `CONCLUSION: the sidebar Settings link goes to account settings, not page settings. Use business.facebook.com/latest/settings instead\n\n` +
+          `Reply with ONLY the CONDITION and CONCLUSION lines.`,
+        context: { system_override: 'Extract an IF/THEN rule. Reply with ONLY CONDITION: and CONCLUSION: lines.', max_tokens: 150 },
+      }, { timeout: 15000 });
+
+      const text = (res.data?.response_text || res.data?.response || '').trim();
+      const condMatch = text.match(/CONDITION:\s*(.+)/i);
+      const concMatch = text.match(/CONCLUSION:\s*(.+)/i);
+
+      if (condMatch && concMatch) {
+        const condition = condMatch[1].trim();
+        const conclusion = concMatch[1].trim();
+        this.logger.log(`CU rule learned: "${condition}" → "${conclusion}"`);
+
+        // Store in Neo4j via memory service
+        await this.storeMemoryRule(condition, conclusion, 0.85);
+      } else {
+        // Fallback: store the raw text as a rule
+        const lesson = text.slice(0, 200);
+        if (lesson.length > 10) {
+          await this.storeMemoryRule(`computer-use task: ${goal.slice(0, 80)}`, lesson, 0.7);
+        }
+      }
+    } catch (err: any) {
+      this.logger.warn(`Failed to extract lesson: ${err.message}`);
+    }
+  }
+
   @Delete('sessions/:id')
   async cancelSession(@Param('id') id: string) {
     const session = sessions.get(id);
@@ -422,6 +520,96 @@ export class ComputerUseController {
    * Research the goal via web search before planning.
    * Returns formatted guide text to inject into the plan prompt.
    */
+  /**
+   * Query Neo4j memory for CU-relevant rules and lessons learned from past sessions.
+   */
+  private async queryMemoryForCU(goal: string): Promise<string> {
+    try {
+      // Extract keywords from the goal for rule matching
+      const keywords = goal.toLowerCase()
+        .replace(/[^\w\s]/g, '')
+        .split(/\s+/)
+        .filter(w => w.length > 3)
+        .slice(0, 8)
+        .join(',');
+
+      const res = await axios.get(`${MEMORY_URL}/internal/memory/rules`, {
+        params: { keywords },
+        timeout: 5000,
+      });
+
+      const rules = res.data?.rules || [];
+      if (rules.length === 0) return '';
+
+      const formatted = rules
+        .slice(0, 10)
+        .map((r: { condition: string; conclusion: string; confidence: number }, i: number) =>
+          `${i + 1}. IF ${r.condition} THEN ${r.conclusion} (confidence: ${r.confidence})`)
+        .join('\n');
+
+      this.logger.log(`CU memory: found ${rules.length} relevant rules for "${goal.slice(0, 50)}"`);
+      return `KNOWLEDGE FROM PREVIOUS SESSIONS (follow these rules):\n${formatted}\n`;
+    } catch (err: any) {
+      this.logger.debug(`CU memory query failed: ${err.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * Store a CU lesson as a rule in Neo4j memory for future sessions.
+   */
+  private async storeMemoryRule(condition: string, conclusion: string, confidence: number = 0.8): Promise<void> {
+    try {
+      await axios.post(`${MEMORY_URL}/internal/memory/teach`, {
+        condition,
+        conclusion,
+        confidence,
+        source: 'computer-use',
+      }, { timeout: 10000 });
+      this.logger.log(`CU rule stored: "${condition}" → "${conclusion}"`);
+    } catch (err: any) {
+      this.logger.debug(`CU rule store failed: ${err.message}`);
+    }
+  }
+
+  /**
+   * Learn from a completed CU session — extract reusable rules and store in Neo4j.
+   * Called after every successful session so future sessions benefit.
+   */
+  private async learnFromSession(session: ComputerUseSession & { visionGranted: boolean }): Promise<void> {
+    const completedSteps = session.plan
+      .filter(s => s.status === 'completed')
+      .map(s => `${s.action}: ${s.description}`)
+      .join(' → ');
+
+    if (completedSteps.length < 20) return; // Too short to learn from
+
+    try {
+      const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+        user_message:
+          `A computer-use task was completed successfully.\n\n` +
+          `GOAL: ${session.goal}\n` +
+          `STEPS THAT WORKED: ${completedSteps.slice(0, 1000)}\n\n` +
+          `Extract the KEY INSIGHT about HOW this was accomplished, as an IF/THEN rule:\n` +
+          `CONDITION: <when user wants to do this type of task>\n` +
+          `CONCLUSION: <the efficient approach that worked>\n\n` +
+          `Focus on URLs, navigation paths, or UI elements that were important.\n` +
+          `Reply with ONLY CONDITION: and CONCLUSION: lines.`,
+        context: { system_override: 'Extract a reusable rule. CONDITION: and CONCLUSION: only.', max_tokens: 150 },
+      }, { timeout: 15000 });
+
+      const text = (res.data?.response_text || res.data?.response || '').trim();
+      const condMatch = text.match(/CONDITION:\s*(.+)/i);
+      const concMatch = text.match(/CONCLUSION:\s*(.+)/i);
+
+      if (condMatch && concMatch) {
+        await this.storeMemoryRule(condMatch[1].trim(), concMatch[1].trim(), 0.9);
+      }
+    } catch (err: any) {
+      this.logger.debug(`learnFromSession failed: ${err.message}`);
+    }
+  }
+
   private async researchGoal(goal: string): Promise<string> {
     try {
       // Generate a search query focused on the ACTION the user wants to perform
@@ -507,14 +695,20 @@ export class ComputerUseController {
     const hasScreen = !!screenImage;
     const shareCtx = this.getShareContext(sessionId);
 
+    // ── Query Neo4j memory for past CU knowledge ──
+    const memoryCtx = await this.queryMemoryForCU(goal);
+
     // ── Pre-plan research: search the web for how to accomplish the goal ──
     const researchContext = await this.researchGoal(goal);
     if (researchContext) {
       (session as any)._research = researchContext;
     }
 
+    const lessonsCtx = memoryCtx; // Neo4j rules replace in-memory lessons
+
     const systemPrompt =
       `You are a computer-use planner. You create SHORT, efficient step-by-step plans to control a real computer.\n\n` +
+      lessonsCtx +
       (researchContext ? `${researchContext}\nUse the research above to inform your plan. Follow the documented steps from trusted sources rather than guessing.\n\n` : '') +
       `SHARED SCREEN CONTEXT:\n${shareCtx}\n\n` +
       `${hasScreen ? 'A screenshot of the current screen is attached. ANALYZE IT FIRST before planning:\n' +
@@ -539,9 +733,12 @@ export class ComputerUseController {
       `2. NEVER use "screenshot" as a standalone step — "read_screen" already captures the screen AND extracts text. Use read_screen instead.\n` +
       `3. NEVER put "wait" after "navigate" — the navigate action already waits for page load.\n` +
       `4. NEVER put "screenshot" before "read_screen" — read_screen already takes a screenshot.\n` +
-      `5. Prefer "navigate" with a KNOWN direct URL over "click" — but NEVER fabricate URLs. Only use URLs you know are correct (from research, from the current page, or from standard well-known patterns like github.com/USERNAME). If unsure of the URL, use "click" to navigate via the UI instead.\n` +
+      `5. ALWAYS prefer "navigate" with a direct URL when you can construct it from the goal.\n` +
+      `   Examples: "page called kiveteam" → navigate to https://www.facebook.com/kiveteam\n` +
+      `            "github repo oasis" → navigate to https://github.com/theaiinc/oasis-cognition\n` +
+      `            "my twitter profile" → navigate to https://twitter.com/USERNAME\n` +
+      `   If the goal mentions a page name/slug/URL, USE IT DIRECTLY. Don't search or click through menus.\n` +
       `6. For GitHub: use direct URLs like https://github.com/orgs/ORGNAME/repositories or https://github.com/USERNAME?tab=repositories\n` +
-      `6b. For complex web apps (Facebook, Google, etc.): prefer "click" navigation via UI menus/links over guessing URLs. These apps have dynamic routes that change frequently.\n` +
       `7. One "read_screen" is enough per page — do NOT repeat read_screen unless you scrolled.\n` +
       `8. Only scroll if you have evidence the content continues below the fold. Don't preemptively scroll.\n` +
       `9. Plans execute LINEARLY — NO conditional logic.\n\n` +
@@ -554,9 +751,9 @@ export class ComputerUseController {
       `  The execution engine replaces __DISCOVERED_*__ tokens with values from read_screen.\n` +
       `- End with "read_screen" to capture the final result.\n` +
       `- NEVER interact with localhost:3000 (Oasis UI).\n` +
-      `- NEVER fabricate or guess URLs for web apps like Facebook, Instagram, Twitter, etc. Their URLs are unpredictable.\n` +
-      `  Instead, navigate to the homepage and use "click" to find your way through the UI menus and sidebar.\n` +
-      `  For Facebook page management: go to facebook.com → look for the page in "Your shortcuts" sidebar → click it → use Page Settings.\n\n` +
+      `- If the goal mentions a page name or identifier, construct the URL directly (e.g., facebook.com/PAGENAME, github.com/USER).\n` +
+      `- For page management (settings, delete, etc.): navigate to the page first, then look for Settings in the sidebar.\n` +
+      `  If page settings don't work via click, try business.facebook.com/latest/settings/ for Facebook.\n\n` +
       `EXAMPLE — "list repos for org theaiinc":\n` +
       `STEP: navigate | https://github.com/orgs/theaiinc/repositories | Go directly to org repos page\n` +
       `STEP: read_screen | | Read all visible repository names\n` +
@@ -1103,40 +1300,33 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
   // ════════════════════════════════════════════════════════════════════════
 
   private static readonly REACT_SYSTEM = `\
-You are a computer-use agent controlling a real browser. You follow a plan but adapt based on what you actually see on the page.
+You are a SMART, EFFICIENT computer-use agent. You follow a plan but ADAPT based on what you see.
 
-You will be given:
-1. The GOAL you're trying to achieve
-2. The CURRENT PLANNED STEP to execute
-3. The REMAINING PLAN (upcoming steps)
-4. The CURRENT PAGE CONTENT (what's actually on screen)
+OUTPUT (one field per line):
+THOUGHT: <what you see + your reasoning> (1-2 sentences max)
+ACTION: <action>
+TARGET: <value>
 
-OUTPUT FORMAT (one field per line, NO JSON, NO markdown):
-
-THOUGHT: what you see on the page and whether the planned step makes sense (one sentence)
-ACTION: <action_name>
-TARGET: <target value>
-
-VALID ACTIONS:
-- execute_plan | TARGET = (empty) — execute the planned step as-is, it makes sense
-- click | TARGET = text of the element to click (use this to ADAPT the planned step)
+ACTIONS:
+- execute_plan — run the planned step as-is
+- click | TARGET = exact text of clickable element (from page content or clickable elements list)
 - navigate | TARGET = full URL
-- type | TARGET = text to type into the focused field
+- type | TARGET = text to type
 - scroll | TARGET = up or down
-- read_screen | TARGET = (empty) — re-read the page to see updated content
-- skip | TARGET = reason — skip this planned step (already done, not needed, etc.)
-- done | TARGET = summary — the goal is ALREADY achieved based on what's on the page
-- failed | TARGET = reason — cannot complete the goal
+- read_screen — re-read after action
+- skip | TARGET = reason
+- done | TARGET = evidence-based summary
+- failed | TARGET = reason
 
-RULES:
-- Prefer "execute_plan" when the planned step matches what you see on the page.
-- Use a different action to ADAPT when the planned step won't work (e.g., wrong URL, element not visible, page state changed).
-- Click elements by their EXACT visible text or aria-label from the page content.
-- NEVER fabricate or guess URLs. Only use URLs visible in the page content or well-known patterns.
-- For complex web apps (Facebook, Google, etc.), prefer clicking UI elements over guessing URLs.
-- If a click doesn't change the page after the page-change indicator says UNCHANGED, try a different element or approach.
-- If you see evidence the goal is already achieved (e.g., "This is an unpublished Page"), say done immediately.
-- Be efficient — skip steps that are redundant given the current page state.`;
+EFFICIENCY RULES (critical):
+1. NAVIGATE DIRECTLY when you know the URL. If the goal mentions "facebook.com/kiveteam", go there directly — don't search.
+2. Extract URLs from the user's goal: page names, domains, paths → construct the URL and navigate.
+3. If a click has NO EFFECT (page unchanged), NEVER repeat it. Try: navigate to URL, scroll, or different element.
+4. After 2 failed clicks on the same target, try a completely different approach (direct URL, different menu path).
+5. "done" requires REAL EVIDENCE from the page content (not just "I clicked things"). Show what changed.
+6. "Page not available" after navigating does NOT mean you accomplished the goal — it means the URL is wrong.
+7. Skip redundant steps. If you're already on the target page, skip navigation steps.
+8. For settings/admin pages: navigate to direct URLs (e.g., business.facebook.com/latest/settings/) rather than clicking through menus.`;
 
   private async executeAdaptiveLoop(sessionId: string): Promise<void> {
     const session = sessions.get(sessionId);
@@ -1151,6 +1341,8 @@ RULES:
     }
 
     const researchCtx = (session as any)._research || '';
+    // Query Neo4j for relevant CU rules
+    const lessonsCtx = await this.queryMemoryForCU(session.goal);
     const MAX_EXTRA_STEPS = 15; // max adaptive steps beyond the original plan
     const actionHistory: string[] = [];
     let prevPageText = '';
@@ -1201,6 +1393,19 @@ RULES:
       }
       prevPageText = pageText;
 
+      // Stuck detection — if the last 2 actions were the same click with no page change
+      let stuckNote = '';
+      if (actionHistory.length >= 2 && pageChangeNote.includes('UNCHANGED')) {
+        const last2 = actionHistory.slice(-2);
+        const sameAction = last2.every(h => {
+          const m = h.match(/→\s*"([^"]+)"/);
+          return m?.[1] && m[1] === (last2[0].match(/→\s*"([^"]+)"/)?.[1]);
+        });
+        if (sameAction) {
+          stuckNote = `\n⚠️ STUCK: Same action repeated with no effect. You MUST try a completely different approach — navigate to a different URL, scroll, or skip this step.\n`;
+        }
+      }
+
       // Build remaining plan context
       const remainingSteps = session.plan
         .slice(session.current_step + 1)
@@ -1212,6 +1417,7 @@ RULES:
       const userPrompt =
         `GOAL: ${session.goal}\n\n` +
         (researchCtx ? `RESEARCH:\n${researchCtx.slice(0, 1500)}\n\n` : '') +
+        lessonsCtx +
         (actionHistory.length > 0 ? `ACTIONS COMPLETED:\n${actionHistory.slice(-8).join('\n')}\n\n` : '') +
         `CURRENT PLANNED STEP (${session.current_step + 1}/${session.plan.length}):\n` +
         `  Action: ${step.action}\n` +
@@ -1219,6 +1425,7 @@ RULES:
         `  Description: ${step.description}\n\n` +
         (remainingSteps ? `REMAINING PLAN:\n${remainingSteps}\n\n` : '') +
         pageChangeNote +
+        stuckNote +
         `CURRENT PAGE:\n${pageText.slice(0, 5000)}\n\n` +
         `Should the planned step be executed as-is, adapted, or skipped?`;
 
@@ -1263,6 +1470,8 @@ RULES:
         session.updated_at = new Date().toISOString();
         this.logger.log(`Goal achieved at step ${session.current_step + 1}: ${target}`);
         this.generateSessionSummary(sessionId).catch(() => {});
+        // Learn from successful session — store what worked as a rule
+        this.learnFromSession(session).catch(() => {});
         return;
       }
 
@@ -2974,19 +3183,20 @@ RULES:
         return { output: navOutput, screenshot: navScreen };
       }
 
+      case 'find_ui_element':
       case 'click': {
-        // ── Strategy 1: Chrome Bridge DOM click (fast, precise, no coordinate guessing) ──
-        try {
-          const bridgeClickRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-            tool: 'computer_action',
-            action: 'chrome_bridge_click',
-            text: target,
-          }, { timeout: 15000 });
+        // ── CUA unified click: Chrome Bridge DOM → ui_parser OCR/GroundingDINO → pixel fallback ──
+        const cuaRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+          tool: 'computer_action',
+          action: action === 'find_ui_element' ? 'find_ui_element' : 'click_ui_element',
+          text: target,
+        }, { timeout: 20000 });
 
-          if (bridgeClickRes.data?.success) {
-            this.logger.log(`DOM click via Chrome Bridge: "${target}" → success`);
+        if (cuaRes.data?.success) {
+          this.logger.log(`CUA ${action}: "${target}" → ${cuaRes.data.output}`);
+          if (action === 'click') {
             await new Promise(r => setTimeout(r, 800));
-            // Read page text after click to capture the result (not just screenshot)
+            // Read page text after click
             let postClickOutput = '';
             try {
               const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
@@ -2996,7 +3206,6 @@ RULES:
               }, { timeout: 10000 });
               if (pageRes.data?.success) {
                 postClickOutput = pageRes.data.output;
-                // Update work URL hint from the new page
                 const urlMatch = (pageRes.data.output as string).match(/^URL:\s*(.+)$/m);
                 if (urlMatch) {
                   try {
@@ -3009,48 +3218,20 @@ RULES:
             } catch { /* ignore */ }
             const postClickScreen = await this.getScreenImage(sid);
             return {
-              output: postClickOutput || `Clicked "${target}" via DOM`,
+              output: postClickOutput || cuaRes.data.output,
               screenshot: postClickScreen,
             };
           }
-          this.logger.log(`Chrome Bridge click failed for "${target}": ${bridgeClickRes.data?.output || 'element not found'} — falling back to pixel click`);
-        } catch (err: any) {
-          this.logger.log(`Chrome Bridge click unavailable: ${err.message} — falling back to pixel click`);
+          // find_ui_element — just return the result
+          return { output: cuaRes.data.output, screenshot: cuaRes.data?.screenshot };
         }
 
-        // ── Strategy 2: Pixel-coordinate click (screenshot → Florence-2/Vision LLM → click) ──
-        const screenB64 = await this.getScreenImage(sid);
-        if (!screenB64) {
-          return { output: `Click failed: no screen image available to locate "${target}"` };
-        }
-
-        const coords = await this.resolveClickCoordinates(target, screenB64, sid);
-        if (!coords) {
-          return { output: `Could not locate "${target}" on screen`, screenshot: screenB64 };
-        }
-
-        // The vision model returns coordinates WITHIN the captured image.
-        // We must offset to the window's absolute position on screen (multi-monitor).
-        let clickX = coords.x;
-        let clickY = coords.y;
-        if (windowBounds) {
-          clickX += windowBounds.x;
-          clickY += windowBounds.y;
-          this.logger.log(`Click offset: image(${coords.x},${coords.y}) + window(${windowBounds.x},${windowBounds.y}) = screen(${clickX},${clickY})`);
-        }
-
-        this.logger.log(`Pixel-clicking "${target}" at absolute (${clickX}, ${clickY})`);
-        const clickRes = await axios.post(
-          `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-          { tool: 'computer_action', action: 'click', x: clickX, y: clickY },
-          { timeout: ACTION_TIMEOUT_MS },
-        );
-
-        await new Promise(r => setTimeout(r, 500));
-        const postClickScreen2 = await this.getScreenImage(sid);
+        // CUA failed — return the error
+        this.logger.warn(`CUA ${action} failed: ${cuaRes.data?.output}`);
+        const fallbackScreen = await this.getScreenImage(sid);
         return {
-          output: clickRes.data?.output || `Clicked "${target}" at (${clickX}, ${clickY})`,
-          screenshot: postClickScreen2 || clickRes.data?.screenshot,
+          output: cuaRes.data?.output || `Could not ${action} "${target}" on screen`,
+          screenshot: fallbackScreen,
         };
       }
 

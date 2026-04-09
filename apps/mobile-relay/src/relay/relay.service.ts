@@ -422,6 +422,19 @@ export class RelayService {
   }
 
   /**
+   * Follow up on a completed/failed CU session with user feedback.
+   * Reopens the session and continues with the correction.
+   */
+  async followUpComputerUseSession(sessionId: string, message: string): Promise<any> {
+    const response = await axios.post(
+      `${GATEWAY_URL}/api/v1/computer-use/sessions/${sessionId}/follow-up`,
+      { message },
+      { timeout: 15_000 },
+    );
+    return response.data;
+  }
+
+  /**
    * Take a native screenshot via dev-agent (pyautogui).
    */
   async takeScreenshot(target?: string): Promise<any> {

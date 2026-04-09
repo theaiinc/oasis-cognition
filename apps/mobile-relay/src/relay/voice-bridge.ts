@@ -338,13 +338,38 @@ class VoiceSession {
         client_message_id: clientMessageId,
       });
 
-      // 3. Send thinking indicator
+      // 3. Check if there's an active CU session — route as steering feedback instead of chat
+      let routedToCU = false;
+      try {
+        const cuRes = await axios.get(`${GATEWAY_URL}/api/v1/computer-use/sessions/active`, { timeout: 5000 });
+        const cuSession = cuRes.data?.session;
+        if (cuSession && ['executing', 'paused'].includes(cuSession.status)) {
+          // Route voice transcript as CU steering feedback
+          await axios.post(
+            `${GATEWAY_URL}/api/v1/computer-use/sessions/${cuSession.session_id}/feedback`,
+            { message: cleanedTranscript },
+            { timeout: 10000 },
+          );
+          this.send({
+            type: 'stream-event',
+            event_type: 'cu_feedback',
+            payload: { session_id: cuSession.session_id, message: cleanedTranscript },
+            client_message_id: clientMessageId,
+          });
+          console.log(`[VoiceBridge] Routed voice to CU session ${cuSession.session_id}: "${cleanedTranscript}"`);
+          routedToCU = true;
+        }
+      } catch { /* no active CU session or gateway down — continue to chat */ }
+
+      if (routedToCU) return;
+
+      // 4. Send thinking indicator (chat mode)
       this.send({
         type: 'thinking',
         client_message_id: clientMessageId,
       });
 
-      // 4. Call interaction API and subscribe to SSE timeline
+      // 5. Call interaction API and subscribe to SSE timeline
       await this.callInteraction(cleanedTranscript, clientMessageId);
     } catch (err: any) {
       console.error(`[VoiceBridge] Utterance processing error:`, err.message);

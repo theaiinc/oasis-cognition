@@ -31,38 +31,67 @@ app.add_middleware(
 import os
 
 _model_loaded = False
-# whisper-medium-mlx is ~4x faster than large-v3-turbo with good accuracy
-# Override via WHISPER_MODEL env var if needed
-_MODEL_REPO = os.environ.get("WHISPER_MODEL", "mlx-community/whisper-medium-mlx")
+# STT backend: "parakeet" (fast, ~80ms) or "whisper" (multilingual, ~1000ms)
+# Parakeet is 10x faster but English-only
+_STT_BACKEND = os.environ.get("OASIS_STT_BACKEND", "parakeet")
+_WHISPER_MODEL = os.environ.get("WHISPER_MODEL", "mlx-community/whisper-medium-mlx")
+_PARAKEET_MODEL = os.environ.get("PARAKEET_MODEL", "mlx-community/parakeet-tdt-0.6b-v3")
 
 # Minimum audio duration (seconds) to bother transcribing.
-# Very short chunks (< 0.5s) produce garbage like "you", "You", "Thank you."
 MIN_AUDIO_DURATION = 0.5
+
+_parakeet_model = None
 
 
 def _ensure_model():
-    """Lazy-load the MLX whisper model on first request."""
-    global _model_loaded
-    if not _model_loaded:
-        import mlx_whisper  # noqa: F401 — triggers model download on first use
-        logger.info("MLX Whisper model ready: %s", _MODEL_REPO)
-        _model_loaded = True
+    """Lazy-load the transcription model on first request."""
+    global _model_loaded, _parakeet_model
+
+    if _model_loaded:
+        return
+
+    if _STT_BACKEND == "parakeet":
+        try:
+            from parakeet_mlx import from_pretrained
+            logger.info("Loading Parakeet model: %s ...", _PARAKEET_MODEL)
+            _parakeet_model = from_pretrained(_PARAKEET_MODEL)
+            logger.info("Parakeet model ready (fast, ~80ms latency)")
+            _model_loaded = True
+            return
+        except Exception as e:
+            logger.warning("Parakeet failed to load (%s), falling back to Whisper", e)
+
+    # Fallback: MLX Whisper
+    import mlx_whisper  # noqa: F401
+    logger.info("MLX Whisper model ready: %s", _WHISPER_MODEL)
+    _model_loaded = True
 
 
 def _transcribe_sync(audio_np: np.ndarray, language: str | None = "en") -> dict:
-    """Run MLX Whisper transcription (blocking). Called via asyncio.to_thread."""
-    import mlx_whisper
-
+    """Transcribe audio using the configured backend."""
     _ensure_model()
+
+    # Parakeet backend (fast, English-only)
+    if _parakeet_model is not None:
+        import tempfile, soundfile as sf
+        # Parakeet needs a file path — write temp wav
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as f:
+            sf.write(f.name, audio_np, 16000)
+            result = _parakeet_model.transcribe(f.name)
+            try: os.unlink(f.name)
+            except: pass
+            return {"text": result.text, "language": "en"}
+
+    # Whisper backend (multilingual)
+    import mlx_whisper
     kwargs = dict(
-        path_or_hf_repo=_MODEL_REPO,
+        path_or_hf_repo=_WHISPER_MODEL,
         condition_on_previous_text=False,
         no_speech_threshold=0.6,
         word_timestamps=False,
     )
     if language:
         kwargs["language"] = language
-    # When language is None/empty, Whisper auto-detects
     return mlx_whisper.transcribe(audio_np, **kwargs)
 
 
@@ -70,9 +99,16 @@ def _transcribe_sync(audio_np: np.ndarray, language: str | None = "en") -> dict:
 
 class TranscribeRequest(BaseModel):
     """Audio as base64-encoded float32 PCM + sample rate."""
-    audio_b64: str
+    audio_b64: str = ""
+    audio_data: str = ""  # Alias — mobile voice bridge sends this field name
     sample_rate: int = 16000
     language: str = ""
+    format: str = ""  # Ignored but accepted from voice bridge
+
+    @property
+    def audio_bytes_b64(self) -> str:
+        """Return whichever audio field was provided."""
+        return self.audio_b64 or self.audio_data
 
 
 class TranscribeResponse(BaseModel):
@@ -90,7 +126,9 @@ async def _warmup():
 
 @app.get("/health")
 async def health():
-    return {"status": "ok", "service": "transcription-mlx", "model": _MODEL_REPO}
+    model = _PARAKEET_MODEL if _parakeet_model else _WHISPER_MODEL
+    backend = "parakeet" if _parakeet_model else "whisper"
+    return {"status": "ok", "service": "transcription-mlx", "model": model, "backend": backend}
 
 
 # Only allow one transcription at a time — MLX/MPS crashes on concurrent GPU access
@@ -105,7 +143,10 @@ async def transcribe(req: TranscribeRequest):
     responsive for health checks and concurrent requests.
     """
     # Decode float32 PCM from base64
-    raw = base64.b64decode(req.audio_b64)
+    audio_b64 = req.audio_bytes_b64
+    if not audio_b64:
+        return TranscribeResponse(text="", duration_ms=0)
+    raw = base64.b64decode(audio_b64)
     audio_np = np.frombuffer(raw, dtype=np.float32)
 
     # Resample to 16kHz if needed

@@ -47,9 +47,53 @@ export function MobileComputerUse({ tunnelUrl, onClose }: MobileComputerUseProps
   const [isFullscreen, setIsFullscreen] = useState(false);
   const [expandedStep, setExpandedStep] = useState<number | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [screenGranted, setScreenGranted] = useState(false);
+  const [liveScreen, setLiveScreen] = useState<string | null>(null);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const screenPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const relayUrl = `${tunnelUrl}/relay`;
+
+  // Combined: check screen access + poll screenshots in one effect
+  // Runs on mount and restarts on reopen (component remount)
+  useEffect(() => {
+    let stopped = false;
+    let interval: ReturnType<typeof setInterval> | null = null;
+
+    const pollScreenshot = async () => {
+      if (stopped) return;
+      try {
+        // Check screen access status first
+        const statusRes = await fetch(`${tunnelUrl}/pair/status`).catch(() => null);
+        if (!statusRes?.ok) return;
+        const statusData = await statusRes.json();
+        const granted = statusData.screen_share_granted === true;
+        setScreenGranted(granted);
+        if (!granted || stopped) return;
+
+        // Take screenshot
+        const ssRes = await fetch(`${relayUrl}/screenshot`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({}),
+        }).catch(() => null);
+        if (!ssRes?.ok || stopped) return;
+        const ssData = await ssRes.json();
+        if (ssData.screenshot && !stopped) {
+          setLiveScreen(ssData.screenshot);
+        }
+      } catch { /* ignore */ }
+    };
+
+    // Start immediately then poll every 3s
+    pollScreenshot();
+    interval = setInterval(pollScreenshot, 3000);
+
+    return () => {
+      stopped = true;
+      if (interval) clearInterval(interval);
+    };
+  }, [tunnelUrl, relayUrl]);
 
   // Poll for session status
   const pollSession = useCallback(async (sessionId?: string) => {
@@ -213,18 +257,28 @@ export function MobileComputerUse({ tunnelUrl, onClose }: MobileComputerUseProps
     }
   };
 
-  // Fullscreen screenshot view
-  if (isFullscreen && session?.live_screenshot) {
+  // Fullscreen screenshot view (works for both CU session and standalone screen share)
+  const fullscreenImage = session?.live_screenshot || liveScreen;
+  if (isFullscreen && fullscreenImage) {
     return (
       <div className="fixed inset-0 z-50 bg-black flex flex-col">
         <div className="flex items-center justify-between px-4 py-2 bg-black/80">
           <div className="flex items-center gap-2">
-            <span className={`px-2 py-0.5 rounded text-[10px] border ${statusColor(session.status)}`}>
-              {session.status.replace('_', ' ')}
-            </span>
-            <span className="text-[10px] text-slate-400">
-              Step {session.current_step + 1}/{session.plan.length}
-            </span>
+            {session ? (
+              <>
+                <span className={`px-2 py-0.5 rounded text-[10px] border ${statusColor(session.status)}`}>
+                  {session.status.replace('_', ' ')}
+                </span>
+                <span className="text-[10px] text-slate-400">
+                  Step {session.current_step + 1}/{session.plan.length}
+                </span>
+              </>
+            ) : (
+              <span className="text-[10px] text-emerald-300 flex items-center gap-1.5">
+                <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                Screen shared
+              </span>
+            )}
           </div>
           <button
             onClick={() => setIsFullscreen(false)}
@@ -233,15 +287,19 @@ export function MobileComputerUse({ tunnelUrl, onClose }: MobileComputerUseProps
             <Minimize2 className="w-4 h-4" />
           </button>
         </div>
-        <div className="flex-1 flex items-center justify-center p-2 overflow-auto">
+        <div
+          className="flex-1 overflow-auto"
+          style={{ touchAction: 'pan-x pan-y pinch-zoom' }}
+        >
           <img
-            src={`data:image/jpeg;base64,${session.live_screenshot}`}
+            src={`data:image/jpeg;base64,${fullscreenImage}`}
             alt="Desktop screen"
-            className="max-w-full max-h-full object-contain rounded-lg"
+            className="min-w-[200vw] object-contain"
+            style={{ transformOrigin: '0 0' }}
           />
         </div>
         {/* Controls overlay at bottom */}
-        {session.status === 'executing' && (
+        {session?.status === 'executing' && (
           <div className="flex justify-center gap-3 p-3 bg-black/80">
             <button
               onClick={handleCancel}
@@ -277,7 +335,28 @@ export function MobileComputerUse({ tunnelUrl, onClose }: MobileComputerUseProps
       <div className="flex-1 overflow-y-auto px-4 py-4">
         <div className="flex flex-col gap-4">
 
-          {/* Live Screenshot Stream */}
+          {/* Live Screen — shown when screen access granted (even without CU session) */}
+          {!session && liveScreen && (
+            <div className="relative rounded-xl border border-slate-800 overflow-hidden">
+              <img
+                src={`data:image/jpeg;base64,${liveScreen}`}
+                alt="Desktop screen"
+                className="w-full object-contain rounded-xl"
+              />
+              <button
+                onClick={() => setIsFullscreen(true)}
+                className="absolute top-2 right-2 p-1.5 rounded-lg bg-black/60 text-white hover:bg-black/80"
+              >
+                <Maximize2 className="w-3.5 h-3.5" />
+              </button>
+              <div className="absolute bottom-2 left-2 flex items-center gap-1.5 px-2 py-1 rounded-lg bg-black/60">
+                <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" />
+                <span className="text-[10px] text-emerald-300">Screen shared</span>
+              </div>
+            </div>
+          )}
+
+          {/* Live Screenshot Stream — during CU session */}
           {session?.live_screenshot && (
             <div className="relative rounded-xl border border-slate-800 overflow-hidden">
               <img

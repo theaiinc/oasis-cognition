@@ -3,6 +3,7 @@ export interface MobilePairingSession {
   sessionKey: Buffer | null;
   desktopHalf: Buffer;
   tunnelUrl: string;
+  qrUrl: string;
   expiresAt: Date;
   durationHours: number;
   createdAt: Date;

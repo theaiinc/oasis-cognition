@@ -28,6 +28,10 @@ export class PairingService {
     const expiresEpoch = Math.floor(expiresAt.getTime() / 1000);
     const qrUrl = `${tunnelUrl}/#pair/${pairingId}/${desktopHalf.encoded}/${expiresEpoch}`;
 
+    // Store QR URL on session so getStatus() can return it after refresh
+    const session = this.sessionService.getSession();
+    if (session) session.qrUrl = qrUrl;
+
     return {
       pairing_id: pairingId,
       qr_url: qrUrl,
@@ -63,6 +67,7 @@ export class PairingService {
       base.pairing_id = session.pairingId;
       base.expires_at = session.expiresAt.toISOString();
       base.tunnel_url = session.tunnelUrl;
+      if (session.qrUrl) base.qr_url = session.qrUrl;
       base.screen_share_granted = session.screenShareGranted;
       base.last_tool_request = session.lastToolRequest
         ? {

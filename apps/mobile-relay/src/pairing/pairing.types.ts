@@ -24,6 +24,7 @@ export interface PairingStatusResponse {
   pairing_id?: string;
   expires_at?: string;
   tunnel_url?: string;
+  qr_url?: string;
   screen_share_granted?: boolean;
   last_tool_request?: {
     type: string;

@@ -56,6 +56,7 @@ export class SessionService {
       sessionKey: null,
       desktopHalf: desktopHalf.raw,
       tunnelUrl,
+      qrUrl: '', // Set by PairingService after computing the full QR URL
       expiresAt,
       durationHours: hours,
       createdAt: new Date(),

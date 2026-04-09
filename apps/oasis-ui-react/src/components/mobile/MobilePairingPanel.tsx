@@ -59,6 +59,12 @@ export function MobilePairingPanel({ onClose }: MobilePairingPanelProps) {
       }
       prevStateRef.current = newStatus.state;
 
+      // Restore QR code if pairing is awaiting mobile (e.g., after page refresh)
+      if (newStatus.state === 'awaiting_mobile' && !qrUrl) {
+        const restoredUrl = (newStatus as any).qr_url || newStatus.tunnel_url;
+        if (restoredUrl) setQrUrl(restoredUrl);
+      }
+
       setStatus(newStatus);
     } catch {
       // Relay not running — show idle

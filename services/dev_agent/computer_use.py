@@ -1525,6 +1525,77 @@ end tell
         ctrl_kwargs["amount"] = amount
     if duration != 0.5:
         ctrl_kwargs["duration"] = duration
+    # App-targeted keystrokes: handle directly via AppleScript (more reliable than routing through control app)
+    app_target = kwargs.get("app")
+    if app_target and action in ("key_press", "hotkey", "type_text"):
+        try:
+            safe_app = app_target.replace('"', '\\"')
+            if action == "type_text" and text:
+                safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
+                ax_script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.3
+        keystroke "{safe_text}"
+    end tell
+end tell
+'''
+            elif action == "hotkey" and keys:
+                # keys = ["command", "n"] → keystroke "n" using {command down}
+                _mod_map = {"command": "command down", "cmd": "command down", "shift": "shift down",
+                            "option": "option down", "alt": "option down", "control": "control down", "ctrl": "control down"}
+                the_key = keys[-1]
+                mods = [_mod_map.get(m.lower(), m + " down") for m in keys[:-1]]
+                mod_clause = f" using {{{', '.join(mods)}}}" if mods else ""
+                ax_script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.3
+        keystroke "{the_key}"{mod_clause}
+    end tell
+end tell
+'''
+            elif action == "key_press" and key:
+                _key_codes = {"enter": 36, "return": 36, "tab": 48, "space": 49, "escape": 53,
+                              "up": 126, "down": 125, "left": 123, "right": 124, "delete": 51}
+                kc = _key_codes.get(key.lower())
+                if kc:
+                    ax_script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.3
+        key code {kc}
+    end tell
+end tell
+'''
+                else:
+                    ax_script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.3
+        keystroke "{key}"
+    end tell
+end tell
+'''
+            else:
+                ax_script = None
+
+            if ax_script:
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", ax_script,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                await asyncio.wait_for(proc.communicate(), timeout=10)
+                output = f"{action}: {text or key or ','.join(keys or [])} → {app_target}"
+                logger.info("App-targeted %s to '%s' via AppleScript", action, app_target)
+                screenshot = _take_screenshot()
+                return {"success": True, "output": output, "screenshot": screenshot}
+        except Exception as e:
+            logger.warning("App-targeted %s failed: %s — falling back to control app", action, e)
 
     ctrl = _run_control(action, **ctrl_kwargs)
     screenshot = _take_screenshot()

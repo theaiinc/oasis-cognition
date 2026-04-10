@@ -322,8 +322,22 @@
     skipped: '<span style="color:#6e7681;opacity:0.4">&#8722;</span>',
   };
 
+  let lastSessionData = null; // Keep last session data to avoid blanking
+
   function updateUI(data) {
     if (data.type === 'idle' || !data.session_id) {
+      // If we have a previous session, keep showing it (dimmed) instead of blanking
+      if (lastSessionData && lastSessionData.session_id) {
+        statusDot.className = 'status-dot idle';
+        headerTitle.textContent = lastSessionData.status === 'completed' ? 'Completed' :
+                                  lastSessionData.status === 'failed' ? 'Failed' : 'Session Ended';
+        stopBtn.disabled = true;
+        steerInput.disabled = true;
+        steerSend.disabled = true;
+        stopBtn.style.opacity = '0.4';
+        warning.style.display = 'none';
+        return; // Keep showing last session's steps and goal
+      }
       statusDot.className = 'status-dot idle';
       headerTitle.textContent = 'No Active Session';
       goalEl.textContent = 'Waiting for a computer-use session...';
@@ -335,6 +349,8 @@
       stopBtn.style.opacity = '0.4';
       return;
     }
+
+    lastSessionData = data; // Remember for when session goes idle
 
     currentSessionId = data.session_id;
     const status = data.status;
@@ -417,16 +433,26 @@
   }
 
   // Poll active session via HTTP (more reliable than WebSocket in Electron)
+  let nullPollCount = 0;
   async function pollSession() {
     try {
       const controller = new AbortController();
       const timer = setTimeout(() => controller.abort(), 5000);
       const resp = await fetch(POLL_URL, { signal: controller.signal });
       clearTimeout(timer);
-      if (!resp.ok) { updateUI({ type: 'idle' }); return; }
+      if (!resp.ok) {
+        nullPollCount++;
+        if (nullPollCount > 5) updateUI({ type: 'idle' }); // Only go idle after 5 consecutive nulls (~7.5s)
+        return;
+      }
       const data = await resp.json();
       const session = data.session;
-      if (!session) { updateUI({ type: 'idle' }); return; }
+      if (!session) {
+        nullPollCount++;
+        if (nullPollCount > 5) updateUI({ type: 'idle' });
+        return;
+      }
+      nullPollCount = 0; // Reset on successful data
 
       // Filter steps
       const steps = (session.plan || [])

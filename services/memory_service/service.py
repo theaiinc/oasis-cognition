@@ -31,6 +31,10 @@ class MemoryService:
         self._fallback_rules: list[dict[str, Any]] = []
         self._fallback_pending_teaching: dict[str, dict[str, Any]] = {}
         self._fallback_pending_self_teaching: dict[str, dict[str, Any]] = {}
+        # CU learning memory fallbacks
+        self._fallback_skills: list[dict[str, Any]] = []
+        self._fallback_ui_elements: list[dict[str, Any]] = []
+        self._fallback_actions: list[dict[str, Any]] = []
         self._use_fallback = False
         self._init_driver()
 
@@ -104,6 +108,64 @@ class MemoryService:
             out["created_at"] = c_at.isoformat() if hasattr(c_at, "isoformat") else str(c_at)
         return out
 
+    @classmethod
+    def _skill_node_to_dict(cls, node: Any) -> dict[str, Any]:
+        if node is None:
+            return {}
+        try:
+            raw = dict(node)
+        except Exception:
+            raw = getattr(node, "_properties", {}) or {}
+        steps_raw = raw.get("steps", "[]")
+        try:
+            steps = json.loads(steps_raw) if isinstance(steps_raw, str) else list(steps_raw)
+        except Exception:
+            steps = []
+        return {
+            "id": str(raw.get("id", "")),
+            "name": str(raw.get("name", "")),
+            "intent": str(raw.get("intent", "")),
+            "steps": steps,
+            "success_rate": cls._safe_rule_float(raw.get("success_rate"), 0.0),
+            "usage_count": int(raw.get("usage_count", 0)) if raw.get("usage_count") is not None else 0,
+            "created_at": str(raw.get("created_at", "")),
+        }
+
+    @classmethod
+    def _ui_element_node_to_dict(cls, node: Any) -> dict[str, Any]:
+        if node is None:
+            return {}
+        try:
+            raw = dict(node)
+        except Exception:
+            raw = getattr(node, "_properties", {}) or {}
+        return {
+            "id": str(raw.get("id", "")),
+            "text": str(raw.get("text", "")),
+            "type": str(raw.get("type", "")),
+            "x_ratio": cls._safe_rule_float(raw.get("x_ratio"), 0.0),
+            "y_ratio": cls._safe_rule_float(raw.get("y_ratio"), 0.0),
+            "context": str(raw.get("context", "")),
+            "confidence": cls._safe_rule_float(raw.get("confidence"), 0.0),
+            "last_seen": str(raw.get("last_seen", "")),
+        }
+
+    @classmethod
+    def _action_node_to_dict(cls, node: Any) -> dict[str, Any]:
+        if node is None:
+            return {}
+        try:
+            raw = dict(node)
+        except Exception:
+            raw = getattr(node, "_properties", {}) or {}
+        return {
+            "id": str(raw.get("id", "")),
+            "type": str(raw.get("type", "")),
+            "target": str(raw.get("target", "")),
+            "success": bool(raw.get("success", False)),
+            "timestamp": str(raw.get("timestamp", "")),
+        }
+
     def _ensure_schema(self) -> None:
         if self._use_fallback or not self._driver:
             return
@@ -138,6 +200,18 @@ class MemoryService:
 
             # Reasoning graph tier index for efficient tier-based queries
             session.run("CREATE INDEX IF NOT EXISTS FOR (n:ReasoningNode) ON (n.tier)")
+
+            # CU learning memory schema
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (sk:Skill) REQUIRE sk.id IS UNIQUE")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (sk:Skill) ON (sk.fingerprint)")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (sk:Skill) ON (sk.intent)")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (sk:Skill) ON (sk.success_rate)")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (ui:UIElement) REQUIRE ui.id IS UNIQUE")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (ui:UIElement) ON (ui.fingerprint)")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (ui:UIElement) ON (ui.text)")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (ui:UIElement) ON (ui.context)")
+            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (act:Action) REQUIRE act.id IS UNIQUE")
+            session.run("CREATE INDEX IF NOT EXISTS FOR (act:Action) ON (act.type)")
 
     @staticmethod
     def _normalize_rule_part(text: str) -> str:
@@ -357,6 +431,243 @@ class MemoryService:
         # Auto-link to related rules
         await self._link_related_rules(rule_id, condition, conclusion)
         return rule_id
+
+    # ── CU Learning Memory ─────────────────────────────────────────────────────
+
+    def _cu_fingerprint(self, *parts: str) -> str:
+        """Stable fingerprint for CU learning memory dedup."""
+        raw = "|".join(self._normalize_rule_part(p) for p in parts)
+        return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+    async def save_ui_element(
+        self, text: str, element_type: str, x_ratio: float, y_ratio: float,
+        context: str, confidence: float = 0.8,
+    ) -> str:
+        """Save or update a UI element in memory. Deduplicates by text+type+context."""
+        fp = self._cu_fingerprint(text, element_type, context)
+        element_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+
+        if self._use_fallback:
+            for existing in self._fallback_ui_elements:
+                if existing.get("fingerprint") == fp:
+                    existing["x_ratio"] = x_ratio
+                    existing["y_ratio"] = y_ratio
+                    existing["confidence"] = max(existing.get("confidence", 0), confidence)
+                    existing["last_seen"] = now
+                    return existing["id"]
+            self._fallback_ui_elements.append({
+                "id": element_id, "fingerprint": fp, "text": text,
+                "type": element_type, "x_ratio": x_ratio, "y_ratio": y_ratio,
+                "context": context, "confidence": confidence, "last_seen": now,
+            })
+            return element_id
+
+        with self._driver.session() as session:
+            session.run("""
+                MERGE (ui:UIElement {fingerprint: $fp})
+                ON CREATE SET ui.id = $id, ui.text = $text, ui.type = $type,
+                    ui.x_ratio = $x, ui.y_ratio = $y, ui.context = $ctx,
+                    ui.confidence = $conf, ui.last_seen = $now
+                ON MATCH SET ui.x_ratio = $x, ui.y_ratio = $y,
+                    ui.confidence = CASE WHEN ui.confidence < $conf THEN $conf ELSE ui.confidence END,
+                    ui.last_seen = $now
+            """, fp=fp, id=element_id, text=text, type=element_type,
+                x=x_ratio, y=y_ratio, ctx=context, conf=confidence, now=now)
+            result = session.run(
+                "MATCH (ui:UIElement {fingerprint: $fp}) RETURN ui.id AS id", fp=fp
+            ).single()
+            actual_id = result["id"] if result else element_id
+
+        logger.info("UIElement saved: '%s' (%s) in '%s'", text[:30], element_type, context[:30])
+        return actual_id
+
+    async def save_action(
+        self, action_type: str, target: str, success: bool,
+        ui_element_id: str | None = None, skill_id: str | None = None,
+    ) -> str:
+        """Record a CU action execution. Always creates a new node (each execution is distinct)."""
+        action_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+
+        if self._use_fallback:
+            self._fallback_actions.append({
+                "id": action_id, "type": action_type, "target": target,
+                "success": success, "timestamp": now,
+                "ui_element_id": ui_element_id, "skill_id": skill_id,
+            })
+            return action_id
+
+        with self._driver.session() as session:
+            session.run("""
+                CREATE (a:Action {id: $id, type: $type, target: $target,
+                    success: $success, timestamp: $now})
+            """, id=action_id, type=action_type, target=target,
+                success=success, now=now)
+
+            if ui_element_id:
+                session.run("""
+                    MATCH (a:Action {id: $aid})
+                    MATCH (ui:UIElement {id: $uid})
+                    MERGE (a)-[:TARGETS]->(ui)
+                """, aid=action_id, uid=ui_element_id)
+
+            if skill_id:
+                session.run("""
+                    MATCH (a:Action {id: $aid})
+                    MATCH (sk:Skill {id: $sid})
+                    MERGE (a)-[:PART_OF]->(sk)
+                """, aid=action_id, sid=skill_id)
+
+        logger.info("Action saved: %s '%s' success=%s", action_type, target[:30], success)
+        return action_id
+
+    async def create_skill(
+        self, name: str, intent: str, steps: list[str],
+        ui_element_ids: list[str] | None = None,
+    ) -> str:
+        """Create or update a reusable skill from completed action sequences."""
+        fp = self._cu_fingerprint(intent)
+        skill_id = str(uuid.uuid4())
+        now = datetime.now(timezone.utc).isoformat()
+        steps_json = json.dumps(steps)
+
+        if self._use_fallback:
+            for existing in self._fallback_skills:
+                if existing.get("fingerprint") == fp:
+                    existing["steps"] = steps
+                    existing["usage_count"] = existing.get("usage_count", 0) + 1
+                    return existing["id"]
+            self._fallback_skills.append({
+                "id": skill_id, "fingerprint": fp, "name": name,
+                "intent": self._normalize_rule_part(intent), "steps": steps,
+                "success_rate": 1.0, "usage_count": 1, "created_at": now,
+            })
+            return skill_id
+
+        with self._driver.session() as session:
+            existing = session.run(
+                "MATCH (sk:Skill {fingerprint: $fp}) RETURN sk.id AS id", fp=fp
+            ).single()
+
+            if existing:
+                session.run("""
+                    MATCH (sk:Skill {fingerprint: $fp})
+                    SET sk.steps = $steps, sk.usage_count = sk.usage_count + 1
+                """, fp=fp, steps=steps_json)
+                actual_id = existing["id"]
+                logger.info("Skill updated: '%s' (deduped)", name[:40])
+            else:
+                session.run("""
+                    CREATE (sk:Skill {id: $id, fingerprint: $fp, name: $name,
+                        intent: $intent, steps: $steps, success_rate: 1.0,
+                        usage_count: 1, created_at: $now})
+                """, id=skill_id, fp=fp, name=name,
+                    intent=self._normalize_rule_part(intent),
+                    steps=steps_json, now=now)
+                actual_id = skill_id
+                logger.info("Skill created: '%s' (%d steps)", name[:40], len(steps))
+
+            for uid in (ui_element_ids or []):
+                session.run("""
+                    MATCH (sk:Skill {id: $sid})
+                    MATCH (ui:UIElement {id: $uid})
+                    MERGE (sk)-[:USES]->(ui)
+                """, sid=actual_id, uid=uid)
+
+        return actual_id
+
+    async def update_skill_stats(self, skill_id: str, success: bool) -> None:
+        """Update skill success_rate using exponential moving average (alpha=0.3)."""
+        alpha = 0.3
+        outcome = 1.0 if success else 0.0
+
+        if self._use_fallback:
+            for sk in self._fallback_skills:
+                if sk["id"] == skill_id:
+                    old_rate = sk.get("success_rate", 0.5)
+                    sk["success_rate"] = round(alpha * outcome + (1 - alpha) * old_rate, 4)
+                    sk["usage_count"] = sk.get("usage_count", 0) + 1
+                    return
+            return
+
+        with self._driver.session() as session:
+            session.run("""
+                MATCH (sk:Skill {id: $id})
+                SET sk.success_rate = round(($alpha * $outcome + (1.0 - $alpha) * sk.success_rate) * 10000) / 10000,
+                    sk.usage_count = sk.usage_count + 1
+            """, id=skill_id, alpha=alpha, outcome=outcome)
+        logger.info("Skill %s stats updated: success=%s", skill_id[:12], success)
+
+    async def find_relevant_skill(
+        self, intent: str, context: str = "", min_success_rate: float = 0.7,
+    ) -> dict[str, Any] | None:
+        """Find a learned skill matching the given intent with high enough success rate."""
+        keywords = [w for w in intent.lower().split() if len(w) > 3][:8]
+        if not keywords:
+            return None
+
+        if self._use_fallback:
+            best = None
+            for sk in self._fallback_skills:
+                if sk.get("success_rate", 0) < min_success_rate:
+                    continue
+                sk_intent = sk.get("intent", "")
+                if any(kw in sk_intent for kw in keywords):
+                    if best is None or sk["success_rate"] > best["success_rate"]:
+                        best = sk
+            return best
+
+        # Build parameterized WHERE with $kw0, $kw1, ... to avoid Cypher injection
+        kw_conditions = " OR ".join(f"sk.intent CONTAINS $kw{i}" for i in range(len(keywords)))
+        params: dict[str, Any] = {"min_rate": min_success_rate}
+        for i, kw in enumerate(keywords):
+            params[f"kw{i}"] = kw
+
+        with self._driver.session() as session:
+            result = session.run(f"""
+                MATCH (sk:Skill) WHERE ({kw_conditions})
+                AND sk.success_rate >= $min_rate
+                RETURN sk ORDER BY sk.success_rate DESC, sk.usage_count DESC
+                LIMIT 1
+            """, **params).single()
+            if result:
+                return self._skill_node_to_dict(result["sk"])
+        return None
+
+    async def find_ui_element(
+        self, query: str, context: str = "",
+    ) -> list[dict[str, Any]]:
+        """Find remembered UI elements matching a text query and context."""
+        keywords = [w for w in query.lower().split() if len(w) > 2][:6]
+        if not keywords:
+            return []
+
+        if self._use_fallback:
+            results = []
+            for ui in self._fallback_ui_elements:
+                text = (ui.get("text") or "").lower()
+                ctx = (ui.get("context") or "").lower()
+                if any(kw in text or kw in ctx for kw in keywords):
+                    results.append(ui)
+            return sorted(results, key=lambda u: u.get("confidence", 0), reverse=True)[:5]
+
+        # Parameterized keyword search
+        kw_conditions = []
+        params: dict[str, Any] = {}
+        for i, kw in enumerate(keywords):
+            kw_conditions.append(f"(ui.text CONTAINS $kw{i} OR ui.context CONTAINS $kw{i})")
+            params[f"kw{i}"] = kw
+
+        with self._driver.session() as session:
+            result = session.run(f"""
+                MATCH (ui:UIElement) WHERE {" OR ".join(kw_conditions)}
+                RETURN ui ORDER BY ui.confidence DESC, ui.last_seen DESC
+                LIMIT 5
+            """, **params)
+            return [self._ui_element_node_to_dict(r["ui"]) for r in result]
+
+    # ── End CU Learning Memory ────────────────────────────────────────────────
 
     async def dedupe_rules(self, dry_run: bool = False) -> dict[str, Any]:
         """Remove duplicate Rule nodes by normalized (condition, conclusion).

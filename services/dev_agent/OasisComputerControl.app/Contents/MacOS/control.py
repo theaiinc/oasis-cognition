@@ -17,8 +17,90 @@ Actions:
 
 import argparse
 import json
+import subprocess
 import sys
 import time
+
+
+# ── AppleScript key mapping ───────────────────────────────────────────────────
+# Maps common key names to AppleScript key codes or keystroke strings.
+# AppleScript uses `key code N` for special keys and `keystroke "x"` for characters.
+
+_AS_KEY_CODES = {
+    "enter": 36, "return": 36, "tab": 48, "space": 49, "delete": 51,
+    "backspace": 51, "escape": 53, "esc": 53,
+    "up": 126, "down": 125, "left": 123, "right": 124,
+    "home": 115, "end": 119, "pageup": 116, "pagedown": 121,
+    "f1": 122, "f2": 120, "f3": 99, "f4": 118, "f5": 96, "f6": 97,
+    "f7": 98, "f8": 100, "f9": 101, "f10": 109, "f11": 103, "f12": 111,
+}
+
+_AS_MODIFIER_MAP = {
+    "command": "command down", "cmd": "command down", "meta": "command down",
+    "shift": "shift down",
+    "option": "option down", "alt": "option down",
+    "control": "control down", "ctrl": "control down",
+}
+
+
+def _send_key_to_app(app_name: str, key: str, modifiers: list[str]) -> None:
+    """Send a keystroke to a specific app process via AppleScript.
+
+    This ensures the keystroke goes to the target app even if another app has focus.
+    Uses `tell process "X"` which targets the app directly.
+    """
+    safe_app = app_name.replace('"', '\\"')
+    key_lower = key.lower().strip()
+
+    # Build modifier clause: {command down, shift down}
+    as_modifiers = []
+    for m in modifiers:
+        mapped = _AS_MODIFIER_MAP.get(m.lower().strip())
+        if mapped:
+            as_modifiers.append(mapped)
+
+    modifier_clause = ""
+    if as_modifiers:
+        modifier_clause = f" using {{{', '.join(as_modifiers)}}}"
+
+    # Determine if we need key code (special keys) or keystroke (characters)
+    if key_lower in _AS_KEY_CODES:
+        code = _AS_KEY_CODES[key_lower]
+        script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.2
+        key code {code}{modifier_clause}
+    end tell
+end tell
+'''
+    elif len(key) == 1:
+        # Single character keystroke
+        safe_key = key.replace('"', '\\"')
+        script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.2
+        keystroke "{safe_key}"{modifier_clause}
+    end tell
+end tell
+'''
+    else:
+        # Try as keystroke (e.g., multi-char like "abc")
+        safe_key = key.replace('"', '\\"')
+        script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.2
+        keystroke "{safe_key}"{modifier_clause}
+    end tell
+end tell
+'''
+
+    subprocess.run(["osascript", "-e", script], capture_output=True, timeout=10)
 
 
 def main():
@@ -36,6 +118,7 @@ def main():
     parser.add_argument('--duration', type=float, default=0.5)
     parser.add_argument('--json', action='store_true', help='Output as JSON')
     parser.add_argument('--output', type=str, help='Write output to file instead of stdout')
+    parser.add_argument('--app', type=str, default=None, help='Target app process name for keystroke targeting')
     args = parser.parse_args()
 
     # Request Accessibility permission — this triggers the macOS prompt and
@@ -128,15 +211,24 @@ def main():
         elif action == "type_text":
             if not args.text:
                 raise ValueError("type_text requires --text")
-            # Use AppleScript keystroke — sends directly to the frontmost app's key window.
-            # More reliable than pyautogui CGEvent which can be intercepted by other processes.
+            # Use AppleScript keystroke targeted to specific app when --app is provided.
+            # Falls back to System Events (frontmost app) then pyautogui.
             try:
-                import subprocess
                 safe = args.text.replace('\\', '\\\\').replace('"', '\\"')
-                subprocess.run([
-                    'osascript', '-e',
-                    f'tell application "System Events" to keystroke "{safe}"',
-                ], timeout=10, capture_output=True)
+                if args.app:
+                    safe_app = args.app.replace('"', '\\"')
+                    script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.2
+        keystroke "{safe}"
+    end tell
+end tell
+'''
+                else:
+                    script = f'tell application "System Events" to keystroke "{safe}"'
+                subprocess.run(['osascript', '-e', script], timeout=10, capture_output=True)
                 result["output"] = f"Typed: {args.text[:80]}"
             except Exception:
                 # Fallback to pyautogui
@@ -150,7 +242,11 @@ def main():
         elif action == "key_press":
             if not args.key:
                 raise ValueError("key_press requires --key")
-            pyautogui.press(args.key)
+            if args.app:
+                # Target specific app process via AppleScript
+                _send_key_to_app(args.app, args.key, modifiers=[])
+            else:
+                pyautogui.press(args.key)
             result["output"] = f"Pressed key: {args.key}"
             time.sleep(0.3)
 
@@ -158,7 +254,14 @@ def main():
             combo = args.keys.split(",") if args.keys else ([args.key] if args.key else [])
             if not combo:
                 raise ValueError("hotkey requires --keys or --key")
-            pyautogui.hotkey(*combo)
+            if args.app:
+                # Target specific app process via AppleScript
+                # Last element is the key, rest are modifiers
+                key = combo[-1].strip()
+                modifiers = [m.strip() for m in combo[:-1]]
+                _send_key_to_app(args.app, key, modifiers)
+            else:
+                pyautogui.hotkey(*combo)
             result["output"] = f"Hotkey: {'+'.join(combo)}"
             time.sleep(0.3)
 

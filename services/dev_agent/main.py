@@ -117,6 +117,7 @@ class ToolRequest(BaseModel):
     amount: int | None = None       # scroll amount
     clicks: int | None = None       # for click (1 = single, 2 = double)
     screen_region: dict | None = None  # {x, y, width, height} for screen-specific capture
+    app: str | None = None             # target app process name for keystroke targeting
     # ── chunked read fields ──
     start_line: int | None = None   # 1-based start line for read_worktree_file
     end_line: int | None = None     # 1-based end line (inclusive) for read_worktree_file
@@ -422,11 +423,25 @@ async def launch_cu_overlay(body: dict = {}):
     session_id = body.get("session_id", "")
     gateway_port = body.get("gateway_port", "8000")
 
-    # If already running, close it first (new session replaces old overlay)
+    # Kill ANY existing overlay — only 1 at a time
     if _overlay_process and _overlay_process.poll() is None:
-        _overlay_process.terminate()
+        try:
+            _overlay_process.terminate()
+            _overlay_process.wait(timeout=3)
+        except Exception:
+            try:
+                _overlay_process.kill()
+            except Exception:
+                pass
         _overlay_process = None
         await asyncio.sleep(0.5)
+
+    # Also kill any orphaned electron overlay processes
+    try:
+        import subprocess as _sp
+        _sp.run(["pkill", "-f", "cu-overlay.*electron"], capture_output=True, timeout=3)
+    except Exception:
+        pass
 
     overlay_dir = os.path.join(os.path.dirname(__file__), "../../apps/cu-overlay")
     overlay_dir = os.path.abspath(overlay_dir)
@@ -633,6 +648,8 @@ async def execute_tool(req: ToolRequest) -> dict[str, Any]:
         extra = {}
         if req.screen_region:
             extra["screen_region"] = req.screen_region
+        if req.app:
+            extra["app"] = req.app
         result = await execute_computer_action(
             action=req.action,
             x=req.x,

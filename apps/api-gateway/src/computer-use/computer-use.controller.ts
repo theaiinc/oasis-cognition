@@ -90,7 +90,7 @@ export class ComputerUseController {
   /** Get the most recent non-terminal session (for panel reconnection after tab switch). */
   @Get('sessions/active')
   getActiveSession() {
-    // Return any non-terminal session first
+    // Return any non-terminal session first (executing, planning, awaiting_approval, paused)
     const active = [...sessions.values()]
       .filter(s => !['completed', 'failed', 'cancelled'].includes(s.status))
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
@@ -99,14 +99,14 @@ export class ComputerUseController {
       return { session: rest };
     }
 
-    // If no active session, return the most recently completed one
-    // (within last 30s) so the overlay can show the final state
+    // If no active session, return the most recently completed/failed one
+    // (within 5 minutes) so the overlay keeps showing the result
     const recent = [...sessions.values()]
       .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
     if (recent.length > 0) {
       const latest = recent[0];
       const age = Date.now() - new Date(latest.updated_at).getTime();
-      if (age < 30_000) {
+      if (age < 300_000) { // 5 minutes
         const { live_screenshot, ...rest } = latest;
         return { session: rest };
       }
@@ -610,6 +610,87 @@ export class ComputerUseController {
     }
   }
 
+  // ── CU Learning Memory integration ──────────────────────────────────────
+
+  /**
+   * Query for a learned skill that matches the goal.
+   * Returns stored steps if a high-confidence skill exists.
+   */
+  private async querySkillForCU(goal: string): Promise<{ found: boolean; steps?: string[]; skillId?: string }> {
+    try {
+      const res = await axios.get(`${MEMORY_URL}/internal/memory/cu/skill/find`, {
+        params: { intent: goal, min_success_rate: 0.75 },
+        timeout: 5000,
+      });
+      if (res.data?.found && res.data.skill?.steps?.length >= 2) {
+        this.logger.log(`CU skill found: "${res.data.skill.name?.slice(0, 50)}" (${res.data.skill.steps.length} steps, rate=${res.data.skill.success_rate})`);
+        return {
+          found: true,
+          steps: res.data.skill.steps,
+          skillId: res.data.skill.id,
+        };
+      }
+    } catch (err: any) {
+      this.logger.debug(`querySkillForCU failed: ${err.message}`);
+    }
+    return { found: false };
+  }
+
+  /** Fire-and-forget: save a CU action execution to memory. */
+  private async saveActionToMemory(
+    action: string, target: string, success: boolean,
+    context: string, uiElementId?: string, skillId?: string,
+  ): Promise<string | null> {
+    try {
+      const res = await axios.post(`${MEMORY_URL}/internal/memory/cu/action`, {
+        type: action,
+        target: target.slice(0, 200),
+        success,
+        ui_element_id: uiElementId || null,
+        skill_id: skillId || null,
+      }, { timeout: 5000 });
+      return res.data?.action_id || null;
+    } catch { return null; }
+  }
+
+  /** Fire-and-forget: save a UI element to memory. */
+  private async saveUIElementToMemory(
+    text: string, type: string, xRatio: number, yRatio: number, context: string,
+  ): Promise<string | null> {
+    try {
+      const res = await axios.post(`${MEMORY_URL}/internal/memory/cu/ui-element`, {
+        text: text.slice(0, 100), type, x_ratio: xRatio, y_ratio: yRatio,
+        context: context.slice(0, 100),
+      }, { timeout: 5000 });
+      return res.data?.element_id || null;
+    } catch { return null; }
+  }
+
+  /** Create a reusable skill from a completed CU session. */
+  private async createSkillFromSession(
+    session: ComputerUseSession & { visionGranted: boolean },
+  ): Promise<void> {
+    const completedSteps = session.plan
+      .filter(s => s.status === 'completed')
+      .map(s => `${s.action}: ${s.description}`);
+
+    if (completedSteps.length < 2) return;
+
+    try {
+      await axios.post(`${MEMORY_URL}/internal/memory/cu/skill`, {
+        name: session.goal.slice(0, 100),
+        intent: session.goal,
+        steps: completedSteps.slice(0, 20),
+        ui_element_ids: ((session as any)._ui_element_ids || []).slice(0, 30),
+      }, { timeout: 10000 });
+      this.logger.log(`Skill created from session: "${session.goal.slice(0, 60)}"`);
+    } catch (err: any) {
+      this.logger.debug(`createSkillFromSession failed: ${err.message}`);
+    }
+  }
+
+  // ── End CU Learning Memory ─────────────────────────────────────────────
+
   private async researchGoal(goal: string): Promise<string> {
     try {
       // Generate a search query focused on the ACTION the user wants to perform
@@ -692,10 +773,62 @@ export class ComputerUseController {
     const session = sessions.get(sessionId);
     if (!session) return;
 
+    // ── Skill-first: check if a learned skill can provide the plan ──
+    const skill = await this.querySkillForCU(goal);
+    if (skill.found && skill.steps && skill.steps.length >= 2) {
+      this.logger.log(`Using learned skill (${skill.steps.length} steps) for "${goal.slice(0, 50)}"`);
+      (session as any)._active_skill_id = skill.skillId;
+      // Extract the question/query from the goal for the type step
+      // e.g., "Open ChatGPT and ask it: Would it be feasible..." → "Would it be feasible..."
+      const goalQuestion = (() => {
+        // Try common patterns: "ask it: ...", "ask: ...", "ask it ..."
+        const askMatch = goal.match(/ask\s+(?:it\s*)?[:\-]?\s*(.+)/i);
+        if (askMatch) return askMatch[1].trim();
+        // Fallback: use the goal as-is
+        return goal;
+      })();
+
+      session.plan = skill.steps.map((s, i) => {
+        const colonIdx = s.indexOf(': ');
+        const action = colonIdx > 0 ? s.slice(0, colonIdx).trim() : 'read_screen';
+        const description = colonIdx > 0 ? s.slice(colonIdx + 2).trim() : s;
+
+        // Set target based on action type
+        let target = '';
+        if (action === 'type') {
+          target = goalQuestion; // The actual question to type
+        } else if (action === 'open_app') {
+          // Extract app name from description or goal
+          const appMatch = goal.match(/open\s+(?:the\s+)?(\w+(?:\s+\w+)?)\s+(?:desktop\s+)?app/i);
+          target = appMatch ? appMatch[1] : description;
+        } else if (action === 'key_press') {
+          // Extract key from description (e.g., "Create new chat with Cmd+N" → "command+n")
+          const cmdN = description.match(/cmd\+n|command\+n/i);
+          const enter = description.match(/enter|return|send/i);
+          if (cmdN) target = 'command+n';
+          else if (enter) target = 'enter';
+          else target = description;
+        }
+
+        return {
+          index: i,
+          description,
+          action,
+          target,
+          status: 'pending' as const,
+        };
+      });
+      session.status = 'awaiting_approval';
+      session.updated_at = new Date().toISOString();
+      return; // Skill provides the plan — skip LLM planning
+    }
+
+    // ── No skill found — fall through to existing logic engine + LLM planning ──
+
     const hasScreen = !!screenImage;
     const shareCtx = this.getShareContext(sessionId);
 
-    // ── Query Neo4j memory for past CU knowledge ──
+    // ── Query Neo4j memory for past CU knowledge (IF/THEN rules — logic engine) ──
     const memoryCtx = await this.queryMemoryForCU(goal);
 
     // ── Pre-plan research: search the web for how to accomplish the goal ──
@@ -1373,11 +1506,22 @@ CRITICAL RULES:
 
     // Launch the always-on-top overlay window via dev-agent
     try {
-      await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-overlay/launch`, {
-        session_id: sessionId,
-        gateway_port: '8000',
-      }, { timeout: 5000 });
-      this.logger.log(`CU overlay launched for session ${sessionId}`);
+      // Only launch overlay if not already showing this session
+      // (avoid killing the overlay that's already displaying the plan)
+      const overlayCheck = await axios.get(
+        `${DEV_AGENT_URL}/cu-overlay/active-session`,
+        { timeout: 3000 },
+      ).catch(() => null);
+      const overlaySession = overlayCheck?.data?.session?.session_id;
+      if (overlaySession !== sessionId) {
+        await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-overlay/launch`, {
+          session_id: sessionId,
+          gateway_port: '8000',
+        }, { timeout: 5000 });
+        this.logger.log(`CU overlay launched for session ${sessionId}`);
+      } else {
+        this.logger.log(`CU overlay already showing session ${sessionId}`);
+      }
     } catch { /* overlay not available — not critical */ }
 
     // Walk through each planned step
@@ -1497,40 +1641,51 @@ CRITICAL RULES:
         .map((s, i) => `  ${session.current_step + 2 + i}. ${s.action}: ${s.description}`)
         .join('\n');
 
-      // 2. Ask the LLM: should we execute this step as-is, adapt, or skip?
-      const userPrompt =
-        `GOAL: ${session.goal}\n\n` +
-        (researchCtx ? `RESEARCH:\n${researchCtx.slice(0, 1500)}\n\n` : '') +
-        lessonsCtx +
-        (actionHistory.length > 0 ? `ACTIONS COMPLETED:\n${actionHistory.slice(-8).join('\n')}\n\n` : '') +
-        `CURRENT PLANNED STEP (${session.current_step + 1}/${session.plan.length}):\n` +
-        `  Action: ${step.action}\n` +
-        `  Target: ${step.target || '(none)'}\n` +
-        `  Description: ${step.description}\n\n` +
-        (remainingSteps ? `REMAINING PLAN:\n${remainingSteps}\n\n` : '') +
-        pageChangeNote +
-        stuckNote +
-        `CURRENT PAGE:\n${pageText.slice(0, 5000)}\n\n` +
-        `Should the planned step be executed as-is, adapted, or skipped?`;
-
+      // 2. Decide: execute as-is (skill plan) or ask LLM to adapt?
       step.status = 'running';
       step.started_at = new Date().toISOString();
       session.updated_at = new Date().toISOString();
 
+      // If using a learned skill, TRUST the plan — execute steps directly without LLM re-evaluation.
+      // Skills have proven success rates; the LLM adaptive loop often misidentifies apps and derails.
+      const isSkillPlan = !!(session as any)._active_skill_id;
+
       let llmResponse = '';
-      try {
-        const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
-          user_message: userPrompt,
-          context: { system_override: ComputerUseController.REACT_SYSTEM, max_tokens: 512 },
-        }, { timeout: LLM_TIMEOUT_MS });
-        llmResponse = res.data?.response_text || res.data?.response || '';
-      } catch (err: any) {
-        this.logger.error(`Adaptive LLM failed: ${err.message}`);
-        step.status = 'failed';
-        step.output = `LLM error: ${err.message}`;
-        step.completed_at = new Date().toISOString();
-        session.current_step++;
-        continue;
+      if (isSkillPlan) {
+        // Execute the planned step directly — no LLM mediation
+        llmResponse = `THOUGHT: Executing learned skill step ${session.current_step + 1}: ${step.description}\nACTION: execute_plan\nTARGET: ${step.target || step.description}`;
+        this.logger.log(`Skill step ${session.current_step + 1}: executing "${step.action}" directly (no LLM)`);
+      } else {
+        // Normal adaptive loop — ask LLM to evaluate
+        const userPrompt =
+          `GOAL: ${session.goal}\n\n` +
+          (researchCtx ? `RESEARCH:\n${researchCtx.slice(0, 1500)}\n\n` : '') +
+          lessonsCtx +
+          (actionHistory.length > 0 ? `ACTIONS COMPLETED:\n${actionHistory.slice(-8).join('\n')}\n\n` : '') +
+          `CURRENT PLANNED STEP (${session.current_step + 1}/${session.plan.length}):\n` +
+          `  Action: ${step.action}\n` +
+          `  Target: ${step.target || '(none)'}\n` +
+          `  Description: ${step.description}\n\n` +
+          (remainingSteps ? `REMAINING PLAN:\n${remainingSteps}\n\n` : '') +
+          pageChangeNote +
+          stuckNote +
+          `CURRENT PAGE:\n${pageText.slice(0, 5000)}\n\n` +
+          `Should the planned step be executed as-is, adapted, or skipped?`;
+
+        try {
+          const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+            user_message: userPrompt,
+            context: { system_override: ComputerUseController.REACT_SYSTEM, max_tokens: 512 },
+          }, { timeout: LLM_TIMEOUT_MS });
+          llmResponse = res.data?.response_text || res.data?.response || '';
+        } catch (err: any) {
+          this.logger.error(`Adaptive LLM failed: ${err.message}`);
+          step.status = 'failed';
+          step.output = `LLM error: ${err.message}`;
+          step.completed_at = new Date().toISOString();
+          session.current_step++;
+          continue;
+        }
       }
 
       // 3. Parse response
@@ -1543,6 +1698,28 @@ CRITICAL RULES:
 
       // 4. Handle the decision
       if (action === 'done') {
+        // Verify the goal was ACTUALLY achieved before marking done
+        const goalVerified = await this.checkGoalSatisfaction(sessionId, session.goal, session.plan);
+        if (!goalVerified) {
+          this.logger.warn(`LLM claimed "done" but goal verification FAILED — continuing execution`);
+          // Don't mark done — let the loop continue to try more steps
+          step.description = `Goal verification failed: ${target}`;
+          actionHistory.push(`${session.current_step + 1}. DONE_REJECTED: goal not verified`);
+          session.current_step++;
+          session.updated_at = new Date().toISOString();
+          extraStepsUsed++;
+          if (session.current_step >= session.plan.length && extraStepsUsed < MAX_EXTRA_STEPS) {
+            session.plan.push({
+              index: session.plan.length,
+              description: 'Previous done claim was rejected — retrying goal...',
+              action: 'read_screen',
+              target: '',
+              status: 'pending',
+            });
+          }
+          continue;
+        }
+
         step.status = 'completed';
         step.output = target;
         step.completed_at = new Date().toISOString();
@@ -1552,10 +1729,20 @@ CRITICAL RULES:
         }
         session.status = 'completed';
         session.updated_at = new Date().toISOString();
-        this.logger.log(`Goal achieved at step ${session.current_step + 1}: ${target}`);
+        this.logger.log(`Goal VERIFIED and achieved at step ${session.current_step + 1}: ${target}`);
         this.generateSessionSummary(sessionId).catch(() => {});
-        // Learn from successful session — store what worked as a rule
+        // Learn from successful session — store what worked as a rule (logic engine)
         this.learnFromSession(session).catch(() => {});
+        // Create reusable skill from the completed steps (learning memory)
+        this.createSkillFromSession(session).catch(() => {});
+        // Update skill stats if we were using a learned skill
+        if ((session as any)._active_skill_id) {
+          axios.patch(
+            `${MEMORY_URL}/internal/memory/cu/skill/${(session as any)._active_skill_id}/stats`,
+            { success: true },
+            { timeout: 5000 },
+          ).catch(() => {});
+        }
         return;
       }
 
@@ -1567,6 +1754,14 @@ CRITICAL RULES:
         session.error = target;
         session.updated_at = new Date().toISOString();
         this.generateSessionSummary(sessionId).catch(() => {});
+        // Degrade skill stats on failure
+        if ((session as any)._active_skill_id) {
+          axios.patch(
+            `${MEMORY_URL}/internal/memory/cu/skill/${(session as any)._active_skill_id}/stats`,
+            { success: false },
+            { timeout: 5000 },
+          ).catch(() => {});
+        }
         return;
       }
 
@@ -1603,6 +1798,21 @@ CRITICAL RULES:
 
         actionHistory.push(`${session.current_step + 1}. ${execAction}${execTarget ? ` → "${execTarget.slice(0, 50)}"` : ''} → ${result.output.slice(0, 80)}`);
 
+        // ── CU Learning: save action + UI element to memory (fire-and-forget) ──
+        const uiElemId = await this.saveUIElementToMemory(
+          execTarget.slice(0, 100), execAction, 0, 0, pageText.slice(0, 100),
+        ).catch(() => null);
+        if (uiElemId) {
+          const ids: string[] = (session as any)._ui_element_ids || [];
+          ids.push(uiElemId);
+          (session as any)._ui_element_ids = ids;
+        }
+        this.saveActionToMemory(
+          execAction, execTarget, step.status === 'completed',
+          pageText.slice(0, 100), uiElemId || undefined,
+          (session as any)._active_skill_id,
+        ).catch(() => {});
+
         // After open_app succeeds, trust the plan — advance immediately without
         // re-asking the LLM (which often misidentifies the app and retries open_app)
         if (execAction === 'open_app') {
@@ -1611,7 +1821,7 @@ CRITICAL RULES:
           session.current_step++;
           session.updated_at = new Date().toISOString();
           this.logger.log(`open_app succeeded → auto-advancing to step ${session.current_step + 1}`);
-          await new Promise(r => setTimeout(r, 500));
+          await new Promise(r => setTimeout(r, 2000)); // Wait for app to fully launch and settle
           continue; // skip the rest of this iteration's logic, proceed to next planned step
         }
 
@@ -1654,7 +1864,9 @@ CRITICAL RULES:
         extraStepsUsed++;
       }
 
-      await new Promise(r => setTimeout(r, 500));
+      // Delay between steps — longer for skill execution to let UI settle
+      const stepDelay = isSkillPlan ? 1500 : 500;
+      await new Promise(r => setTimeout(r, stepDelay));
     }
 
     // All steps done
@@ -3343,57 +3555,88 @@ CRITICAL RULES:
         //   1. If a native app is open, try Cmd+N (new chat/document) to get a fresh input
         //   2. Then click near the bottom of the screen where input fields typically are
         //   3. Small delay to let focus settle
-        const nativeApp = (session as any)?._native_app_mode;
+        const typeSession = sessionId ? sessions.get(sessionId) : undefined;
+        const nativeApp = (typeSession as any)?._native_app_mode;
 
         if (nativeApp) {
-          // For native chat apps, create a new chat first (Cmd+N), then click the input field.
-          const chatApps = ['chatgpt', 'claude', 'slack', 'discord', 'messages', 'telegram'];
-          const isChat = chatApps.some(a => (nativeApp as string).toLowerCase().includes(a));
+          // 1. Re-focus the target app
+          await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'focus_window', text: nativeApp,
+          }, { timeout: 5000 }).catch(() => {});
+          await new Promise(r => setTimeout(r, 500));
 
-          if (isChat) {
-            // Cmd+N = new chat (focuses input automatically in most chat apps)
-            try {
-              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-                tool: 'computer_action', action: 'hotkey', keys: 'command,n',
-              }, { timeout: 5000 });
-              this.logger.log(`type: sent Cmd+N to ${nativeApp} for new chat`);
-              await new Promise(r => setTimeout(r, 1000));
-            } catch { /* continue */ }
+          // 2. For non-skill plans only: send Cmd+N to create new chat.
+          // Skip if using a skill plan (the skill has a separate key_press step for Cmd+N).
+          const isSkillPlan = !!(typeSession as any)?._active_skill_id;
+          if (!isSkillPlan) {
+            const chatApps = ['chatgpt', 'claude', 'slack', 'discord', 'messages', 'telegram'];
+            const isChat = chatApps.some(a => (nativeApp as string).toLowerCase().includes(a));
+            if (isChat) {
+              try {
+                await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                  tool: 'computer_action', action: 'hotkey', keys: 'command,n',
+                  app: nativeApp, // Target the specific process
+                }, { timeout: 5000 });
+                this.logger.log(`type: sent Cmd+N to ${nativeApp} for new chat`);
+                await new Promise(r => setTimeout(r, 1000));
+              } catch { /* continue */ }
+            }
           }
 
-          // Click the input field by finding it on the app's screen via OCR.
-          // The app was maximized by open_app, so we know which screen it's on.
-          // We click directly at known positions to avoid cross-screen confusion.
-          try {
-            const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-              tool: 'computer_action', action: 'list_screens',
-            }, { timeout: 5000 });
-            const screens = screensRes.data?.screens || [];
-            // The app was opened on the external monitor (screen 1) by open_app
-            const scr = screens.length > 1 ? screens[1] : screens[0];
-            if (scr) {
-              // Chat apps: input field is at the bottom, horizontally centered past the sidebar
-              // Sidebar is typically ~250px wide, so center the click in the remaining area
-              const sidebarWidth = 260;
-              const contentWidth = scr.width - sidebarWidth;
-              const clickX = scr.x + sidebarWidth + Math.round(contentWidth / 2);
-              const clickY = scr.y + scr.height - 55; // ~55px from bottom
-              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-                tool: 'computer_action', action: 'click', x: clickX, y: clickY,
-              }, { timeout: 5000 });
-              this.logger.log(`type: clicked chat input at (${clickX}, ${clickY}) on ${scr.name || 'screen'}`);
-            }
-          } catch { /* continue */ }
-          await new Promise(r => setTimeout(r, 500));
+          // 3. Click the input field using OCR — match app-specific placeholders first
+          const appLower = (nativeApp as string).toLowerCase();
+          let appPlaceholders: string[];
+          if (appLower.includes('chatgpt')) {
+            appPlaceholders = ['Ask anything', 'Message ChatGPT'];
+          } else if (appLower.includes('claude')) {
+            appPlaceholders = ['Ask Claude', 'How can Claude help'];
+          } else {
+            appPlaceholders = ['Type a message', 'Message', 'Type here', 'Send a message'];
+          }
+
+          let inputClicked = false;
+          for (const placeholder of appPlaceholders) {
+            if (inputClicked) break;
+            try {
+              const clickRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'click_ui_element', text: placeholder,
+              }, { timeout: 12000 });
+              if (clickRes.data?.success) {
+                this.logger.log(`type: clicked input via OCR "${placeholder}" at ${clickRes.data.output?.slice(0, 60)}`);
+                inputClicked = true;
+              }
+            } catch { /* try next */ }
+          }
+          await new Promise(r => setTimeout(r, 300));
         }
 
         // Type the text
         await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
-          { tool: 'computer_action', action: 'type_text', text: target },
+          {
+            tool: 'computer_action', action: 'type_text', text: target,
+            ...(nativeApp ? { app: nativeApp } : {}),
+          },
           { timeout: ACTION_TIMEOUT_MS });
         await new Promise(r => setTimeout(r, 300));
+
+        // Press Enter to send (for chat apps, the user almost always wants to send)
+        const typeSess = sessionId ? sessions.get(sessionId) : undefined;
+        const nApp = (typeSess as any)?._native_app_mode;
+        if (nApp) {
+          const chatApps2 = ['chatgpt', 'claude', 'slack', 'discord', 'messages'];
+          if (chatApps2.some(a => (nApp as string).toLowerCase().includes(a))) {
+            await new Promise(r => setTimeout(r, 500));
+            await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'key_press', key: 'enter',
+            }, { timeout: 5000 }).catch(() => {});
+            this.logger.log(`type: auto-pressed Enter to send in ${nApp}`);
+            // Wait for response to start rendering
+            await new Promise(r => setTimeout(r, 3000));
+          }
+        }
+
         const typeScreen = await this.getScreenImage(sid);
-        return { output: `Typed: ${target.slice(0, 80)}`, screenshot: typeScreen };
+        return { output: `Typed and sent: ${target.slice(0, 80)}`, screenshot: typeScreen };
       }
 
       case 'key_press': {
@@ -3406,10 +3649,17 @@ CRITICAL RULES:
           payload.action = 'key_press';
           payload.key = target;
         }
+        // Target keystrokes to the active native app (prevents keystrokes going to wrong window)
+        const keySess = sessionId ? sessions.get(sessionId) : undefined;
+        const keyApp = (keySess as any)?._native_app_mode;
+        if (keyApp) {
+          payload.app = keyApp; // --app flag → AppleScript targets this process
+          this.logger.log(`key_press: targeting "${keyApp}" process`);
+        }
         await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, payload, { timeout: ACTION_TIMEOUT_MS });
         await new Promise(r => setTimeout(r, 300));
         const keyScreen = await this.getScreenImage(sid);
-        return { output: `Pressed: ${target}`, screenshot: keyScreen };
+        return { output: `Pressed: ${target}${keyApp ? ` (→ ${keyApp})` : ''}`, screenshot: keyScreen };
       }
 
       case 'open_app': {
@@ -3424,7 +3674,8 @@ CRITICAL RULES:
           }, { timeout: 5000 });
           const screens = screensRes.data?.screens || [];
           // If session has a capture target with a specific screen, use that
-          const captureTarget = session?.capture_target;
+          const openSession = sessionId ? sessions.get(sessionId) : undefined;
+          const captureTarget = (openSession as any)?.capture_target;
           if (captureTarget?.target) {
             const idx = screens.findIndex((s: any) => s.name?.toLowerCase().includes(captureTarget.target!.toLowerCase()));
             if (idx >= 0) targetScreenIdx = idx;
@@ -3507,7 +3758,13 @@ CRITICAL RULES:
 
         // Mark session as in native app mode so future read_screen uses OCR
         const appSession = sessions.get(sid);
-        if (appSession) (appSession as any)._native_app_mode = target;
+        // Store the normalized app name for keystroke targeting.
+        // macOS process names don't include "desktop", "app", etc.
+        // "ChatGPT desktop" → "ChatGPT", "Finder app" → "Finder"
+        const normalizedAppName = target
+          .replace(/\s+(desktop|app|application)$/i, '')
+          .trim();
+        if (appSession) (appSession as any)._native_app_mode = normalizedAppName;
 
         return { output: appOutput, screenshot: appScreen };
       }

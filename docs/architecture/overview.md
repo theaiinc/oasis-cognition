@@ -85,7 +85,7 @@ flowchart LR
 | Execution | **tool-executor** | Sandboxed shell/npm-style execution against mounted workspace. |
 | Coding | **dev-agent** (host) | Git worktrees, `read_file` / `edit_file` / `apply_patch`, and repo-local edits — runs on the host for real git access (`scripts/start-dev-agent.sh`). |
 | Oversight | **observer-service** | Invokes **graph-builder** and **logic-engine** to score plans, detect contradictions, and feed structured feedback back into the loop. |
-| Memory | **memory-service** | Neo4j-backed session memory, rules snapshots, and code-symbol queries used by agents and the gateway. |
+| Memory | **memory-service** | Neo4j-backed session memory, rules snapshots, code-symbol queries, and **CU learning memory** (Skill, UIElement, Action nodes for action replay and self-improvement). |
 | Index | **code-indexer** | Tree-sitter indexing of the repo into Neo4j (`CodeFile`, `CodeSymbol`, `CodeModule`); optional file watcher. |
 | Voice | **voice-agent** + **LiveKit** | Real-time audio; transcription may call host **transcription** (MLX) on macOS. |
 | Adapter | **openai-adapter** | OpenAI-compatible REST API (`/v1/chat/completions`, `/v1/models`). Bridges external clients (e.g. Open WebUI) to the Oasis pipeline; Langfuse tracing built-in. |
@@ -133,6 +133,30 @@ flowchart LR
 | 8098 | transcription-gipformer (**host**, `scripts/start-gipformer.sh`) |
 | 8099 | transcription (native MLX when installed via `make install`) |
 | 11434 | Ollama (**host**, `OLLAMA_HOST=0.0.0.0:11434` for Docker access) |
+
+## Computer-Use learning memory
+
+The CU agent learns from successful sessions and replays proven action sequences:
+
+**Neo4j node types** (managed by memory-service under `/internal/memory/cu/`):
+
+| Node | Purpose | Key properties |
+|------|---------|---------------|
+| `Skill` | Reusable action sequence learned from a successful CU session | `intent`, `steps` (JSON), `success_rate` (EMA), `usage_count` |
+| `UIElement` | Remembered UI element position across sessions | `text`, `type`, `x_ratio`, `y_ratio`, `context`, `confidence` |
+| `Action` | Individual CU action execution record | `type`, `target`, `success`, `timestamp` |
+
+**Relationships**: `(:Skill)-[:USES]->(:UIElement)`, `(:Action)-[:TARGETS]->(:UIElement)`, `(:Action)-[:PART_OF]->(:Skill)`
+
+**Learning loop**:
+1. Cold start: LLM plans as usual (logic engine IF/THEN rules + web research)
+2. Each step saves `Action` + `UIElement` nodes (fire-and-forget)
+3. On success: `Skill` created from completed steps, linked to UI elements
+4. Warm start: `draftPlan` queries skills first — if found (rate >= 0.75), skips LLM entirely
+5. Success/failure updates `success_rate` via exponential moving average (alpha=0.3)
+6. After ~3 consecutive failures, skill degrades below threshold and system falls back to LLM
+
+The existing logic engine (IF/THEN rules, observer, graph-builder) is **not modified** — skills are a parallel shortcut layer.
 
 ## Infrastructure dependencies
 

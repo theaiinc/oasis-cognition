@@ -658,6 +658,92 @@ async def identify_speaker(req: IdentifySpeakerRequest):
     return {"count": len(matches), "matches": matches}
 
 
+# ── CU Learning Memory endpoints ──────────────────────────────────────────────
+
+
+class SaveUIElementRequest(BaseModel):
+    text: str
+    type: str  # "button", "input", "link", etc.
+    x_ratio: float = 0.0  # normalized 0.0-1.0
+    y_ratio: float = 0.0
+    context: str = ""  # page/app context, e.g. "ChatGPT", "GitHub Settings"
+    confidence: float = 0.8
+
+
+class SaveActionRequest(BaseModel):
+    type: str  # "click", "type", "navigate", "open_app", etc.
+    target: str
+    success: bool
+    ui_element_id: str | None = None
+    skill_id: str | None = None
+
+
+class CreateSkillRequest(BaseModel):
+    name: str
+    intent: str  # normalized goal description
+    steps: list[str]  # ordered action descriptions
+    ui_element_ids: list[str] = []
+
+
+class UpdateSkillStatsRequest(BaseModel):
+    success: bool
+
+
+@app.post("/internal/memory/cu/ui-element")
+async def save_cu_ui_element(req: SaveUIElementRequest):
+    element_id = await memory.save_ui_element(
+        text=req.text, element_type=req.type, x_ratio=req.x_ratio,
+        y_ratio=req.y_ratio, context=req.context, confidence=req.confidence,
+    )
+    return {"status": "ok", "element_id": element_id}
+
+
+@app.post("/internal/memory/cu/action")
+async def save_cu_action(req: SaveActionRequest):
+    action_id = await memory.save_action(
+        action_type=req.type, target=req.target, success=req.success,
+        ui_element_id=req.ui_element_id, skill_id=req.skill_id,
+    )
+    return {"status": "ok", "action_id": action_id}
+
+
+@app.post("/internal/memory/cu/skill")
+async def create_cu_skill(req: CreateSkillRequest):
+    skill_id = await memory.create_skill(
+        name=req.name, intent=req.intent, steps=req.steps,
+        ui_element_ids=req.ui_element_ids if req.ui_element_ids else None,
+    )
+    return {"status": "ok", "skill_id": skill_id}
+
+
+@app.patch("/internal/memory/cu/skill/{skill_id}/stats")
+async def update_cu_skill_stats(skill_id: str, req: UpdateSkillStatsRequest):
+    await memory.update_skill_stats(skill_id, req.success)
+    return {"status": "ok"}
+
+
+@app.get("/internal/memory/cu/skill/find")
+async def find_cu_skill(
+    intent: str = Query(..., description="Goal/intent to match"),
+    context: str = Query("", description="Current page/app context"),
+    min_success_rate: float = Query(0.7, ge=0.0, le=1.0),
+):
+    skill = await memory.find_relevant_skill(intent, context, min_success_rate)
+    return {"found": skill is not None, "skill": skill}
+
+
+@app.get("/internal/memory/cu/ui-element/find")
+async def find_cu_ui_element(
+    query: str = Query(..., description="Element text or description"),
+    context: str = Query("", description="Page/app context"),
+):
+    elements = await memory.find_ui_element(query, context)
+    return {"count": len(elements), "elements": elements}
+
+
+# ── End CU Learning Memory ────────────────────────────────────────────────────
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok", "service": "memory-service"}

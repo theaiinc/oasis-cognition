@@ -81,7 +81,26 @@ def main():
 
         elif action == "click":
             if args.x is not None and args.y is not None:
-                pyautogui.click(args.x, args.y, clicks=args.clicks, button=args.button)
+                # Use Quartz CGEvent for negative coords (multi-monitor menu bars)
+                # pyautogui clips negative values on some setups
+                if args.y < 0 or args.x < 0:
+                    try:
+                        import Quartz
+                        point = (float(args.x), float(args.y))
+                        for _ in range(args.clicks):
+                            move = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventMouseMoved, point, 0)
+                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, move)
+                            time.sleep(0.05)
+                            down = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseDown, point, 0)
+                            up = Quartz.CGEventCreateMouseEvent(None, Quartz.kCGEventLeftMouseUp, point, 0)
+                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, down)
+                            time.sleep(0.05)
+                            Quartz.CGEventPost(Quartz.kCGHIDEventTap, up)
+                            time.sleep(0.1)
+                    except Exception:
+                        pyautogui.click(args.x, args.y, clicks=args.clicks, button=args.button)
+                else:
+                    pyautogui.click(args.x, args.y, clicks=args.clicks, button=args.button)
                 result["output"] = f"Clicked ({args.x}, {args.y})"
             else:
                 pyautogui.click(clicks=args.clicks, button=args.button)
@@ -109,11 +128,23 @@ def main():
         elif action == "type_text":
             if not args.text:
                 raise ValueError("type_text requires --text")
-            if args.text.isascii():
-                pyautogui.typewrite(args.text, interval=0.03)
-            else:
-                pyautogui.write(args.text)
-            result["output"] = f"Typed: {args.text[:80]}"
+            # Use AppleScript keystroke — sends directly to the frontmost app's key window.
+            # More reliable than pyautogui CGEvent which can be intercepted by other processes.
+            try:
+                import subprocess
+                safe = args.text.replace('\\', '\\\\').replace('"', '\\"')
+                subprocess.run([
+                    'osascript', '-e',
+                    f'tell application "System Events" to keystroke "{safe}"',
+                ], timeout=10, capture_output=True)
+                result["output"] = f"Typed: {args.text[:80]}"
+            except Exception:
+                # Fallback to pyautogui
+                if args.text.isascii():
+                    pyautogui.typewrite(args.text, interval=0.03)
+                else:
+                    pyautogui.write(args.text)
+                result["output"] = f"Typed: {args.text[:80]}"
             time.sleep(0.3)
 
         elif action == "key_press":

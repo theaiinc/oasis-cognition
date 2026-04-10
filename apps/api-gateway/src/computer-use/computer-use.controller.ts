@@ -721,13 +721,21 @@ export class ComputerUseController {
       `OUTPUT FORMAT: One step per line using this format (NO JSON, NO markdown):\n` +
       `STEP: <action> | <target> | <description>\n\n` +
       `ACTIONS:\n` +
-      `- navigate | <full URL> | description — goes to a URL directly\n` +
-      `- click | <visual element description> | description — clicks a visible element\n` +
+      `BROWSER:\n` +
+      `- navigate | <full URL> | description — opens a URL in the browser\n` +
+      `- click | <visual element description> | description — clicks a visible element in the browser\n` +
       `- type | <text to type> | description — types text into the focused field\n` +
       `- scroll | up/down | description — scrolls the page\n` +
       `- read_screen | | description — captures screenshot AND extracts all visible text\n` +
       `- key_press | <key or combo e.g. enter, ${hostModifier()}+l> | description\n` +
+      `NATIVE DESKTOP:\n` +
+      `- open_app | <app name> | description — focus/launch a native macOS app (Claude, Finder, Terminal, Slack, etc.)\n` +
+      `- click_screen | <element description> | description — find and click an element on the screen using vision (works on any app)\n` +
       `- wait | <seconds> | description — waits (only if page needs time to load)\n\n` +
+      `IMPORTANT:\n` +
+      `- PREFER native desktop apps over browser. If ChatGPT/Claude/Slack/Discord/etc. has a desktop app, use open_app — do NOT navigate to the website.\n` +
+      `- Only use navigate/browser when there is NO native app for the service.\n` +
+      `- For native apps: open_app → read_screen → click_screen\n\n` +
       `EFFICIENCY RULES (these are critical):\n` +
       `1. Generate 3-6 steps. Fewer is better. Every step costs time.\n` +
       `2. NEVER use "screenshot" as a standalone step — "read_screen" already captures the screen AND extracts text. Use read_screen instead.\n` +
@@ -739,6 +747,9 @@ export class ComputerUseController {
       `            "my twitter profile" → navigate to https://twitter.com/USERNAME\n` +
       `   If the goal mentions a page name/slug/URL, USE IT DIRECTLY. Don't search or click through menus.\n` +
       `6. For GitHub: use direct URLs like https://github.com/orgs/ORGNAME/repositories or https://github.com/USERNAME?tab=repositories\n` +
+      `7. BEFORE typing text, ALWAYS click the input field first with click_screen. Text input requires focus.\n` +
+      `   Example: To type in ChatGPT → click_screen "Message ChatGPT input" THEN type "your query"\n` +
+      `   Example: To type in a search bar → click_screen "Search" THEN type "search term"\n` +
       `7. One "read_screen" is enough per page — do NOT repeat read_screen unless you scrolled.\n` +
       `8. Only scroll if you have evidence the content continues below the fold. Don't preemptively scroll.\n` +
       `9. Plans execute LINEARLY — NO conditional logic.\n\n` +
@@ -1300,33 +1311,45 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
   // ════════════════════════════════════════════════════════════════════════
 
   private static readonly REACT_SYSTEM = `\
-You are a SMART, EFFICIENT computer-use agent. You follow a plan but ADAPT based on what you see.
+You are a SMART computer-use agent controlling a real macOS desktop. You can control BOTH the web browser AND native desktop apps.
 
 OUTPUT (one field per line):
 THOUGHT: <what you see + your reasoning> (1-2 sentences max)
 ACTION: <action>
 TARGET: <value>
 
-ACTIONS:
+BROWSER ACTIONS:
 - execute_plan — run the planned step as-is
-- click | TARGET = exact text of clickable element (from page content or clickable elements list)
-- navigate | TARGET = full URL
-- type | TARGET = text to type
+- click | TARGET = exact text of clickable element
+- navigate | TARGET = full URL (opens in browser)
+- type | TARGET = text to type into focused field
 - scroll | TARGET = up or down
-- read_screen — re-read after action
+- read_screen — capture and read current screen content
+
+NATIVE DESKTOP ACTIONS:
+- open_app | TARGET = app name (e.g., "Claude", "Finder", "Terminal", "Notes", "Slack")
+- key_press | TARGET = keyboard shortcut (e.g., "enter", "command+c", "command+tab", "escape")
+- click_screen | TARGET = description of what to click on screen (uses screenshot + vision to find and click)
+
+CONTROL ACTIONS:
 - skip | TARGET = reason
 - done | TARGET = evidence-based summary
 - failed | TARGET = reason
 
-EFFICIENCY RULES (critical):
-1. NAVIGATE DIRECTLY when you know the URL. If the goal mentions "facebook.com/kiveteam", go there directly — don't search.
-2. Extract URLs from the user's goal: page names, domains, paths → construct the URL and navigate.
-3. If a click has NO EFFECT (page unchanged), NEVER repeat it. Try: navigate to URL, scroll, or different element.
-4. After 2 failed clicks on the same target, try a completely different approach (direct URL, different menu path).
-5. "done" requires REAL EVIDENCE from the page content (not just "I clicked things"). Show what changed.
-6. "Page not available" after navigating does NOT mean you accomplished the goal — it means the URL is wrong.
-7. Skip redundant steps. If you're already on the target page, skip navigation steps.
-8. For settings/admin pages: navigate to direct URLs (e.g., business.facebook.com/latest/settings/) rather than clicking through menus.`;
+CRITICAL RULES:
+1. PREFER NATIVE APPS over browser. If an app exists as a desktop application (ChatGPT, Claude, Slack, Discord, etc.), use open_app — do NOT open Chrome.
+   - "open ChatGPT" → open_app ChatGPT (NOT navigate to chatgpt.com)
+   - "message on Slack" → open_app Slack (NOT navigate to slack.com)
+   - "check email" → open_app Mail (NOT navigate to gmail.com)
+   - Only use navigate/browser when there is NO native app (e.g., Facebook, GitHub, custom websites)
+2. DETECT the task context:
+   - Native app tasks: open_app → read_screen → click_screen
+   - Browser-only tasks: navigate → click → scroll
+3. NAVIGATE DIRECTLY when you know the URL (browser only).
+4. If a click has NO EFFECT, NEVER repeat. Try different approach.
+5. "done" requires REAL EVIDENCE. Show what changed.
+6. key_press works in the currently focused app.
+7. After open_app, the screen shows OCR text from the native app — use click_screen to interact.`;
 
   private async executeAdaptiveLoop(sessionId: string): Promise<void> {
     const session = sessions.get(sessionId);
@@ -1361,14 +1384,75 @@ EFFICIENCY RULES (critical):
     while (session.current_step < session.plan.length && session.status === 'executing') {
       const step = session.plan[session.current_step];
 
-      // 1. Read current page state
+      // 1. Read current page/screen state
       let pageText = '';
-      try {
-        const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-          tool: 'computer_action', action: 'get_page_text',
-        }, { timeout: 15000 });
-        if (pageRes.data?.success) pageText = pageRes.data.output as string;
-      } catch { /* ignore */ }
+      const isNativeMode = !!(session as any)?._native_app_mode;
+
+      if (isNativeMode) {
+        // Native app mode — capture EACH screen separately and describe with vision LLM
+        // Multi-monitor: combined screenshot is too wide for the LLM to read properly
+        const descriptions: string[] = [];
+        try {
+          const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'list_screens',
+          }, { timeout: 5000 });
+          const screens = screensRes.data?.screens || [];
+
+          for (const scr of screens) {
+            try {
+              // Capture this specific screen
+              const ssRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'screenshot',
+                screen_region: { x: scr.x, y: scr.y, width: scr.width, height: scr.height },
+              }, { timeout: 10000 });
+              const scrImage = ssRes.data?.screenshot;
+              if (!scrImage || scrImage.length < 10000) continue;
+
+              // Describe this screen with vision LLM
+              const vRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+                user_message:
+                  `Describe this screenshot of screen "${scr.name}" (${scr.width}x${scr.height}). ` +
+                  `I'm looking for the "${(session as any)._native_app_mode}" app. ` +
+                  `List all visible windows/apps and their UI elements. Be concise.`,
+                context: {
+                  system_override: 'Describe the screenshot. List visible apps and UI elements.',
+                  max_tokens: 600,
+                  screen_image: scrImage,
+                },
+              }, { timeout: 20000 });
+              const desc = (vRes.data?.response_text || vRes.data?.response || '').trim();
+              if (desc) {
+                descriptions.push(`[Screen: ${scr.name}]\n${desc}`);
+              }
+            } catch { /* skip this screen */ }
+          }
+        } catch { /* ignore list_screens failure */ }
+
+        if (descriptions.length > 0) {
+          pageText = `App: ${(session as any)._native_app_mode}\n\n${descriptions.join('\n\n')}`;
+        } else {
+          // Fallback: single combined screenshot
+          const nativeScreen = await this.getScreenImage(sessionId);
+          if (nativeScreen) {
+            try {
+              const visionRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+                user_message: `Describe this screenshot. List all visible UI elements.`,
+                context: { system_override: 'Describe screenshot.', max_tokens: 800, screen_image: nativeScreen },
+              }, { timeout: 20000 });
+              const desc = (visionRes.data?.response_text || visionRes.data?.response || '').trim();
+              if (desc) pageText = `App: ${(session as any)._native_app_mode}\n\n${desc}`;
+            } catch { /* ignore */ }
+          }
+        }
+      } else {
+        // Browser mode — use Chrome Bridge
+        try {
+          const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'get_page_text',
+          }, { timeout: 15000 });
+          if (pageRes.data?.success) pageText = pageRes.data.output as string;
+        } catch { /* ignore */ }
+      }
       if (!pageText) {
         try {
           const ocrRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
@@ -1518,6 +1602,18 @@ EFFICIENCY RULES (critical):
         if (result.screenshot) session.live_screenshot = result.screenshot;
 
         actionHistory.push(`${session.current_step + 1}. ${execAction}${execTarget ? ` → "${execTarget.slice(0, 50)}"` : ''} → ${result.output.slice(0, 80)}`);
+
+        // After open_app succeeds, trust the plan — advance immediately without
+        // re-asking the LLM (which often misidentifies the app and retries open_app)
+        if (execAction === 'open_app') {
+          step.status = 'completed';
+          step.completed_at = new Date().toISOString();
+          session.current_step++;
+          session.updated_at = new Date().toISOString();
+          this.logger.log(`open_app succeeded → auto-advancing to step ${session.current_step + 1}`);
+          await new Promise(r => setTimeout(r, 500));
+          continue; // skip the rest of this iteration's logic, proceed to next planned step
+        }
 
         // Discovery extraction
         if ((execAction === 'read_screen' || execAction === 'read_page') && result.output) {
@@ -2541,12 +2637,16 @@ EFFICIENCY RULES (critical):
         await new Promise(r => setTimeout(r, 300));
       }
 
-      // If targeting a specific screen, pass the screen region for cropped capture
+      // For native app actions (open_app, click_screen), always capture ALL screens
+      // so the agent can see apps on any display. For browser actions, use the targeted screen.
       const screenRegion = this.getScreenRegion(sessionId);
       const payload: Record<string, any> = { tool: 'computer_action', action: 'screenshot' };
-      if (screenRegion) {
+      const lastAction = session?.plan?.[session.current_step]?.action?.toLowerCase() || '';
+      const isNativeAction = ['open_app', 'click_screen', 'key_press'].includes(lastAction);
+      if (screenRegion && !isNativeAction) {
         payload.screen_region = screenRegion;
       }
+      // For native actions, capture full screen (all displays) to find the app
 
       const res = await axios.post(
         `${DEV_AGENT_URL}/internal/dev-agent/execute`,
@@ -3237,7 +3337,57 @@ EFFICIENCY RULES (critical):
 
       case 'type': {
         if (!target) return { output: 'type action requires target text' };
-        // Single call — errors propagate to sub-step retry mechanism.
+
+        // Before typing, ensure the input field is focused.
+        // Strategy:
+        //   1. If a native app is open, try Cmd+N (new chat/document) to get a fresh input
+        //   2. Then click near the bottom of the screen where input fields typically are
+        //   3. Small delay to let focus settle
+        const nativeApp = (session as any)?._native_app_mode;
+
+        if (nativeApp) {
+          // For native chat apps, create a new chat first (Cmd+N), then click the input field.
+          const chatApps = ['chatgpt', 'claude', 'slack', 'discord', 'messages', 'telegram'];
+          const isChat = chatApps.some(a => (nativeApp as string).toLowerCase().includes(a));
+
+          if (isChat) {
+            // Cmd+N = new chat (focuses input automatically in most chat apps)
+            try {
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'hotkey', keys: 'command,n',
+              }, { timeout: 5000 });
+              this.logger.log(`type: sent Cmd+N to ${nativeApp} for new chat`);
+              await new Promise(r => setTimeout(r, 1000));
+            } catch { /* continue */ }
+          }
+
+          // Click the input field by finding it on the app's screen via OCR.
+          // The app was maximized by open_app, so we know which screen it's on.
+          // We click directly at known positions to avoid cross-screen confusion.
+          try {
+            const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'list_screens',
+            }, { timeout: 5000 });
+            const screens = screensRes.data?.screens || [];
+            // The app was opened on the external monitor (screen 1) by open_app
+            const scr = screens.length > 1 ? screens[1] : screens[0];
+            if (scr) {
+              // Chat apps: input field is at the bottom, horizontally centered past the sidebar
+              // Sidebar is typically ~250px wide, so center the click in the remaining area
+              const sidebarWidth = 260;
+              const contentWidth = scr.width - sidebarWidth;
+              const clickX = scr.x + sidebarWidth + Math.round(contentWidth / 2);
+              const clickY = scr.y + scr.height - 55; // ~55px from bottom
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'click', x: clickX, y: clickY,
+              }, { timeout: 5000 });
+              this.logger.log(`type: clicked chat input at (${clickX}, ${clickY}) on ${scr.name || 'screen'}`);
+            }
+          } catch { /* continue */ }
+          await new Promise(r => setTimeout(r, 500));
+        }
+
+        // Type the text
         await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
           { tool: 'computer_action', action: 'type_text', text: target },
           { timeout: ACTION_TIMEOUT_MS });
@@ -3260,6 +3410,123 @@ EFFICIENCY RULES (critical):
         await new Promise(r => setTimeout(r, 300));
         const keyScreen = await this.getScreenImage(sid);
         return { output: `Pressed: ${target}`, screenshot: keyScreen };
+      }
+
+      case 'open_app': {
+        if (!target) return { output: 'open_app requires app name' };
+
+        // Determine which screen to open the app on.
+        // Use the session's capture target screen, or default to screen 0 (primary).
+        let targetScreenIdx = 0;
+        try {
+          const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'list_screens',
+          }, { timeout: 5000 });
+          const screens = screensRes.data?.screens || [];
+          // If session has a capture target with a specific screen, use that
+          const captureTarget = session?.capture_target;
+          if (captureTarget?.target) {
+            const idx = screens.findIndex((s: any) => s.name?.toLowerCase().includes(captureTarget.target!.toLowerCase()));
+            if (idx >= 0) targetScreenIdx = idx;
+          }
+          // Default: use the largest non-primary screen (external monitor) if available,
+          // since users typically want CU actions on the external display
+          if (screens.length > 1 && targetScreenIdx === 0) {
+            targetScreenIdx = 1; // prefer external monitor
+          }
+        } catch { /* use default screen 0 */ }
+
+        // 1. Open app, move to target screen, and maximize (100vw x 100vh)
+        const openRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+          tool: 'computer_action',
+          action: 'open_application',
+          text: target,
+          x: targetScreenIdx, // x = target screen index for open_application
+        }, { timeout: ACTION_TIMEOUT_MS }).catch(() => null);
+        await new Promise(r => setTimeout(r, 1000));
+
+        // 2. Also try focus_window to ensure it's frontmost
+        await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+          tool: 'computer_action',
+          action: 'focus_window',
+          text: target,
+        }, { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+        await new Promise(r => setTimeout(r, 500));
+
+        // 3. Take screenshot (full screen — captures all displays for native apps)
+        const appScreen = await this.getScreenImage(sid);
+
+        // 4. Read each screen separately with vision LLM (multi-monitor aware)
+        let appOutput = `Opened ${target}`;
+        try {
+          const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'list_screens',
+          }, { timeout: 5000 });
+          const screens = screensRes.data?.screens || [];
+          const descs: string[] = [];
+
+          for (const scr of screens) {
+            try {
+              const ssRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'screenshot',
+                screen_region: { x: scr.x, y: scr.y, width: scr.width, height: scr.height },
+              }, { timeout: 10000 });
+              const img = ssRes.data?.screenshot;
+              if (!img || img.length < 10000) continue;
+
+              const vRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+                user_message:
+                  `I just opened "${target}". Describe this screenshot of "${scr.name}" screen. ` +
+                  `List all visible windows, apps, and clickable UI elements. Where is "${target}"?`,
+                context: {
+                  system_override: 'Describe screenshot. List apps and UI elements visible.',
+                  max_tokens: 600,
+                  screen_image: img,
+                },
+              }, { timeout: 20000 });
+              const desc = (vRes.data?.response_text || vRes.data?.response || '').trim();
+              if (desc) descs.push(`[Screen: ${scr.name}]\n${desc}`);
+            } catch { /* skip */ }
+          }
+          if (descs.length > 0) {
+            appOutput = `App: ${target}\n\n${descs.join('\n\n')}`;
+          }
+        } catch {
+          // Fallback: single screenshot
+          if (appScreen) {
+            try {
+              const vRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+                user_message: `Describe this screenshot. I opened "${target}". List all visible UI elements.`,
+                context: { system_override: 'Describe screenshot.', max_tokens: 800, screen_image: appScreen },
+              }, { timeout: 20000 });
+              const desc = (vRes.data?.response_text || vRes.data?.response || '').trim();
+              if (desc) appOutput = `App: ${target}\n\n${desc}`;
+            } catch { /* ignore */ }
+          }
+        }
+
+        // Mark session as in native app mode so future read_screen uses OCR
+        const appSession = sessions.get(sid);
+        if (appSession) (appSession as any)._native_app_mode = target;
+
+        return { output: appOutput, screenshot: appScreen };
+      }
+
+      case 'click_screen': {
+        // Native screen click — uses screenshot + ui_parser to find element, then clicks at screen coordinates
+        if (!target) return { output: 'click_screen requires element description' };
+        // Use click_ui_element which tries Chrome Bridge → ui_parser → pixel fallback
+        const clickRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+          tool: 'computer_action',
+          action: 'click_ui_element',
+          text: target,
+        }, { timeout: 20000 });
+        await new Promise(r => setTimeout(r, 800));
+        const clickScreen = await this.getScreenImage(sid);
+        return {
+          output: clickRes.data?.output || `Clicked "${target}" on screen`,
+          screenshot: clickScreen,
+        };
       }
 
       case 'scroll': {

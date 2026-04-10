@@ -82,14 +82,14 @@ def _run_control(action: str, **kwargs) -> dict[str, Any]:
 
 # ── Screenshot helper ──────────────────────────────────────────────────────
 
-def _take_screenshot(region: tuple[int, int, int, int] | None = None) -> str:
+def _take_screenshot(region: tuple[int, int, int, int] | None = None, max_width: int = 1024) -> str:
     """Capture screen (or region) and return as base64 JPEG string.
 
     On macOS, uses OasisScreenCapture.app so Screen Recording permission
     shows "Oasis Screen Capture" — never imports pyautogui/Quartz in this process.
     """
     if _os.path.isfile(_CAPTURE_BIN):
-        args = ["--max-width", "1024"]
+        args = ["--max-width", str(max_width)]
         if region:
             args += ["--region", f"{region[0]},{region[1]},{region[2]},{region[3]}"]
         raw = _run_app_bundle(_CAPTURE_APP, args, timeout=10)
@@ -621,6 +621,8 @@ async def execute_computer_action(
     if action == "open_application":
         if not text:
             return {"success": False, "output": "open_application requires text (app name)", "screenshot": ""}
+        # Optional: x = target screen index (0-based). If not provided, uses primary screen.
+        target_screen_idx = x if x is not None else None
         try:
             proc = await asyncio.create_subprocess_exec(
                 "open", "-a", text,
@@ -630,8 +632,65 @@ async def execute_computer_action(
             _, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
             if proc.returncode != 0:
                 return {"success": False, "output": f"Failed to open {text}: {stderr.decode().strip()}", "screenshot": ""}
-            logger.info("open_application: opened %r", text)
-            return {"success": True, "output": f"Opened {text}", "screenshot": ""}
+
+            # Wait for the app to finish launching
+            await asyncio.sleep(1.0)
+
+            # Get screen info
+            screens_info = await _list_screens()
+            screens = screens_info.get("screens", [])
+            if not screens:
+                screens = [{"x": 0, "y": 0, "width": 1920, "height": 1080}]
+
+            # Determine target screen
+            if target_screen_idx is not None and 0 <= target_screen_idx < len(screens):
+                target_scr = screens[target_screen_idx]
+            else:
+                # Default: use primary screen (index 0)
+                target_scr = screens[0]
+
+            # Move window to target screen and maximize to fill it (100vw x 100vh)
+            safe_app = text.replace('"', '\\"')
+            menu_bar_h = 25
+            sx, sy = target_scr["x"], target_scr["y"]
+            sw, sh = target_scr["width"], target_scr["height"]
+            scr_name = target_scr.get("name", f"Screen {target_screen_idx or 0}")
+
+            maximize_script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.5
+        try
+            set win to front window
+            -- Move to target screen and maximize
+            set position of win to {{{sx}, {sy + menu_bar_h}}}
+            delay 0.2
+            set size of win to {{{sw}, {sh - menu_bar_h}}}
+        on error
+            -- App may not have a window yet or doesn't support resizing
+            try
+                click button 2 of front window
+            end try
+        end try
+    end tell
+end tell
+'''
+            try:
+                mx_proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", maximize_script,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                mx_stdout, mx_stderr = await asyncio.wait_for(mx_proc.communicate(), timeout=6)
+                if mx_proc.returncode == 0:
+                    logger.info("open_application: %r moved to %s and maximized (%d,%d %dx%d)",
+                                text, scr_name, sx, sy + menu_bar_h, sw, sh - menu_bar_h)
+                else:
+                    logger.debug("open_application: maximize script error: %s", mx_stderr.decode()[:200])
+            except Exception as e:
+                logger.debug("open_application: maximize failed for %r: %s", text, e)
+
+            return {"success": True, "output": f"Opened {text} — maximized on {scr_name}", "screenshot": ""}
         except Exception as e:
             return {"success": False, "output": f"Failed to open {text}: {e}", "screenshot": ""}
 
@@ -971,27 +1030,195 @@ except Exception as e:
             except Exception as e:
                 logger.debug("Chrome Bridge find failed: %s", e)
 
-        # Strategy 2: ui_parser OCR + GroundingDINO (needs screenshot)
+        # Strategy 2: macOS Accessibility API — find by text in focused app
+        # Searches name, description, value, title, help, and AXStaticText children
+        if platform.system() == "Darwin":
+            try:
+                # Escape single quotes in query for AppleScript safety
+                safe_text = text.replace("'", "'\\''").replace('"', '\\"')
+                ax_script = f'''
+tell application "System Events"
+    set frontApp to first application process whose frontmost is true
+    set queryText to "{safe_text}"
+    set results to ""
+
+    -- Search menu bar items by name
+    try
+        set menuItems to every menu bar item of menu bar 1 of frontApp
+        repeat with m in menuItems
+            try
+                if (name of m as text) contains queryText then
+                    set elemPos to position of m
+                    set elemSize to size of m
+                    set posX to item 1 of elemPos
+                    set posY to item 2 of elemPos
+                    set sW to item 1 of elemSize
+                    set sH to item 2 of elemSize
+                    set centerX to posX + (sW / 2)
+                    set centerY to posY + (sH / 2)
+                    set results to results & "AXMenuBarItem|" & (name of m as text) & "|" & (centerX as integer) & "," & (centerY as integer) & "|" & sW & "x" & sH & linefeed
+                end if
+            end try
+        end repeat
+    end try
+
+    -- Search window UI elements (buttons, text fields, static text, etc.)
+    try
+        set uiElems to entire contents of window 1 of frontApp
+        set counter to 0
+        repeat with e in uiElems
+            set counter to counter + 1
+            if counter > 300 then exit repeat
+            try
+                set roleName to role of e
+                set matchText to ""
+                try
+                    set matchText to matchText & " " & (name of e as text)
+                end try
+                try
+                    set matchText to matchText & " " & (description of e as text)
+                end try
+                try
+                    set matchText to matchText & " " & (value of e as text)
+                end try
+                if matchText contains queryText then
+                    set elemPos to position of e
+                    set elemSize to size of e
+                    set posX to item 1 of elemPos
+                    set posY to item 2 of elemPos
+                    set sW to item 1 of elemSize
+                    set sH to item 2 of elemSize
+                    if sW > 0 and sH > 0 then
+                        set centerX to posX + (sW / 2)
+                        set centerY to posY + (sH / 2)
+                        set elemName to "?"
+                        try
+                            set elemName to name of e as text
+                        end try
+                        set results to results & roleName & "|" & elemName & "|" & (centerX as integer) & "," & (centerY as integer) & "|" & sW & "x" & sH & linefeed
+                    end if
+                end if
+            end try
+        end repeat
+    end try
+
+    return results
+end tell
+'''
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", ax_script,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=12)
+                ax_output = stdout.decode().strip()
+                if ax_output:
+                    lines = [l.strip() for l in ax_output.split("\n") if l.strip()]
+                    # Prefer interactive elements (buttons, links, menus) over static text
+                    interactive_roles = {"AXButton", "AXLink", "AXMenuItem", "AXMenuButton",
+                                        "AXPopUpButton", "AXCheckBox", "AXRadioButton", "AXTextField"}
+                    sorted_lines = sorted(lines, key=lambda l: 0 if l.split("|")[0] in interactive_roles else 1)
+                    if sorted_lines:
+                        parts = sorted_lines[0].split("|")
+                        if len(parts) >= 3:
+                            coords = parts[2].split(",")
+                            cx, cy = int(coords[0]), int(coords[1])
+                            label = parts[1] if parts[1] not in ("?", "missing value") else text
+                            logger.info("find_ui_element: '%s' found via Accessibility at native (%d,%d) — role=%s label=%s (%d matches)",
+                                        text, cx, cy, parts[0], label, len(lines))
+                            return {
+                                "success": True,
+                                "output": f"Found '{label}' at native ({cx}, {cy}) via Accessibility API",
+                                "screenshot": "",
+                                "element": {
+                                    "label": label,
+                                    "method": "accessibility",
+                                    "native_center": [cx, cy],
+                                    "role": parts[0],
+                                    "center": [cx, cy],
+                                },
+                            }
+                else:
+                    logger.debug("Accessibility: no match for '%s' (stderr: %s)", text, stderr.decode().strip()[:200])
+            except Exception as e:
+                logger.debug("Accessibility find failed: %s", e)
+
+        # Strategy 3: Per-screen OCR + GroundingDINO (capture each screen separately for accuracy)
         UI_PARSER_URL = _os.getenv("UI_PARSER_URL", "http://localhost:8011")
         try:
-            screenshot_b64 = _take_screenshot()
-            if screenshot_b64:
-                import httpx as _httpx
-                async with _httpx.AsyncClient(timeout=15) as client:
+            import httpx as _httpx
+            screens_info = await _list_screens()
+            screens = screens_info.get("screens", [])
+            if not screens:
+                screens = [{"index": 0, "name": "Screen", "width": 1920, "height": 1080, "x": 0, "y": 0}]
+
+            best_overall = None
+            best_screen = None
+            best_screenshot = ""
+
+            async with _httpx.AsyncClient(timeout=15) as client:
+                for scr in screens:
+                    # Capture each screen at native resolution (up to 1920px) for accurate OCR
+                    scr_screenshot = _take_screenshot(
+                        region=(scr["x"], scr["y"], scr["width"], scr["height"]),
+                        max_width=min(scr["width"], 1920),
+                    )
+                    if not scr_screenshot:
+                        continue
+
                     resp = await client.post(f"{UI_PARSER_URL}/internal/ui-parser/ground", json={
-                        "image": screenshot_b64,
+                        "image": scr_screenshot,
                         "query": text,
                     })
                     data = resp.json()
                     detections = data.get("detections", [])
                     if detections:
-                        best = detections[0]
-                        return {
-                            "success": True,
-                            "output": f"Found '{best.get('label', text)}' at ({best['center'][0]}, {best['center'][1]}) via {best.get('method', 'ocr')}",
-                            "screenshot": screenshot_b64,
-                            "element": {**best, "method": best.get("method", "ocr")},
-                        }
+                        det = detections[0]
+                        if best_overall is None or det.get("score", 0) > best_overall.get("score", 0):
+                            best_overall = det
+                            best_screen = scr
+                            best_screenshot = scr_screenshot
+
+            if best_overall and best_screen:
+                # Convert from per-screen image coords to NATIVE screen coords
+                # Get the actual per-screen image dimensions
+                img_w, img_h = 1024, 768
+                try:
+                    import io as _io, base64 as _b64
+                    from PIL import Image as _PILImage
+                    img_bytes = _b64.b64decode(best_screenshot)
+                    img = _PILImage.open(_io.BytesIO(img_bytes))
+                    img_w, img_h = img.size
+                except Exception:
+                    pass
+
+                # Scale from image space to per-screen native coords, then add screen offset
+                scale_x = best_screen["width"] / img_w
+                scale_y = best_screen["height"] / img_h
+                native_cx = best_overall["center"][0] * scale_x + best_screen["x"]
+                native_cy = best_overall["center"][1] * scale_y + best_screen["y"]
+
+                logger.info(
+                    "find_ui_element: '%s' found via %s on screen '%s' — "
+                    "img(%d,%d) img_size=%dx%d scr_offset=(%d,%d) scr_size=%dx%d → native(%.0f,%.0f)",
+                    text, best_overall.get("method", "?"), best_screen.get("name", "?"),
+                    int(best_overall["center"][0]), int(best_overall["center"][1]),
+                    img_w, img_h, best_screen["x"], best_screen["y"],
+                    best_screen["width"], best_screen["height"], native_cx, native_cy,
+                )
+
+                return {
+                    "success": True,
+                    "output": f"Found '{best_overall.get('label', text)}' at native ({native_cx:.0f}, {native_cy:.0f}) on {best_screen.get('name', 'screen')} via {best_overall.get('method', 'ocr')}",
+                    "screenshot": best_screenshot,
+                    "element": {
+                        **best_overall,
+                        "method": best_overall.get("method", "ocr"),
+                        # Store pre-computed native coords so click_ui_element can use them directly
+                        "native_center": [round(native_cx), round(native_cy)],
+                        "screen_name": best_screen.get("name", ""),
+                        "screen_index": best_screen.get("index", 0),
+                    },
+                }
         except Exception as e:
             logger.warning("ui_parser find failed: %s", e)
 
@@ -1009,6 +1236,7 @@ except Exception as e:
 
         el = find_result["element"]
         method = el.get("method", "")
+        logger.info("click_ui_element: found '%s' via %s — element keys: %s", text, method, list(el.keys()))
 
         # Step 2: Click using the best method
         # If found via DOM → use Chrome Bridge click (trusted events)
@@ -1021,15 +1249,127 @@ except Exception as e:
             except Exception:
                 pass
 
-        # Fallback: pixel click at center coordinates
-        center = el.get("center_px", el.get("center", [0, 0]))
-        if center[0] > 0 and center[1] > 0:
-            click_result = await execute_computer_action(
-                action="click", text="", x=int(center[0]), y=int(center[1]), **kwargs
-            )
-            logger.info("click_ui_element: '%s' clicked at (%d, %d) via pixel", text, center[0], center[1])
-            return {"success": True, "output": f"Clicked '{el.get('text', text)}' at ({int(center[0])}, {int(center[1])})", "screenshot": click_result.get("screenshot", "")}
+        # If found via Accessibility → click directly via AppleScript (handles multi-monitor/negative coords)
+        if method == "accessibility" and platform.system() == "Darwin":
+            try:
+                safe_text = text.replace("'", "'\\''").replace('"', '\\"')
+                role = el.get("role", "")
+                # For menu bar items, use direct AppleScript click (non-blocking via AXPress)
+                if role == "AXMenuBarItem":
+                    ax_click = f'''
+tell application "System Events"
+    set frontApp to first application process whose frontmost is true
+    perform action "AXPress" of menu bar item "{safe_text}" of menu bar 1 of frontApp
+end tell
+'''
+                else:
+                    # For window elements, use coordinate-based click via System Events
+                    # (handles negative coords unlike pyautogui)
+                    nc = el.get("native_center", [0, 0])
+                    ax_click = f'''
+tell application "System Events"
+    -- Use CGEvent-style click via System Events (handles multi-monitor negative coords)
+    set frontApp to first application process whose frontmost is true
+    set uiElems to entire contents of window 1 of frontApp
+    repeat with e in uiElems
+        try
+            set matchText to ""
+            try
+                set matchText to matchText & " " & (name of e as text)
+            end try
+            try
+                set matchText to matchText & " " & (description of e as text)
+            end try
+            try
+                set matchText to matchText & " " & (value of e as text)
+            end try
+            if matchText contains "{safe_text}" then
+                perform action "AXPress" of e
+                return "clicked"
+            end if
+        end try
+    end repeat
+    return "not_found"
+end tell
+'''
+                proc = await asyncio.create_subprocess_exec(
+                    "osascript", "-e", ax_click,
+                    stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
+                ax_result = stdout.decode().strip()
+                if proc.returncode == 0:
+                    logger.info("click_ui_element: '%s' clicked via Accessibility AXPress (role=%s)", text, role)
+                    return {"success": True, "output": f"Clicked '{el.get('label', text)}' via Accessibility", "screenshot": ""}
+                else:
+                    logger.debug("AXPress failed: %s", stderr.decode().strip()[:200])
+            except asyncio.TimeoutError:
+                logger.debug("AXPress timed out for '%s'", text)
+            except Exception as e:
+                logger.debug("AXPress failed: %s", e)
 
+        # Pixel click: use pre-computed native_center if available (from per-screen find),
+        # otherwise fall back to scaling image-space coords
+        native_center = el.get("native_center")
+        if native_center and isinstance(native_center, (list, tuple)) and len(native_center) >= 2:
+            click_x, click_y = int(native_center[0]), int(native_center[1])
+            logger.info("click_ui_element: using pre-computed native_center (%d, %d) on screen '%s'",
+                        click_x, click_y, el.get("screen_name", "?"))
+        else:
+            # Legacy path: scale image-space coords to native
+            center = el.get("center")
+            if not center or not isinstance(center, (list, tuple)) or len(center) < 2:
+                center = el.get("center_px")
+            if not center or not isinstance(center, (list, tuple)) or len(center) < 2:
+                bbox = el.get("bbox")
+                if bbox and isinstance(bbox, (list, tuple)) and len(bbox) >= 4:
+                    center = [(bbox[0] + bbox[2]) / 2, (bbox[1] + bbox[3]) / 2]
+            click_x, click_y = 0, 0
+            if center and center[0] > 0 and center[1] > 0:
+                click_x, click_y = int(center[0]), int(center[1])
+                # Get actual image dimensions from the screenshot
+                img_w, img_h = 1024, 768
+                screenshot_b64 = find_result.get("screenshot", "")
+                if screenshot_b64:
+                    try:
+                        import io as _io, base64 as _b64
+                        from PIL import Image as _PILImage
+                        img_bytes = _b64.b64decode(screenshot_b64)
+                        img = _PILImage.open(_io.BytesIO(img_bytes))
+                        img_w, img_h = img.size
+                    except Exception:
+                        pass
+                try:
+                    screens_info = await execute_computer_action(action="list_screens", text="", x=None, y=None, **kwargs)
+                    screens = screens_info.get("screens", [])
+                    if screens:
+                        total_w = max(s["x"] + s["width"] for s in screens)
+                        total_h = max(s["y"] + s["height"] for s in screens)
+                        scale_x = total_w / img_w
+                        scale_y = total_h / img_h
+                        click_x = int(center[0] * scale_x)
+                        click_y = int(center[1] * scale_y)
+                        logger.info("click_ui_element: legacy scale image(%d,%d) → native(%d,%d) scale=%.3f",
+                                    int(center[0]), int(center[1]), click_x, click_y, scale_x)
+                except Exception as e:
+                    logger.warning("Scale calculation failed: %s — using raw coords", e)
+
+        # macOS multi-monitor can have negative coords (screens above/left of primary)
+        has_valid_coords = (click_x != 0 or click_y != 0) and click_x >= -5000 and click_y >= -5000
+        if has_valid_coords:
+            click_result = await execute_computer_action(
+                action="click", text="", x=click_x, y=click_y, **kwargs
+            )
+            ctrl_success = click_result.get("success", False)
+            ctrl_output = click_result.get("output", "")
+            if not ctrl_success:
+                logger.error("click_ui_element: click FAILED at (%d,%d): %s", click_x, click_y, ctrl_output)
+                return {"success": False, "output": f"Click at ({click_x},{click_y}) failed: {ctrl_output}", "screenshot": click_result.get("screenshot", "")}
+
+            logger.info("click_ui_element: '%s' clicked at native (%d, %d)", text, click_x, click_y)
+            return {"success": True, "output": f"Clicked '{el.get('text', text)}' at native ({click_x}, {click_y})", "screenshot": click_result.get("screenshot", "")}
+
+        logger.error("click_ui_element: no valid coords for '%s' — element: %s", text, {k: v for k, v in el.items() if k != 'thumbnail'})
         return {"success": False, "output": f"Found '{text}' but could not determine click coordinates", "screenshot": ""}
 
     if action == "chrome_bridge_click":

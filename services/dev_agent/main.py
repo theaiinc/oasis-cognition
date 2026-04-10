@@ -464,6 +464,89 @@ async def close_cu_overlay():
     return {"status": "not_running"}
 
 
+# ── CUA Diagnostic: test coordinate pipeline ──────────────────────────────────
+
+@app.post("/internal/dev-agent/cu-diag/find-and-click")
+async def cu_diag_find_and_click(query: str = "", dry_run: bool = True):
+    """Diagnostic: find a UI element and show the coordinate scaling pipeline.
+
+    If dry_run=True (default), shows what would be clicked without actually clicking.
+    If dry_run=False, performs the actual click.
+    """
+    from services.dev_agent.computer_use import execute_computer_action, _take_screenshot
+
+    result: dict[str, Any] = {"query": query, "dry_run": dry_run, "steps": []}
+
+    # Step 1: Take screenshot and get actual dimensions
+    screenshot_b64 = _take_screenshot()
+    if screenshot_b64:
+        try:
+            import io, base64
+            from PIL import Image
+            img_bytes = base64.b64decode(screenshot_b64)
+            img = Image.open(io.BytesIO(img_bytes))
+            result["screenshot_size"] = {"width": img.size[0], "height": img.size[1]}
+            result["steps"].append(f"Screenshot captured: {img.size[0]}x{img.size[1]}")
+        except Exception as e:
+            result["steps"].append(f"Screenshot dimension decode failed: {e}")
+    else:
+        result["steps"].append("Screenshot capture failed")
+        return result
+
+    # Step 2: Get native screen info
+    screens_info = await execute_computer_action(action="list_screens", text="", x=None, y=None)
+    screens = screens_info.get("screens", [])
+    result["screens"] = [{k: v for k, v in s.items() if k != "thumbnail"} for s in screens]
+    if screens:
+        total_w = max(s["x"] + s["width"] for s in screens)
+        total_h = max(s["y"] + s["height"] for s in screens)
+        result["native_total"] = {"width": total_w, "height": total_h}
+        if result.get("screenshot_size"):
+            scale_x = total_w / result["screenshot_size"]["width"]
+            scale_y = total_h / result["screenshot_size"]["height"]
+            result["scale_factors"] = {"x": round(scale_x, 4), "y": round(scale_y, 4)}
+            result["steps"].append(f"Scale factors: x={scale_x:.4f}, y={scale_y:.4f}")
+    else:
+        result["steps"].append("No screens detected")
+
+    # Step 3: Find element (uses per-screen detection for accuracy)
+    if query:
+        find_result = await execute_computer_action(action="find_ui_element", text=query, x=None, y=None)
+        result["find_success"] = find_result.get("success", False)
+        result["find_output"] = find_result.get("output", "")
+        el = find_result.get("element")
+        if el:
+            result["element"] = {k: v for k, v in el.items() if k not in ("thumbnail", "screenshot")}
+
+            # Prefer pre-computed native_center from per-screen detection
+            native_center = el.get("native_center")
+            if native_center and len(native_center) >= 2:
+                click_x, click_y = int(native_center[0]), int(native_center[1])
+                result["would_click_at"] = {"x": click_x, "y": click_y}
+                result["steps"].append(f"Per-screen native coords: ({click_x}, {click_y}) on '{el.get('screen_name', '?')}'")
+            else:
+                # Legacy fallback
+                center = el.get("center")
+                if center and len(center) >= 2 and "scale_factors" in result:
+                    click_x = int(center[0] * result["scale_factors"]["x"])
+                    click_y = int(center[1] * result["scale_factors"]["y"])
+                    result["would_click_at"] = {"x": click_x, "y": click_y}
+                    result["steps"].append(f"Legacy scale: ({center[0]:.1f}, {center[1]:.1f}) → ({click_x}, {click_y})")
+
+            if not dry_run and "would_click_at" in result:
+                cx, cy = result["would_click_at"]["x"], result["would_click_at"]["y"]
+                click_result = await execute_computer_action(action="click", text="", x=cx, y=cy)
+                result["click_result"] = {
+                    "success": click_result.get("success", False),
+                    "output": click_result.get("output", ""),
+                }
+                result["steps"].append(f"Clicked at ({cx}, {cy}): {click_result.get('output', '')}")
+        else:
+            result["steps"].append(f"Element '{query}' not found")
+
+    return result
+
+
 # ── Unified tool endpoint (mirrors tool-executor pattern) ────────────────────
 
 @app.post("/internal/dev-agent/execute")

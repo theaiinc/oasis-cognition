@@ -107,11 +107,17 @@ def _ocr_locate(
 
     for region in ocr_results:
         text = region["text"].strip()
+        if len(text) < 2:
+            continue  # skip single-character OCR noise
         text_lower = text.lower()
 
         # Exact substring match (highest confidence)
-        if query_lower in text_lower or text_lower in query_lower:
+        # Require the shorter string to be at least 3 chars to avoid spurious matches
+        shorter_len = min(len(query_lower), len(text_lower))
+        if shorter_len >= 3 and (query_lower in text_lower or text_lower in query_lower):
             similarity = 1.0 if query_lower == text_lower else 0.9
+        elif query_lower == text_lower:
+            similarity = 1.0
         else:
             # Fuzzy match
             similarity = SequenceMatcher(None, query_lower, text_lower).ratio()
@@ -248,10 +254,30 @@ def ground_element(
         text_threshold=text_threshold,
     )
 
-    # Combine: OCR matches first (more reliable for text), then DINO
+    # Penalize GroundingDINO detections that cover unreasonably large areas
+    # (a bbox covering >25% of the image is not a specific UI element)
+    for d in dino_matches:
+        bbox = d["bbox"]
+        area = (bbox[2] - bbox[0]) * (bbox[3] - bbox[1])
+        # Estimate image area from bbox coords (rough — works for typical screenshots)
+        img_area_est = max(bbox[2], 1024) * max(bbox[3], 768)
+        area_ratio = area / img_area_est if img_area_est > 0 else 0
+        if area_ratio > 0.25:
+            d["score"] = d["score"] * 0.3  # heavy penalty for huge bboxes
+            logger.debug("Ground '%s': penalized DINO detection (area_ratio=%.2f, new_score=%.3f)",
+                         query, area_ratio, d["score"])
+
+    # Combine: prefer OCR matches (more reliable for text UI elements)
+    # If we have ANY OCR matches, boost them slightly to prefer over low-quality DINO
+    if ocr_matches:
+        for m in ocr_matches:
+            m["score"] = min(1.0, m["score"] * 1.15)  # slight boost for OCR
+
     combined = ocr_matches + dino_matches
     combined.sort(key=lambda d: d["score"], reverse=True)
 
-    logger.info("Ground '%s': %d OCR + %d DINO = %d total",
-                query, len(ocr_matches), len(dino_matches), len(combined))
+    logger.info("Ground '%s': %d OCR + %d DINO = %d total (top=%s %.3f)",
+                query, len(ocr_matches), len(dino_matches), len(combined),
+                combined[0]["method"] if combined else "none",
+                combined[0]["score"] if combined else 0)
     return combined

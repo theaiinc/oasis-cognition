@@ -676,6 +676,25 @@ export class ComputerUseController {
 
     if (completedSteps.length < 2) return;
 
+    // Don't store skills from sessions that had failures or used unknown actions
+    const validActions = new Set([
+      'navigate', 'click', 'scroll', 'type', 'key_press', 'open_app',
+      'read_screen', 'read_page', 'click_screen', 'wait', 'hotkey',
+      'execute_plan', 'done', 'skip', 'switch_tab',
+    ]);
+    const hasUnknownActions = session.plan.some(s =>
+      s.output?.includes('Unknown action') || !validActions.has(s.action || ''),
+    );
+    const hasTooManyFailures = session.plan.filter(s => s.status === 'failed').length >= 2;
+    const hasReadScreenSpam = session.plan.filter(s =>
+      s.action === 'read_screen' && s.description?.includes('Checking if goal'),
+    ).length > 5;
+
+    if (hasUnknownActions || hasTooManyFailures || hasReadScreenSpam) {
+      this.logger.log(`Skipping skill creation — session had quality issues (unknown=${hasUnknownActions}, failures=${hasTooManyFailures}, spam=${hasReadScreenSpam})`);
+      return;
+    }
+
     try {
       await axios.post(`${MEMORY_URL}/internal/memory/cu/skill`, {
         name: session.goal.slice(0, 100),
@@ -1503,6 +1522,7 @@ CRITICAL RULES:
     const actionHistory: string[] = [];
     let prevPageText = '';
     let extraStepsUsed = 0;
+    let consecutiveGoalRejections = 0;
 
     // Launch the always-on-top overlay window via dev-agent
     try {
@@ -1701,24 +1721,32 @@ CRITICAL RULES:
         // Verify the goal was ACTUALLY achieved before marking done
         const goalVerified = await this.checkGoalSatisfaction(sessionId, session.goal, session.plan);
         if (!goalVerified) {
-          this.logger.warn(`LLM claimed "done" but goal verification FAILED — continuing execution`);
-          // Don't mark done — let the loop continue to try more steps
-          step.description = `Goal verification failed: ${target}`;
-          actionHistory.push(`${session.current_step + 1}. DONE_REJECTED: goal not verified`);
-          session.current_step++;
-          session.updated_at = new Date().toISOString();
-          extraStepsUsed++;
-          if (session.current_step >= session.plan.length && extraStepsUsed < MAX_EXTRA_STEPS) {
-            session.plan.push({
-              index: session.plan.length,
-              description: 'Previous done claim was rejected — retrying goal...',
-              action: 'read_screen',
-              target: '',
-              status: 'pending',
-            });
+          consecutiveGoalRejections++;
+          this.logger.warn(`LLM "done" rejected (${consecutiveGoalRejections}/3) — goal not verified`);
+
+          // After 3 consecutive rejections, accept the result as-is to avoid infinite loops
+          if (consecutiveGoalRejections >= 3) {
+            this.logger.warn(`Goal verification failed 3 times — completing session as-is`);
+            // Fall through to the completion handler below
+          } else {
+            step.description = `Goal verification failed: ${target}`;
+            actionHistory.push(`${session.current_step + 1}. DONE_REJECTED: goal not verified (${consecutiveGoalRejections}/3)`);
+            session.current_step++;
+            session.updated_at = new Date().toISOString();
+            extraStepsUsed++;
+            if (session.current_step >= session.plan.length && extraStepsUsed < MAX_EXTRA_STEPS) {
+              session.plan.push({
+                index: session.plan.length,
+                description: 'Previous done claim was rejected — retrying goal...',
+                action: 'read_screen',
+                target: '',
+                status: 'pending',
+              });
+            }
+            continue;
           }
-          continue;
         }
+        consecutiveGoalRejections = 0; // Reset on verified success
 
         step.status = 'completed';
         step.output = target;
@@ -3383,7 +3411,9 @@ CRITICAL RULES:
 
     switch (action) {
       case 'navigate': {
-        const url = target.startsWith('http') ? target : `https://${target}`;
+        // Strip quotes and whitespace the LLM sometimes wraps around URLs
+        const cleanTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+        const url = cleanTarget.startsWith('http') ? cleanTarget : `https://${cleanTarget}`;
         this.logger.log(`Navigate: ${url}`);
 
         const session2 = sessions.get(sid);
@@ -3801,6 +3831,27 @@ CRITICAL RULES:
         await new Promise(r => setTimeout(r, 300));
         const scrollScreen = await this.getScreenImage(sid);
         return { output: `Scrolled ${target || 'down'}`, screenshot: scrollScreen };
+      }
+
+      case 'switch_tab': {
+        // Switch to a Chrome tab matching the target text
+        if (!target) return { output: 'switch_tab requires target tab name' };
+        const cleanTabTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+        try {
+          const tabRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'chrome_set_url',
+            text: cleanTabTarget, // Chrome Bridge will match by tab title
+          }, { timeout: 10000 });
+          // If that doesn't work, try clicking on the tab via UI
+          if (!tabRes.data?.success) {
+            await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'click_ui_element', text: cleanTabTarget,
+            }, { timeout: 15000 }).catch(() => null);
+          }
+        } catch { /* continue */ }
+        await new Promise(r => setTimeout(r, 500));
+        const tabScreen = await this.getScreenImage(sid);
+        return { output: `Switched to tab: ${cleanTabTarget}`, screenshot: tabScreen };
       }
 
       default: {

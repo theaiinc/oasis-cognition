@@ -360,14 +360,52 @@ async function handleCommand(msg) {
       }
 
       case "set_url": {
-        const tab = await findTargetTab(payload.url_hint);
-        if (!tab || !tab.id) {
-          sendResponse(id, command, false, null, "No suitable tab found");
+        if (payload.new_tab) {
+          // Create a new tab in the current window (keeps all CU tabs together)
+          const newTab = await chrome.tabs.create({ url: payload.url, active: true });
+          if (newTab.windowId) {
+            await chrome.windows.update(newTab.windowId, { focused: true });
+          }
+          sendResponse(id, command, true, { url: payload.url, tab_id: newTab.id, new_tab: true });
+        } else {
+          const tab = await findTargetTab(payload.url_hint);
+          if (!tab || !tab.id) {
+            // No matching tab — create new instead of failing
+            const newTab = await chrome.tabs.create({ url: payload.url, active: true });
+            sendResponse(id, command, true, { url: payload.url, tab_id: newTab.id, new_tab: true });
+            return;
+          }
+          await chrome.tabs.update(tab.id, { url: payload.url, active: true });
+          await chrome.windows.update(tab.windowId, { focused: true });
+          sendResponse(id, command, true, { url: payload.url, tab_id: tab.id });
+        }
+        break;
+      }
+
+      case "switch_tab": {
+        // Activate an existing tab by matching title or URL substring
+        const query = (payload.query || payload.text || "").toLowerCase();
+        if (!query) {
+          sendResponse(id, command, false, null, "switch_tab requires query (tab title or URL fragment)");
           return;
         }
-        await chrome.tabs.update(tab.id, { url: payload.url, active: true });
-        await chrome.windows.update(tab.windowId, { focused: true });
-        sendResponse(id, command, true, { url: payload.url, tab_id: tab.id });
+        const allTabs = await chrome.tabs.query({});
+        const match = allTabs.find(t => {
+          const title = (t.title || "").toLowerCase();
+          const url = (t.url || "").toLowerCase();
+          return title.includes(query) || url.includes(query);
+        });
+        if (match && match.id) {
+          await chrome.tabs.update(match.id, { active: true });
+          await chrome.windows.update(match.windowId, { focused: true });
+          sendResponse(id, command, true, {
+            tab_id: match.id,
+            title: match.title,
+            url: match.url,
+          });
+        } else {
+          sendResponse(id, command, false, null, `No tab matching "${query}"`);
+        }
         break;
       }
 
@@ -385,6 +423,24 @@ async function handleCommand(msg) {
           payload.index,
         );
         sendResponse(id, command, clickResult.success, clickResult, clickResult.error);
+        break;
+      }
+
+      case "type_text": {
+        // Type text into the currently focused element using execCommand('insertText').
+        // Works with contenteditable divs (Facebook, Twitter, etc.) and regular inputs.
+        const tab = await findTargetTab(payload.url_hint);
+        if (!tab || !tab.id) {
+          sendResponse(id, command, false, null, "No suitable tab found");
+          return;
+        }
+        await ensureContentScript(tab.id);
+        const typeResult = await chrome.tabs.sendMessage(tab.id, {
+          command: "type_text",
+          text: payload.text,
+          selector: payload.selector, // optional: focus this element first
+        });
+        sendResponse(id, command, typeResult?.success ?? false, typeResult?.payload, typeResult?.error);
         break;
       }
 

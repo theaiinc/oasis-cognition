@@ -887,6 +887,8 @@ export class ComputerUseController {
       `IMPORTANT:\n` +
       `- PREFER native desktop apps over browser. If ChatGPT/Claude/Slack/Discord/etc. has a desktop app, use open_app — do NOT navigate to the website.\n` +
       `- Only use navigate/browser when there is NO native app for the service.\n` +
+      `- BROWSER-ONLY (use navigate, NOT open_app): Facebook, GitHub, Twitter/X, LinkedIn, Reddit, Google, Amazon, YouTube, any website\n` +
+      `- NATIVE APP (use open_app): ChatGPT, Claude, Slack, Discord, Finder, Notes, Terminal, Mail, Messages\n` +
       `- For native apps: open_app → read_screen → click_screen\n\n` +
       `EFFICIENCY RULES (these are critical):\n` +
       `1. Generate 3-6 steps. Fewer is better. Every step costs time.\n` +
@@ -903,7 +905,7 @@ export class ComputerUseController {
       `   Example: To type in ChatGPT → click_screen "Message ChatGPT input" THEN type "your query"\n` +
       `   Example: To type in a search bar → click_screen "Search" THEN type "search term"\n` +
       `7. One "read_screen" is enough per page — do NOT repeat read_screen unless you scrolled.\n` +
-      `8. Only scroll if you have evidence the content continues below the fold. Don't preemptively scroll.\n` +
+      `8. SCROLL UP FIRST when looking for elements (nav bars, inputs, post buttons are usually above). Only scroll DOWN if up finds nothing.\n` +
       `9. Plans execute LINEARLY — NO conditional logic.\n\n` +
       `OTHER RULES:\n` +
       `- NEVER include login/signup/authentication steps. Assume the user is already logged in.\n` +
@@ -1501,7 +1503,9 @@ CRITICAL RULES:
 4. If a click has NO EFFECT, NEVER repeat. Try different approach.
 5. "done" requires REAL EVIDENCE. Show what changed.
 6. key_press works in the currently focused app.
-7. After open_app, the screen shows OCR text from the native app — use click_screen to interact.`;
+7. After open_app, the screen shows OCR text from the native app — use click_screen to interact.
+8. SCROLL PREFERENCE: When looking for an element, scroll UP first (nav bars, inputs, buttons are usually above). Only scroll DOWN if scrolling up finds nothing. Never scroll more than 3 times in the same direction without taking an action.
+9. NEVER do consecutive read_screen or scroll without a real action (click, type, navigate) in between. If you can't find what you need after 2 reads, take a concrete action.`;
 
   private async executeAdaptiveLoop(sessionId: string): Promise<void> {
     const session = sessions.get(sessionId);
@@ -1518,7 +1522,8 @@ CRITICAL RULES:
     const researchCtx = (session as any)._research || '';
     // Query Neo4j for relevant CU rules
     const lessonsCtx = await this.queryMemoryForCU(session.goal);
-    const MAX_EXTRA_STEPS = 15; // max adaptive steps beyond the original plan
+    const MAX_EXTRA_STEPS = 8; // max adaptive steps beyond the original plan
+    let consecutiveReadScreens = 0; // track read_screen spam
     const actionHistory: string[] = [];
     let prevPageText = '';
     let extraStepsUsed = 0;
@@ -1526,22 +1531,11 @@ CRITICAL RULES:
 
     // Launch the always-on-top overlay window via dev-agent
     try {
-      // Only launch overlay if not already showing this session
-      // (avoid killing the overlay that's already displaying the plan)
-      const overlayCheck = await axios.get(
-        `${DEV_AGENT_URL}/cu-overlay/active-session`,
-        { timeout: 3000 },
-      ).catch(() => null);
-      const overlaySession = overlayCheck?.data?.session?.session_id;
-      if (overlaySession !== sessionId) {
-        await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-overlay/launch`, {
-          session_id: sessionId,
-          gateway_port: '8000',
-        }, { timeout: 5000 });
-        this.logger.log(`CU overlay launched for session ${sessionId}`);
-      } else {
-        this.logger.log(`CU overlay already showing session ${sessionId}`);
-      }
+      await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-overlay/launch`, {
+        session_id: sessionId,
+        gateway_port: '8000',
+      }, { timeout: 5000 });
+      this.logger.log(`CU overlay launched for session ${sessionId}`);
     } catch { /* overlay not available — not critical */ }
 
     // Walk through each planned step
@@ -1666,46 +1660,58 @@ CRITICAL RULES:
       step.started_at = new Date().toISOString();
       session.updated_at = new Date().toISOString();
 
-      // If using a learned skill, TRUST the plan — execute steps directly without LLM re-evaluation.
-      // Skills have proven success rates; the LLM adaptive loop often misidentifies apps and derails.
+      // 2. Ask the LLM: should we execute this step as-is, adapt, or skip?
+      // Even for skill-sourced plans, the LLM validates each step against the current screen.
+      // Skills provide the PLAN (fast, no LLM planning call), but each step is still validated.
       const isSkillPlan = !!(session as any)._active_skill_id;
+      const skillHint = isSkillPlan
+        ? `\nNOTE: This plan comes from a LEARNED SKILL with a proven success rate. ` +
+          `Prefer executing the planned step as-is unless the screen clearly shows it won't work. ` +
+          `Do NOT change the action type unless absolutely necessary.\n`
+        : '';
+
+      // Build progress overview — what's been done and what's left
+      const completedSummary = session.plan
+        .filter(s => s.status === 'completed' && s.action !== 'read_screen')
+        .map(s => `  ✓ ${s.action}: ${(s.description || '').slice(0, 60)}`)
+        .join('\n');
+      const progressOverview = completedSummary
+        ? `\nPROGRESS SO FAR:\n${completedSummary}\n`
+        : '';
+
+      const userPrompt =
+        `GOAL: ${session.goal}\n\n` +
+        (researchCtx ? `RESEARCH:\n${researchCtx.slice(0, 1500)}\n\n` : '') +
+        lessonsCtx +
+        skillHint +
+        progressOverview +
+        (actionHistory.length > 0 ? `RECENT ACTIONS:\n${actionHistory.slice(-5).join('\n')}\n\n` : '') +
+        `CURRENT PLANNED STEP (${session.current_step + 1}/${session.plan.length}):\n` +
+        `  Action: ${step.action}\n` +
+        `  Target: ${step.target || '(none)'}\n` +
+        `  Description: ${step.description}\n\n` +
+        (remainingSteps ? `REMAINING PLAN:\n${remainingSteps}\n\n` : '') +
+        pageChangeNote +
+        stuckNote +
+        `CURRENT PAGE:\n${pageText.slice(0, 5000)}\n\n` +
+        `IMPORTANT: Focus on the REMAINING plan steps. Do NOT repeat actions already completed above. ` +
+        `If a tab or page was already opened, use switch_tab to return to it instead of re-navigating.\n\n` +
+        `Should the planned step be executed as-is, adapted, or skipped?`;
 
       let llmResponse = '';
-      if (isSkillPlan) {
-        // Execute the planned step directly — no LLM mediation
-        llmResponse = `THOUGHT: Executing learned skill step ${session.current_step + 1}: ${step.description}\nACTION: execute_plan\nTARGET: ${step.target || step.description}`;
-        this.logger.log(`Skill step ${session.current_step + 1}: executing "${step.action}" directly (no LLM)`);
-      } else {
-        // Normal adaptive loop — ask LLM to evaluate
-        const userPrompt =
-          `GOAL: ${session.goal}\n\n` +
-          (researchCtx ? `RESEARCH:\n${researchCtx.slice(0, 1500)}\n\n` : '') +
-          lessonsCtx +
-          (actionHistory.length > 0 ? `ACTIONS COMPLETED:\n${actionHistory.slice(-8).join('\n')}\n\n` : '') +
-          `CURRENT PLANNED STEP (${session.current_step + 1}/${session.plan.length}):\n` +
-          `  Action: ${step.action}\n` +
-          `  Target: ${step.target || '(none)'}\n` +
-          `  Description: ${step.description}\n\n` +
-          (remainingSteps ? `REMAINING PLAN:\n${remainingSteps}\n\n` : '') +
-          pageChangeNote +
-          stuckNote +
-          `CURRENT PAGE:\n${pageText.slice(0, 5000)}\n\n` +
-          `Should the planned step be executed as-is, adapted, or skipped?`;
-
-        try {
-          const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
-            user_message: userPrompt,
-            context: { system_override: ComputerUseController.REACT_SYSTEM, max_tokens: 512 },
-          }, { timeout: LLM_TIMEOUT_MS });
-          llmResponse = res.data?.response_text || res.data?.response || '';
-        } catch (err: any) {
-          this.logger.error(`Adaptive LLM failed: ${err.message}`);
-          step.status = 'failed';
-          step.output = `LLM error: ${err.message}`;
-          step.completed_at = new Date().toISOString();
-          session.current_step++;
-          continue;
-        }
+      try {
+        const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+          user_message: userPrompt,
+          context: { system_override: ComputerUseController.REACT_SYSTEM, max_tokens: 512 },
+        }, { timeout: LLM_TIMEOUT_MS });
+        llmResponse = res.data?.response_text || res.data?.response || '';
+      } catch (err: any) {
+        this.logger.error(`Adaptive LLM failed: ${err.message}`);
+        step.status = 'failed';
+        step.output = `LLM error: ${err.message}`;
+        step.completed_at = new Date().toISOString();
+        session.current_step++;
+        continue;
       }
 
       // 3. Parse response
@@ -1879,6 +1885,23 @@ CRITICAL RULES:
       session.current_step++;
       session.updated_at = new Date().toISOString();
 
+      // Track consecutive read_screen/scroll steps (no real progress)
+      if (['read_screen', 'read_page', 'scroll'].includes(execAction)) {
+        consecutiveReadScreens++;
+      } else {
+        consecutiveReadScreens = 0;
+      }
+
+      // If 4 consecutive read_screen/scroll with no real action → agent is stuck, stop
+      if (consecutiveReadScreens >= 4) {
+        this.logger.warn(`Agent stuck: ${consecutiveReadScreens} consecutive read/scroll steps — stopping`);
+        session.status = 'completed';
+        session.error = 'Agent stopped making progress (consecutive read/scroll without action). Partial completion.';
+        session.updated_at = new Date().toISOString();
+        this.generateSessionSummary(sessionId).catch(() => {});
+        return;
+      }
+
       // If we've run out of planned steps but the goal might not be done,
       // add one final check step
       if (session.current_step >= session.plan.length && extraStepsUsed < MAX_EXTRA_STEPS) {
@@ -1892,9 +1915,7 @@ CRITICAL RULES:
         extraStepsUsed++;
       }
 
-      // Delay between steps — longer for skill execution to let UI settle
-      const stepDelay = isSkillPlan ? 1500 : 500;
-      await new Promise(r => setTimeout(r, stepDelay));
+      await new Promise(r => setTimeout(r, 500));
     }
 
     // All steps done
@@ -3462,37 +3483,44 @@ CRITICAL RULES:
             try { (session2 as any)._work_url_hint = new URL(url).hostname; } catch { /* ignore */ }
           }
         } else {
-          // Subsequent navigates: use AppleScript to set URL in the work window.
-          // This avoids Cmd+L which might hit the wrong Chrome window.
-          // Find the work window by URL hint, then set its active tab URL.
-          const workHint = (session2 as any)?._work_url_hint || '';
+          // Subsequent navigates: check if the URL domain differs from the current page.
+          // If different domain → open NEW TAB (keeps both pages accessible via switch_tab).
+          // If same domain → reuse existing tab.
+          const currentHint = (session2 as any)?._work_url_hint || '';
+          let newDomain = true;
+          try {
+            const urlHost = new URL(url).hostname;
+            newDomain = !currentHint || !urlHost.includes(currentHint.split('/')[0]);
+          } catch { /* assume new domain */ }
+
           try {
             await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
               tool: 'computer_action',
               action: 'chrome_set_url',
               text: url,
-              url_hint: workHint,
+              url_hint: newDomain ? undefined : currentHint,
+              new_tab: newDomain, // Open new tab for different domains
             }, { timeout: 15000 });
-            this.logger.log(`chrome_set_url: navigated work window to ${url}`);
+            this.logger.log(`Navigate: ${newDomain ? 'new tab' : 'same tab'} → ${url}`);
           } catch (err: any) {
-            this.logger.warn(`chrome_set_url failed, falling back to focus+Cmd+L: ${err.message}`);
-            // Fallback: focus Chrome and type URL
+            this.logger.warn(`Chrome Bridge navigate failed: ${err.message}`);
+            // Fallback: AppleScript direct navigation
             try {
-              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
-                { tool: 'computer_action', action: 'focus_window', text: 'Google Chrome' },
-                { timeout: 5000 });
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'focus_window', text: 'Google Chrome',
+              }, { timeout: 5000 });
               await new Promise(r => setTimeout(r, 200));
-              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
-                { tool: 'computer_action', action: 'hotkey', keys: [hostModifier(), 'l'] },
-                { timeout: ACTION_TIMEOUT_MS });
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'hotkey', keys: [hostModifier(), 'l'],
+              }, { timeout: ACTION_TIMEOUT_MS });
               await new Promise(r => setTimeout(r, 300));
-              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
-                { tool: 'computer_action', action: 'type_text', text: url },
-                { timeout: ACTION_TIMEOUT_MS });
-              await new Promise(r => setTimeout(r, 300));
-              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
-                { tool: 'computer_action', action: 'key_press', key: 'enter' },
-                { timeout: ACTION_TIMEOUT_MS });
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'type_text', text: url,
+              }, { timeout: ACTION_TIMEOUT_MS });
+              await new Promise(r => setTimeout(r, 200));
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'key_press', key: 'enter',
+              }, { timeout: ACTION_TIMEOUT_MS });
             } catch { /* best effort */ }
           }
 
@@ -3580,6 +3608,59 @@ CRITICAL RULES:
       case 'type': {
         if (!target) return { output: 'type action requires target text' };
 
+        // If the type target looks like a composition request (post, message, email)
+        // rather than a literal string (URL, search query, short command), compose
+        // proper content using the LLM with data collected from previous steps.
+        const typeSessCtx = sessionId ? sessions.get(sessionId) : undefined;
+        const goalLower = (typeSessCtx?.goal || '').toLowerCase();
+        const descLower = (step.description || '').toLowerCase();
+        // Compose content when the goal/step involves creating posts, messages, or content
+        // that should reference collected data. Skip for simple inputs (URLs, search queries).
+        const isComposition = (
+          descLower.match(/compose|post|write|draft|content|vietnamese|message/) ||
+          goalLower.match(/compose.*post|write.*post|post.*on.*facebook|post.*on.*homepage|vietnamese/)
+        ) && !target.match(/^https?:\/\//) // Don't compose URLs
+          && !descLower.match(/search|url|navigate/); // Don't compose search queries
+
+        let textToType = target;
+        if (isComposition && typeSessCtx) {
+          try {
+            // Collect data from previous read_screen steps
+            const collectedData = typeSessCtx.plan
+              .filter(s => s.status === 'completed' && s.output && ['read_screen', 'read_page', 'navigate'].includes(s.action || ''))
+              .map(s => s.output!)
+              .join('\n---\n')
+              .slice(0, 3000);
+
+            const composeRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+              user_message:
+                `GOAL: ${typeSessCtx.goal}\n\n` +
+                `DATA COLLECTED FROM PREVIOUS STEPS:\n${collectedData}\n\n` +
+                `CURRENT TASK: Compose the text content to type.\n` +
+                `The user wants to type this on: ${step.description || 'a text field'}\n\n` +
+                `RULES:\n` +
+                `- Write the ACTUAL content to type, not instructions about what to type\n` +
+                `- If the goal mentions a specific language (Vietnamese, etc.), write in that language\n` +
+                `- If posting on social media, write an engaging post referencing the collected data\n` +
+                `- If the goal says "this post was done by CU agent" or similar, include that mention\n` +
+                `- Keep it natural and human-sounding\n` +
+                `- Output ONLY the text to type, nothing else — no quotes, no labels, no explanation\n`,
+              context: {
+                system_override: 'You compose text content. Output ONLY the text to type. No quotes, no labels, no markdown.',
+                max_tokens: 500,
+              },
+            }, { timeout: 20000 });
+
+            const composed = (composeRes.data?.response_text || composeRes.data?.response || '').trim();
+            if (composed && composed.length > 20) {
+              textToType = composed;
+              this.logger.log(`type: composed ${textToType.length} chars of content`);
+            }
+          } catch (err: any) {
+            this.logger.debug(`Content composition failed: ${err.message} — using original target`);
+          }
+        }
+
         // Before typing, ensure the input field is focused.
         // Strategy:
         //   1. If a native app is open, try Cmd+N (new chat/document) to get a fresh input
@@ -3640,16 +3721,33 @@ CRITICAL RULES:
           await new Promise(r => setTimeout(r, 300));
         }
 
-        // Type the text
-        await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
-          {
-            tool: 'computer_action', action: 'type_text', text: target,
-            ...(nativeApp ? { app: nativeApp } : {}),
-          },
-          { timeout: ACTION_TIMEOUT_MS });
+        // Type the text — use Chrome Bridge for browser pages (handles contenteditable),
+        // AppleScript keystroke for native apps
+        let typeSuccess = false;
+        if (!nativeApp) {
+          // Browser mode: try Chrome Bridge type_text (works with contenteditable like Facebook)
+          try {
+            const bridgeRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'chrome_bridge_type', text: textToType,
+            }, { timeout: 15000 });
+            if (bridgeRes.data?.success) {
+              this.logger.log(`type: Chrome Bridge typed ${textToType.length} chars`);
+              typeSuccess = true;
+            }
+          } catch { /* fallback */ }
+        }
+        if (!typeSuccess) {
+          // Native app or Chrome Bridge fallback: AppleScript keystroke
+          await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
+            {
+              tool: 'computer_action', action: 'type_text', text: textToType,
+              ...(nativeApp ? { app: nativeApp } : {}),
+            },
+            { timeout: ACTION_TIMEOUT_MS });
+        }
         await new Promise(r => setTimeout(r, 300));
 
-        // Press Enter to send (for chat apps, the user almost always wants to send)
+        // Press Enter to send (for chat apps only — NOT for social media posts)
         const typeSess = sessionId ? sessions.get(sessionId) : undefined;
         const nApp = (typeSess as any)?._native_app_mode;
         if (nApp) {
@@ -3658,15 +3756,15 @@ CRITICAL RULES:
             await new Promise(r => setTimeout(r, 500));
             await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
               tool: 'computer_action', action: 'key_press', key: 'enter',
+              app: nApp,
             }, { timeout: 5000 }).catch(() => {});
             this.logger.log(`type: auto-pressed Enter to send in ${nApp}`);
-            // Wait for response to start rendering
             await new Promise(r => setTimeout(r, 3000));
           }
         }
 
         const typeScreen = await this.getScreenImage(sid);
-        return { output: `Typed and sent: ${target.slice(0, 80)}`, screenshot: typeScreen };
+        return { output: `Typed: ${textToType.slice(0, 120)}`, screenshot: typeScreen };
       }
 
       case 'key_press': {
@@ -3694,6 +3792,28 @@ CRITICAL RULES:
 
       case 'open_app': {
         if (!target) return { output: 'open_app requires app name' };
+
+        // Redirect browser-only services to navigate instead of trying to open as native app
+        const browserOnlyMap: Record<string, string> = {
+          'facebook': 'https://www.facebook.com',
+          'github': 'https://github.com',
+          'twitter': 'https://twitter.com',
+          'x': 'https://x.com',
+          'linkedin': 'https://www.linkedin.com',
+          'reddit': 'https://www.reddit.com',
+          'youtube': 'https://www.youtube.com',
+          'google': 'https://www.google.com',
+          'instagram': 'https://www.instagram.com',
+        };
+        const targetLower = target.toLowerCase().replace(/\s*(app|desktop)\s*/g, '').trim();
+        const browserUrl = browserOnlyMap[targetLower];
+        if (browserUrl) {
+          this.logger.log(`open_app "${target}" → redirecting to navigate ${browserUrl} (browser-only service)`);
+          return this.executeComputerAction(
+            { ...step, action: 'navigate', target: browserUrl } as PlanStep,
+            sessionId,
+          );
+        }
 
         // Determine which screen to open the app on.
         // Use the session's capture target screen, or default to screen 0 (primary).
@@ -3802,16 +3922,97 @@ CRITICAL RULES:
       case 'click_screen': {
         // Native screen click — uses screenshot + ui_parser to find element, then clicks at screen coordinates
         if (!target) return { output: 'click_screen requires element description' };
-        // Use click_ui_element which tries Chrome Bridge → ui_parser → pixel fallback
-        const clickRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-          tool: 'computer_action',
-          action: 'click_ui_element',
-          text: target,
-        }, { timeout: 20000 });
+        const cleanClickTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+
+        // Pre-publish check: if clicking a "Post/Publish/Submit" button, read the
+        // composed content first and verify it's not duplicated or malformed.
+        const isPublishClick = cleanClickTarget.toLowerCase().match(/^post$|publish|submit|send post/);
+        if (isPublishClick) {
+          try {
+            // Read the current page text to check for duplicated content
+            const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'get_page_text',
+            }, { timeout: 10000 });
+            const pageText = (pageRes.data?.output || '') as string;
+
+            // Check for obvious duplication (same sentence appearing twice)
+            const sentences = pageText.split(/[.!?。]\s+/).filter(s => s.length > 30);
+            const seen = new Set<string>();
+            let hasDuplication = false;
+            for (const s of sentences) {
+              const norm = s.toLowerCase().trim().slice(0, 80);
+              if (seen.has(norm)) { hasDuplication = true; break; }
+              seen.add(norm);
+            }
+
+            if (hasDuplication) {
+              this.logger.warn(`Pre-publish check: DUPLICATION detected — clearing and retyping`);
+              // Clear the contenteditable and retype without duplication
+              const clickSessCtx = sessionId ? sessions.get(sessionId) : undefined;
+              const lastTypedStep = clickSessCtx?.plan
+                ?.filter(s => s.status === 'completed' && s.action === 'type')
+                ?.pop();
+              if (lastTypedStep?.output) {
+                // Extract the text that was typed (after "Typed: ")
+                const typedText = lastTypedStep.output.replace(/^Typed:\s*/i, '').trim();
+                if (typedText) {
+                  await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                    tool: 'computer_action', action: 'chrome_bridge_type', text: typedText,
+                  }, { timeout: 15000 }).catch(() => {});
+                  await new Promise(r => setTimeout(r, 500));
+                  this.logger.log(`Pre-publish: re-typed content without duplication`);
+                }
+              }
+            } else {
+              this.logger.log(`Pre-publish check: content looks clean`);
+            }
+          } catch { /* continue with publish */ }
+        }
+
+        // 0. Focus the active app/browser first to prevent cross-screen mouse chaos
+        const clickSess = sessionId ? sessions.get(sessionId) : undefined;
+        const clickApp = (clickSess as any)?._native_app_mode;
+        if (clickApp) {
+          await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'focus_window', text: clickApp,
+          }, { timeout: 5000 }).catch(() => {});
+        } else {
+          // Browser mode — focus Chrome
+          await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'focus_window', text: 'Google Chrome',
+          }, { timeout: 5000 }).catch(() => {});
+        }
+        await new Promise(r => setTimeout(r, 300));
+
+        // 1. Try Chrome Bridge DOM click first (trusted events — works on Facebook, etc.)
+        let domClicked = false;
+        try {
+          const domRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action',
+            action: 'chrome_bridge_click',
+            text: cleanClickTarget,
+          }, { timeout: 10000 });
+          if (domRes.data?.success) {
+            this.logger.log(`click_screen: DOM click succeeded for "${cleanClickTarget.slice(0, 40)}"`);
+            domClicked = true;
+          }
+        } catch { /* fallback to pixel click */ }
+
+        // 2. Fallback: pixel click via click_ui_element (OCR/GroundingDINO)
+        if (!domClicked) {
+          await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action',
+            action: 'click_ui_element',
+            text: cleanClickTarget,
+          }, { timeout: 20000 }).catch(() => null);
+        }
+
         await new Promise(r => setTimeout(r, 800));
         const clickScreen = await this.getScreenImage(sid);
         return {
-          output: clickRes.data?.output || `Clicked "${target}" on screen`,
+          output: domClicked
+            ? `Clicked "${cleanClickTarget}" via DOM`
+            : `Clicked "${cleanClickTarget}" on screen`,
           screenshot: clickScreen,
         };
       }
@@ -3834,24 +4035,48 @@ CRITICAL RULES:
       }
 
       case 'switch_tab': {
-        // Switch to a Chrome tab matching the target text
-        if (!target) return { output: 'switch_tab requires target tab name' };
+        // Activate an existing Chrome tab by title or URL match (no navigation)
+        if (!target) return { output: 'switch_tab requires target tab name or URL' };
         const cleanTabTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+
+        let switched = false;
+        // 1. Try Chrome Bridge switch_tab command (activates tab by title/URL match)
         try {
-          const tabRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-            tool: 'computer_action', action: 'chrome_set_url',
-            text: cleanTabTarget, // Chrome Bridge will match by tab title
-          }, { timeout: 10000 });
-          // If that doesn't work, try clicking on the tab via UI
-          if (!tabRes.data?.success) {
-            await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-              tool: 'computer_action', action: 'click_ui_element', text: cleanTabTarget,
-            }, { timeout: 15000 }).catch(() => null);
+          const bridge = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'chrome_bridge_command',
+            text: JSON.stringify({ command: 'switch_tab', query: cleanTabTarget }),
+          }, { timeout: 10000 }).catch(() => null);
+
+          // Fallback: use the Chrome Bridge via the dev-agent's send_command
+          if (!bridge?.data?.success) {
+            // Direct Chrome Bridge WebSocket
+            const wsRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'chrome_bridge_send',
+              command: 'switch_tab',
+              payload: { query: cleanTabTarget },
+            }, { timeout: 8000 }).catch(() => null);
+            if (wsRes?.data?.success) switched = true;
+          } else {
+            switched = true;
           }
         } catch { /* continue */ }
+
+        // 2. Fallback: try clicking on the tab title in the tab bar
+        if (!switched) {
+          try {
+            await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'click_ui_element', text: cleanTabTarget,
+            }, { timeout: 12000 });
+            switched = true;
+          } catch { /* continue */ }
+        }
+
         await new Promise(r => setTimeout(r, 500));
         const tabScreen = await this.getScreenImage(sid);
-        return { output: `Switched to tab: ${cleanTabTarget}`, screenshot: tabScreen };
+        return {
+          output: switched ? `Switched to tab: ${cleanTabTarget}` : `Could not find tab: ${cleanTabTarget}`,
+          screenshot: tabScreen,
+        };
       }
 
       default: {

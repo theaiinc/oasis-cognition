@@ -1372,6 +1372,46 @@ end tell
         logger.error("click_ui_element: no valid coords for '%s' — element: %s", text, {k: v for k, v in el.items() if k != 'thumbnail'})
         return {"success": False, "output": f"Found '{text}' but could not determine click coordinates", "screenshot": ""}
 
+    if action == "chrome_bridge_type":
+        # Type text into the focused browser element via Chrome Bridge.
+        # Uses execCommand('insertText') which works with contenteditable (Facebook, etc.)
+        if not text:
+            return {"success": False, "output": "chrome_bridge_type requires text", "screenshot": ""}
+        if not chrome_bridge.connected:
+            return {"success": False, "output": "Chrome Bridge not connected", "screenshot": ""}
+        try:
+            resp = await chrome_bridge.send_command("type_text", {
+                "text": text,
+                "selector": kwargs.get("selector", ""),
+            }, timeout=10)
+            if resp.get("success"):
+                payload = resp.get("payload", {})
+                logger.info("chrome_bridge_type: typed %d chars via %s", payload.get("typed", 0), payload.get("method", "?"))
+                return {"success": True, "output": f"Typed via DOM: {text[:60]}", "screenshot": ""}
+            else:
+                return {"success": False, "output": resp.get("error", "type failed"), "screenshot": ""}
+        except Exception as e:
+            return {"success": False, "output": str(e), "screenshot": ""}
+
+    if action == "switch_tab":
+        # Switch to an existing Chrome tab by title or URL match (no navigation)
+        if not text:
+            return {"success": False, "output": "switch_tab requires text (tab title or URL fragment)", "screenshot": ""}
+        if chrome_bridge.connected:
+            try:
+                resp = await chrome_bridge.send_command("switch_tab", {"query": text}, timeout=8)
+                if resp.get("success"):
+                    payload = resp.get("payload", {})
+                    logger.info("switch_tab: activated '%s' → %s", text, payload.get("title", "?"))
+                    return {"success": True, "output": f"Switched to tab: {payload.get('title', text)}", "screenshot": ""}
+                else:
+                    logger.info("switch_tab: no tab matching '%s'", text)
+                    return {"success": False, "output": f"No tab matching '{text}'", "screenshot": ""}
+            except Exception as e:
+                logger.warning("switch_tab via Chrome Bridge failed: %s", e)
+                return {"success": False, "output": str(e), "screenshot": ""}
+        return {"success": False, "output": "Chrome Bridge not connected — cannot switch tabs", "screenshot": ""}
+
     if action == "chrome_bridge_click":
         # Click an element via the Chrome Bridge extension using text match.
         # Falls back gracefully if the bridge isn't connected.
@@ -1402,10 +1442,13 @@ end tell
         # ── Try Chrome Bridge extension first ──
         if chrome_bridge.connected:
             try:
-                resp = await chrome_bridge.send_command("set_url", {
+                payload = {
                     "url": text,
                     "url_hint": kwargs.get("url_hint", ""),
-                }, timeout=15)
+                }
+                if kwargs.get("new_tab"):
+                    payload["new_tab"] = True
+                resp = await chrome_bridge.send_command("set_url", payload, timeout=15)
                 if resp.get("success"):
                     logger.info("chrome_set_url via Chrome Bridge: %s", text)
                     return {"success": True, "output": f"Navigated to {text}", "screenshot": ""}

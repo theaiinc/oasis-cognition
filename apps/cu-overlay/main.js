@@ -38,18 +38,18 @@ function createWindow() {
     y: 60,
     alwaysOnTop: true,
     frame: false,
-    transparent: true,
+    transparent: false, // Solid window — transparent windows don't repaint on macOS when unfocused
     resizable: true,
     skipTaskbar: true,
     hasShadow: true,
     roundedCorners: true,
-    backgroundColor: "#00000000",
+    backgroundColor: "#1a1a2e", // Dark background matching the overlay CSS
     titleBarStyle: "hidden",
-    trafficLightPosition: { x: -20, y: -20 }, // hide traffic lights off-screen
+    trafficLightPosition: { x: -20, y: -20 },
     webPreferences: {
       nodeIntegration: false,
       contextIsolation: true,
-      webSecurity: false, // Allow fetch from file:// to http://localhost
+      webSecurity: false,
     },
   });
 
@@ -67,12 +67,18 @@ function createWindow() {
   mainWindow.setAlwaysOnTop(true, "floating");
   mainWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
 
-  // Re-assert always-on-top periodically (some macOS window managers reset it)
+  // Re-assert always-on-top and force repaint every 1.5s.
+  // With transparent:false, macOS repaints reliably. setOpacity toggle is a
+  // belt-and-suspenders measure to ensure the content updates are visible.
   setInterval(() => {
     if (mainWindow && !mainWindow.isDestroyed()) {
       mainWindow.setAlwaysOnTop(true, "floating");
+      // Force Chromium to repaint by poking the webContents
+      try {
+        mainWindow.webContents.invalidate();
+      } catch { /* older Electron */ }
     }
-  }, 5000);
+  }, 1500);
 
   // Debug: open devtools to check connection
   if (process.argv.includes('--devtools')) {

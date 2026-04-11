@@ -322,35 +322,40 @@
     skipped: '<span style="color:#6e7681;opacity:0.4">&#8722;</span>',
   };
 
-  let lastSessionData = null; // Keep last session data to avoid blanking
+  let lastSessionData = null;
 
   function updateUI(data) {
     if (data.type === 'idle' || !data.session_id) {
-      // If we have a previous session, keep showing it (dimmed) instead of blanking
+      // If we have a previous session, re-render it with disabled controls
       if (lastSessionData && lastSessionData.session_id) {
+        // Re-render the FULL last session data (steps + goal) but with disabled controls
+        data = { ...lastSessionData };
+        // Override status display only
         statusDot.className = 'status-dot idle';
-        headerTitle.textContent = lastSessionData.status === 'completed' ? 'Completed' :
-                                  lastSessionData.status === 'failed' ? 'Failed' : 'Session Ended';
+        const label = data.status === 'completed' ? 'Completed' :
+                      data.status === 'failed' ? 'Failed' : 'Session Ended';
+        headerTitle.textContent = label;
+        warning.style.display = 'none';
         stopBtn.disabled = true;
         steerInput.disabled = true;
         steerSend.disabled = true;
         stopBtn.style.opacity = '0.4';
+        // Fall through to render steps/goal from lastSessionData
+      } else {
+        statusDot.className = 'status-dot idle';
+        headerTitle.textContent = 'No Active Session';
+        goalEl.textContent = 'Waiting for a computer-use session...';
         warning.style.display = 'none';
-        return; // Keep showing last session's steps and goal
+        stepsEl.innerHTML = '<div class="idle-msg">No session running</div>';
+        stopBtn.disabled = true;
+        steerInput.disabled = true;
+        steerSend.disabled = true;
+        stopBtn.style.opacity = '0.4';
+        return;
       }
-      statusDot.className = 'status-dot idle';
-      headerTitle.textContent = 'No Active Session';
-      goalEl.textContent = 'Waiting for a computer-use session...';
-      warning.style.display = 'none';
-      stepsEl.innerHTML = '<div class="idle-msg">No session running</div>';
-      stopBtn.disabled = true;
-      steerInput.disabled = true;
-      steerSend.disabled = true;
-      stopBtn.style.opacity = '0.4';
-      return;
     }
 
-    lastSessionData = data; // Remember for when session goes idle
+    lastSessionData = data;
 
     currentSessionId = data.session_id;
     const status = data.status;
@@ -403,6 +408,9 @@
       // Auto-scroll to running step
       const runningEl = stepsEl.querySelector('.step.running');
       if (runningEl) runningEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+
+      // Repaint hint — nudge the renderer to flush DOM changes
+      void stepsEl.offsetHeight;
     }
 
     // Error display
@@ -458,6 +466,10 @@
       const steps = (session.plan || [])
         .filter(s => s.status !== 'skipped')
         .map(s => ({ index: s.index, status: s.status, description: s.description || '', action: s.action || '' }));
+
+      // Debug: log step statuses on every poll
+      const stepSyms = steps.map(s => s.status[0]?.toUpperCase() || '?').join('');
+      console.log(`[Poll] ${session.status} step=${session.current_step}/${steps.length} [${stepSyms}]`);
 
       const state = {
         type: 'session_state',

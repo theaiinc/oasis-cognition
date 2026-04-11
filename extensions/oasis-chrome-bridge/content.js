@@ -231,6 +231,55 @@
           break;
         }
 
+        case "type_text": {
+          // Type text into the focused element or a specified element.
+          // Uses execCommand('insertText') which works with contenteditable divs
+          // (Facebook, Twitter post composers, etc.) and regular inputs/textareas.
+          const text = msg.text || '';
+          let target = document.activeElement;
+
+          // If a selector/text_match is provided, find and focus that element first
+          if (msg.selector || msg.text_match) {
+            const found = findElement(msg.selector, msg.text_match);
+            if (found) {
+              found.scrollIntoView({ block: "center", behavior: "instant" });
+              found.focus();
+              found.click();
+              target = found;
+            }
+          }
+
+          // For contenteditable elements (like Facebook's post composer)
+          if (target && (target.isContentEditable || target.contentEditable === 'true')) {
+            target.focus();
+            const sel = window.getSelection();
+            const range = document.createRange();
+
+            // Select ALL existing content first — this replaces instead of appending
+            // Prevents duplication when the type action retries
+            range.selectNodeContents(target);
+            sel.removeAllRanges();
+            sel.addRange(range);
+
+            // Delete existing content, then insert new text
+            document.execCommand('delete', false);
+            document.execCommand('insertText', false, text);
+            sendResponse({ success: true, payload: { typed: text.length, method: 'execCommand-replace' } });
+          } else if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
+            // Regular input/textarea
+            target.focus();
+            target.value = text;
+            target.dispatchEvent(new Event('input', { bubbles: true }));
+            target.dispatchEvent(new Event('change', { bubbles: true }));
+            sendResponse({ success: true, payload: { typed: text.length, method: 'value' } });
+          } else {
+            // Fallback: try execCommand on whatever is focused
+            document.execCommand('insertText', false, text);
+            sendResponse({ success: true, payload: { typed: text.length, method: 'fallback' } });
+          }
+          break;
+        }
+
         default:
           sendResponse({ success: false, error: `Unknown command: ${msg.command}` });
       }

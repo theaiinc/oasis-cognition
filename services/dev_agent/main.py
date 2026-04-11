@@ -118,6 +118,7 @@ class ToolRequest(BaseModel):
     clicks: int | None = None       # for click (1 = single, 2 = double)
     screen_region: dict | None = None  # {x, y, width, height} for screen-specific capture
     app: str | None = None             # target app process name for keystroke targeting
+    new_tab: bool | None = None        # open URL in new tab (Chrome Bridge)
     # ── chunked read fields ──
     start_line: int | None = None   # 1-based start line for read_worktree_file
     end_line: int | None = None     # 1-based end line (inclusive) for read_worktree_file
@@ -650,6 +651,8 @@ async def execute_tool(req: ToolRequest) -> dict[str, Any]:
             extra["screen_region"] = req.screen_region
         if req.app:
             extra["app"] = req.app
+        if req.new_tab:
+            extra["new_tab"] = True
         result = await execute_computer_action(
             action=req.action,
             x=req.x,

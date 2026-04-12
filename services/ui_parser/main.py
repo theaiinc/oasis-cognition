@@ -198,7 +198,7 @@ async def ocr_endpoint(req: OcrRequest):
     return {"results": results, "count": len(results)}
 
 
-# ─── Grounding: OCR + GroundingDINO element detection ───────────────────────
+# ─── Grounding: OCR + OmniParser V2 element detection ───────────────────────
 
 class GroundRequest(BaseModel):
     """Locate a UI element by text description in a screenshot."""
@@ -227,7 +227,7 @@ async def ground_endpoint(req: GroundRequest):
 
     Hybrid strategy:
       1. OCR text matching (fast, pixel-accurate for labeled elements)
-      2. GroundingDINO visual detection (for icons, avatars, visual elements)
+      2. OmniParser V2 visual detection (for icons, avatars, visual elements)
 
     Returns center coordinates suitable for direct click targeting.
     """
@@ -244,7 +244,7 @@ async def ground_endpoint(req: GroundRequest):
 class FindElementRequest(BaseModel):
     """Find a UI element by query in a screenshot.
 
-    Combines Chrome Bridge DOM data (if available) with OCR + GroundingDINO.
+    Combines Chrome Bridge DOM data (if available) with OCR + OmniParser V2.
     Returns the best matching element with ID, type, text, bbox, and center coordinates.
     """
     image: str = Field(..., description="Base64-encoded JPEG screenshot")
@@ -269,7 +269,7 @@ async def find_element_endpoint(req: FindElementRequest):
     Priority:
       1. Chrome Bridge DOM elements (text/aria-label match — fastest, most accurate)
       2. OCR text matching (pixel-accurate for labeled elements)
-      3. GroundingDINO visual detection (for icons, avatars, non-text elements)
+      3. OmniParser V2 visual detection (for icons, avatars, non-text elements)
 
     Returns the single best match with coordinates for clicking.
     """
@@ -313,7 +313,7 @@ async def find_element_endpoint(req: FindElementRequest):
                 "alternatives": dom_matches[1:5],
             }
 
-    # 2. Fall back to OCR + GroundingDINO via existing ground endpoint
+    # 2. Fall back to OCR + OmniParser V2 via existing ground endpoint
     detections = grounding.ground_element(
         req.image, req.query,
         image_width=req.image_width,

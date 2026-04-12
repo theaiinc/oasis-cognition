@@ -86,10 +86,11 @@ export interface PlanStep {
 }
 
 export type SessionStatus =
-  | 'planning'          // LLM is drafting the plan
-  | 'awaiting_approval' // Plan ready, waiting for user OK
-  | 'executing'         // Steps are running
-  | 'paused'            // User paused or step-approval mode
+  | 'planning'              // LLM is drafting the plan
+  | 'awaiting_approval'     // Plan ready, waiting for user OK
+  | 'executing'             // Steps are running
+  | 'paused'                // User paused or step-approval mode
+  | 'awaiting_click_assist' // Click failed — waiting for user to pick an element
   | 'completed'
   | 'failed'
   | 'cancelled';

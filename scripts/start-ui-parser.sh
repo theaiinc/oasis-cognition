@@ -1,7 +1,7 @@
 #!/bin/bash
-# Start the UI Parser service (runs natively for GroundingDINO GPU access)
+# Start the UI Parser service (runs natively for GPU access)
 # This is NOT a Docker service — it runs on your Mac directly.
-# Uses GroundingDINO + Tesseract OCR for pixel-accurate UI element detection.
+# Uses OmniParser V2 (YOLOv8 + Florence-2) + Tesseract OCR for UI element detection.
 
 set -e
 
@@ -11,7 +11,7 @@ UI_PARSER_DIR="$OASIS_ROOT/services/ui_parser"
 
 echo "🔍 Starting UI Parser (native)..."
 echo "   Port: 8011"
-echo "   Models: GroundingDINO-tiny + Tesseract OCR"
+echo "   Models: OmniParser V2 (YOLOv8 + Florence-2) + Tesseract OCR"
 echo ""
 
 cd "$UI_PARSER_DIR"
@@ -43,8 +43,8 @@ fi
 
 # Install deps if needed
 if ! "$PYTHON" -c "import transformers" 2>/dev/null; then
-    echo "Installing UI Parser dependencies (torch + GroundingDINO)..."
-    "$PIP" install -q torch transformers scipy pillow pytesseract \
+    echo "Installing UI Parser dependencies (OmniParser V2)..."
+    "$PIP" install -q torch transformers ultralytics timm einops scipy pillow pytesseract \
         fastapi uvicorn pydantic pydantic-settings
 fi
 

@@ -4,7 +4,10 @@ pydantic>=2.9.0
 pydantic-settings>=2.5.0
 Pillow>=10.0.0
 pytesseract>=0.3.10
-# GroundingDINO (visual element detection)
+# OmniParser V2 (YOLOv8 icon detection + Florence-2 captioning)
 torch>=2.1.0
-transformers>=4.50.0
+transformers>=4.38.0
+ultralytics>=8.1.0
+timm>=0.9.0
+einops>=0.7.0
 scipy>=1.10.0

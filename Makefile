@@ -149,7 +149,7 @@ dev-agent-stop:
 		echo "🔧  Dev Agent: stopped"; \
 	fi
 
-# ── UI Parser (native Python, GroundingDINO + Tesseract OCR) ────────────────
+# ── UI Parser (native Python, OmniParser V2 + Tesseract OCR) ────────────────
 
 ui-parser-start:
 	@mkdir -p $(HOME)/Library/Logs/oasis

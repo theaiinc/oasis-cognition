@@ -20,6 +20,8 @@ import type { VoiceChatState } from '../../hooks/useVoiceChat';
 interface PlanStep {
   index: number;
   description: string;
+  action?: string;
+  target?: string;
   status: 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'blocked';
   output?: string;
   screenshot?: string;
@@ -28,7 +30,7 @@ interface PlanStep {
 interface CuSession {
   session_id: string;
   goal: string;
-  status: 'planning' | 'awaiting_approval' | 'executing' | 'paused' | 'completed' | 'failed' | 'cancelled';
+  status: 'planning' | 'awaiting_approval' | 'executing' | 'paused' | 'awaiting_click_assist' | 'completed' | 'failed' | 'cancelled';
   plan: PlanStep[];
   current_step: number;
   live_screenshot?: string;
@@ -81,12 +83,19 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
   const reportedStepsRef = useRef(0);
   const prevStatusRef = useRef<string | null>(null);
   const lastVoiceRef = useRef('');
-  const micIntervalRef = useRef<ReturnType<typeof setInterval>>();
+  const micIntervalRef = useRef<ReturnType<typeof setInterval> | undefined>(undefined);
   const micRecorderRef = useRef<MediaRecorder | null>(null);
 
   const relayUrl = `${tunnelUrl}/relay`;
   const isTerminal = session && ['completed', 'failed', 'cancelled'].includes(session.status);
-  const isActive = session && ['executing', 'paused', 'planning', 'awaiting_approval'].includes(session.status);
+  const isActive = session && ['executing', 'paused', 'planning', 'awaiting_approval', 'awaiting_click_assist'].includes(session.status);
+
+  // Click assist state
+  const [clickAssist, setClickAssist] = useState<{
+    screenshot: string;
+    elements: { number: number; description: string; x_ratio: number; y_ratio: number }[];
+    target: string;
+  } | null>(null);
 
   // Helpers
   const addMsg = useCallback((sender: ChatMsg['sender'], text: string, type?: ChatMsg['type'], screenshot?: string) => {
@@ -182,6 +191,18 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
     }
     if (session.status === 'executing' && prev !== 'executing') {
       addMsg('system', 'Executing...');
+    }
+    if (session.status === 'awaiting_click_assist' && prev !== 'awaiting_click_assist') {
+      addMsg('system', 'Click failed — please select the correct element below');
+      // Fetch click assist data
+      fetch(`${relayUrl}/computer-use/click-assist?session_id=${session.session_id}`)
+        .then(r => r.json())
+        .then(data => {
+          if (data.active && data.elements?.length) {
+            setClickAssist({ screenshot: data.screenshot, elements: data.elements, target: data.target });
+          }
+        })
+        .catch(() => {});
     }
     if (session.status === 'paused' && prev !== 'paused') {
       addMsg('system', session.error || 'Session paused');
@@ -291,6 +312,21 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
     } catch { /* ignore */ }
   };
 
+  const handleClickAssist = async (elementNumber: number) => {
+    if (!session) return;
+    const el = clickAssist?.elements?.find(e => e.number === elementNumber);
+    try {
+      addMsg('user', `Selected #${elementNumber}: ${el?.description || '?'}`);
+      await fetch(`${relayUrl}/computer-use/click-assist`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: session.session_id, number: elementNumber }),
+      });
+      setClickAssist(null);
+      addMsg('system', 'Clicking selected element — resuming...');
+      pollSession(session.session_id);
+    } catch { addMsg('system', 'Failed to submit selection'); }
+  };
+
   const handleApprove = async () => {
     if (!session) return;
     try {
@@ -341,11 +377,52 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
   // Screenshot image for preview
   const screenImage = session?.live_screenshot || liveScreen;
 
+  // ── Pinch-zoom + pan state for screenshot ──
+  const [imgTransform, setImgTransform] = useState({ scale: 1, x: 0, y: 0 });
+  const touchRef = useRef<{ startDist: number; startScale: number; startX: number; startY: number; lastX: number; lastY: number; fingers: number }>({
+    startDist: 0, startScale: 1, startX: 0, startY: 0, lastX: 0, lastY: 0, fingers: 0,
+  });
+
+  const handleTouchStart = (e: React.TouchEvent) => {
+    const t = e.touches;
+    if (t.length === 2) {
+      // Pinch start
+      const dist = Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+      touchRef.current = { ...touchRef.current, startDist: dist, startScale: imgTransform.scale, fingers: 2 };
+    } else if (t.length === 1) {
+      // Pan start
+      touchRef.current = { ...touchRef.current, lastX: t[0].clientX, lastY: t[0].clientY, startX: imgTransform.x, startY: imgTransform.y, fingers: 1 };
+    }
+  };
+
+  const handleTouchMove = (e: React.TouchEvent) => {
+    const t = e.touches;
+    if (t.length === 2) {
+      // Pinch zoom
+      const dist = Math.hypot(t[0].clientX - t[1].clientX, t[0].clientY - t[1].clientY);
+      const newScale = Math.max(0.5, Math.min(5, touchRef.current.startScale * (dist / touchRef.current.startDist)));
+      setImgTransform(prev => ({ ...prev, scale: newScale }));
+    } else if (t.length === 1 && imgTransform.scale > 1) {
+      // Pan (only when zoomed in)
+      const dx = t[0].clientX - touchRef.current.lastX;
+      const dy = t[0].clientY - touchRef.current.lastY;
+      touchRef.current.lastX = t[0].clientX;
+      touchRef.current.lastY = t[0].clientY;
+      setImgTransform(prev => ({ ...prev, x: prev.x + dx, y: prev.y + dy }));
+    }
+  };
+
+  const handleTouchEnd = () => {
+    touchRef.current.fingers = 0;
+  };
+
+  const resetZoom = () => setImgTransform({ scale: 1, x: 0, y: 0 });
+
   // ── Fullscreen screenshot view ──
   if (isFullscreen && screenImage) {
     return (
       <div className="fixed inset-0 z-50 bg-black flex flex-col">
-        <div className="flex items-center justify-between px-4 py-2 bg-black/80">
+        <div className="flex items-center justify-between px-4 py-2 bg-black/80 z-10">
           {session ? (
             <span className="text-[10px] text-slate-400">
               Step {(session.current_step || 0) + 1}/{session.plan?.length || 0}
@@ -355,12 +432,35 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
               <div className="w-2 h-2 rounded-full bg-emerald-400 animate-pulse" /> Screen shared
             </span>
           )}
-          <button onClick={() => setIsFullscreen(false)} className="p-1.5 rounded-lg bg-slate-800 text-white">
-            <Minimize2 className="w-4 h-4" />
-          </button>
+          <div className="flex items-center gap-2">
+            {imgTransform.scale > 1.05 && (
+              <button onClick={resetZoom} className="px-2 py-1 rounded bg-slate-700 text-[9px] text-slate-300">
+                {Math.round(imgTransform.scale * 100)}% — Reset
+              </button>
+            )}
+            <button onClick={() => { setIsFullscreen(false); resetZoom(); }} className="p-1.5 rounded-lg bg-slate-800 text-white">
+              <Minimize2 className="w-4 h-4" />
+            </button>
+          </div>
         </div>
-        <div className="flex-1 overflow-auto" style={{ touchAction: 'pan-x pan-y pinch-zoom' }}>
-          <img src={`data:image/jpeg;base64,${screenImage}`} alt="Screen" className="min-w-[200vw] object-contain" />
+        <div
+          className="flex-1 overflow-hidden flex items-center justify-center"
+          onTouchStart={handleTouchStart}
+          onTouchMove={handleTouchMove}
+          onTouchEnd={handleTouchEnd}
+          style={{ touchAction: 'none' }}
+        >
+          <img
+            src={`data:image/jpeg;base64,${screenImage}`}
+            alt="Screen"
+            className="max-w-none select-none"
+            draggable={false}
+            style={{
+              transform: `translate(${imgTransform.x}px, ${imgTransform.y}px) scale(${imgTransform.scale})`,
+              transformOrigin: 'center center',
+              transition: touchRef.current.fingers > 0 ? 'none' : 'transform 0.2s ease-out',
+            }}
+          />
         </div>
       </div>
     );
@@ -436,16 +536,42 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
           </button>
           {showScreenPreview && (
             <div className="relative px-3 pb-2">
-              <img
-                src={`data:image/jpeg;base64,${screenImage}`}
-                alt="Screen" className="w-full rounded-lg border border-slate-800"
-              />
-              <button
-                onClick={() => setIsFullscreen(true)}
-                className="absolute top-1 right-4 p-1 rounded bg-black/60 text-white"
+              <div
+                className="overflow-hidden rounded-lg border border-slate-800"
+                onTouchStart={handleTouchStart}
+                onTouchMove={handleTouchMove}
+                onTouchEnd={handleTouchEnd}
+                onDoubleClick={() => {
+                  if (imgTransform.scale > 1.05) resetZoom();
+                  else setImgTransform({ scale: 2, x: 0, y: 0 });
+                }}
+                style={{ touchAction: 'none' }}
               >
-                <Maximize2 className="w-3 h-3" />
-              </button>
+                <img
+                  src={`data:image/jpeg;base64,${screenImage}`}
+                  alt="Screen"
+                  className="w-full select-none"
+                  draggable={false}
+                  style={{
+                    transform: `translate(${imgTransform.x}px, ${imgTransform.y}px) scale(${imgTransform.scale})`,
+                    transformOrigin: 'center center',
+                    transition: touchRef.current.fingers > 0 ? 'none' : 'transform 0.2s ease-out',
+                  }}
+                />
+              </div>
+              <div className="absolute top-1 right-4 flex gap-1">
+                {imgTransform.scale > 1.05 && (
+                  <button onClick={resetZoom} className="p-1 rounded bg-black/60 text-[8px] text-white">
+                    {Math.round(imgTransform.scale * 100)}%
+                  </button>
+                )}
+                <button
+                  onClick={() => { setIsFullscreen(true); resetZoom(); }}
+                  className="p-1 rounded bg-black/60 text-white"
+                >
+                  <Maximize2 className="w-3 h-3" />
+                </button>
+              </div>
             </div>
           )}
         </div>
@@ -480,7 +606,8 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
                   <Monitor className="w-3 h-3 text-purple-400" />
                 </div>
               )}
-              <div className={`max-w-[85%] rounded-2xl px-3 py-2 ${
+              <div
+                className={`max-w-[85%] rounded-2xl px-3 py-2 cursor-pointer active:opacity-70 transition-opacity ${
                 msg.sender === 'user'
                   ? 'bg-purple-600/30 border border-purple-800/40'
                   : msg.sender === 'system'
@@ -490,8 +617,20 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
                       : msg.type === 'summary'
                         ? 'bg-emerald-950/30 border border-emerald-800/30'
                         : 'bg-slate-800/50'
-              }`}>
-                <p className={`text-[11px] leading-relaxed ${
+              }`}
+                onClick={() => {
+                  navigator.clipboard.writeText(msg.text).then(() => {
+                    // Brief visual feedback — flash the bubble
+                    const el = document.getElementById(`msg-${msg.id}`);
+                    if (el) {
+                      el.style.outline = '1px solid rgba(168,85,247,0.5)';
+                      setTimeout(() => { el.style.outline = 'none'; }, 600);
+                    }
+                  }).catch(() => {});
+                }}
+                id={`msg-${msg.id}`}
+              >
+                <p className={`text-[11px] leading-relaxed select-text ${
                   msg.sender === 'user' ? 'text-purple-200' :
                   msg.sender === 'system' ? 'text-slate-400 italic' :
                   msg.type === 'error' ? 'text-red-300' :
@@ -525,6 +664,61 @@ export function MobileComputerUse({ tunnelUrl, voiceChat, onClose }: MobileCompu
                   Reject
                 </button>
               </div>
+            </div>
+          )}
+
+          {/* Click assist — numbered element picker */}
+          {session?.status === 'awaiting_click_assist' && clickAssist && (
+            <div className="bg-slate-800/40 border border-blue-800/30 rounded-2xl p-3 mx-2">
+              <p className="text-[10px] text-blue-300 font-medium mb-2">
+                Could not find "{clickAssist.target}" — tap the correct element:
+              </p>
+              {clickAssist.screenshot && (
+                <div className="relative mb-3 rounded-lg overflow-hidden border border-slate-700">
+                  <img
+                    src={`data:image/jpeg;base64,${clickAssist.screenshot}`}
+                    alt="Screen"
+                    className="w-full"
+                  />
+                  {/* Number overlays on the screenshot */}
+                  {clickAssist.elements.map(el => (
+                    <button
+                      key={el.number}
+                      onClick={() => handleClickAssist(el.number)}
+                      className="absolute flex items-center justify-center w-6 h-6 rounded-full bg-blue-600 text-white text-[10px] font-bold border-2 border-white shadow-lg active:scale-110 transition-transform"
+                      style={{
+                        left: `${el.x_ratio * 100}%`,
+                        top: `${el.y_ratio * 100}%`,
+                        transform: 'translate(-50%, -50%)',
+                      }}
+                      title={el.description}
+                    >
+                      {el.number}
+                    </button>
+                  ))}
+                </div>
+              )}
+              {/* Element list (scrollable) */}
+              <div className="flex flex-col gap-1 max-h-[120px] overflow-y-auto mb-2">
+                {clickAssist.elements.map(el => (
+                  <button
+                    key={el.number}
+                    onClick={() => handleClickAssist(el.number)}
+                    className="flex items-center gap-2 text-left p-1.5 rounded-lg bg-slate-700/40 active:bg-blue-700/40 transition-colors"
+                  >
+                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-blue-600 text-white text-[9px] font-bold flex items-center justify-center">
+                      {el.number}
+                    </span>
+                    <span className="text-[10px] text-slate-300 truncate">{el.description}</span>
+                  </button>
+                ))}
+              </div>
+              <button
+                onClick={handleCancel}
+                className="w-full py-1.5 rounded-lg border border-red-800 text-red-400 text-[10px]"
+              >
+                Skip this click
+              </button>
             </div>
           )}
 

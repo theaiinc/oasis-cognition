@@ -33,3 +33,4 @@ dist/
 tsconfig.tsbuildinfo
 .venv-gipformer
 .claude/launch.json
+services/ui_parser/weights/

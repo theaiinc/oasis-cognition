@@ -69,7 +69,10 @@ export function MobileSidebar({
     if (!open || !paired || !tunnelUrl) return;
 
     setLoadingSessions(true);
-    fetch(`${tunnelUrl}/relay/sessions`, { signal: AbortSignal.timeout(10000) })
+    const url = activeProjectId
+      ? `${tunnelUrl}/relay/sessions?project_id=${activeProjectId}`
+      : `${tunnelUrl}/relay/sessions`;
+    fetch(url, { signal: AbortSignal.timeout(10000) })
       .then(res => res.ok ? res.json() : null)
       .then(data => {
         if (data?.sessions && Array.isArray(data.sessions)) {
@@ -78,14 +81,17 @@ export function MobileSidebar({
       })
       .catch(() => { /* ignore */ })
       .finally(() => setLoadingSessions(false));
-  }, [open, paired, tunnelUrl]);
+  }, [open, paired, tunnelUrl, activeProjectId]);
 
   // Fetch artifacts when section is opened
   useEffect(() => {
     if (!showArtifacts || !paired || !tunnelUrl) return;
 
     setLoadingArtifacts(true);
-    fetch(`${tunnelUrl}/relay/artifacts`, { signal: AbortSignal.timeout(10000) })
+    const url = activeProjectId
+      ? `${tunnelUrl}/relay/artifacts?project_id=${activeProjectId}`
+      : `${tunnelUrl}/relay/artifacts`;
+    fetch(url, { signal: AbortSignal.timeout(10000) })
       .then(res => res.ok ? res.json() : null)
       .then(data => {
         if (data?.artifacts && Array.isArray(data.artifacts)) {
@@ -94,7 +100,7 @@ export function MobileSidebar({
       })
       .catch(() => { /* ignore */ })
       .finally(() => setLoadingArtifacts(false));
-  }, [showArtifacts, paired, tunnelUrl]);
+  }, [showArtifacts, paired, tunnelUrl, activeProjectId]);
 
   // Fetch projects when project picker is opened
   useEffect(() => {

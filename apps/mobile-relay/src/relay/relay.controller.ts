@@ -115,9 +115,10 @@ export function createRelayRouter(relayService: RelayService): Router {
   });
 
   /** List artifacts. */
-  router.get('/artifacts', async (_req: Request, res: Response) => {
+  router.get('/artifacts', async (req: Request, res: Response) => {
     try {
-      const data = await relayService.listArtifacts();
+      const projectId = req.query.project_id as string | undefined;
+      const data = await relayService.listArtifacts(projectId);
       res.json(data);
     } catch (err: any) {
       res.status(502).json({ error: 'Failed to fetch artifacts' });
@@ -273,6 +274,32 @@ export function createRelayRouter(relayService: RelayService): Router {
       res.json(result);
     } catch (err: any) {
       res.status(502).json({ error: 'Failed to follow up on session' });
+    }
+  });
+
+  /** Get click-assist data (annotated screenshot with numbered elements). */
+  router.get('/computer-use/click-assist', async (req: Request, res: Response) => {
+    try {
+      const sessionId = req.query.session_id as string;
+      if (!sessionId) { res.status(400).json({ error: 'session_id is required' }); return; }
+      const API_URL = process.env.API_GATEWAY_URL || 'http://127.0.0.1:8000';
+      const result = await axios.get(`${API_URL}/api/v1/computer-use/sessions/${sessionId}/click-assist`, { timeout: 10000 });
+      res.json(result.data);
+    } catch (err: any) {
+      res.status(502).json({ error: 'Failed to get click assist data' });
+    }
+  });
+
+  /** Submit user's click-assist selection (which numbered element to click). */
+  router.post('/computer-use/click-assist', async (req: Request, res: Response) => {
+    try {
+      const { session_id, number } = req.body;
+      if (!session_id || number === undefined) { res.status(400).json({ error: 'session_id and number are required' }); return; }
+      const API_URL = process.env.API_GATEWAY_URL || 'http://127.0.0.1:8000';
+      const result = await axios.post(`${API_URL}/api/v1/computer-use/sessions/${session_id}/click-assist`, { number }, { timeout: 15000 });
+      res.json(result.data);
+    } catch (err: any) {
+      res.status(502).json({ error: 'Failed to submit click assist' });
     }
   });
 

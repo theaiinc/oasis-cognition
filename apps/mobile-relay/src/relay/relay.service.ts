@@ -259,8 +259,10 @@ export class RelayService {
   /**
    * Fetch list of artifacts from the gateway.
    */
-  async listArtifacts(): Promise<any> {
+  async listArtifacts(projectId?: string): Promise<any> {
+    const params = projectId ? { project_id: projectId } : {};
     const response = await axios.get(`${GATEWAY_URL}/api/v1/artifacts`, {
+      params,
       timeout: 10_000,
     });
     return response.data;

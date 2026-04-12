@@ -321,8 +321,13 @@ export class ComputerUseController {
   async resumeSession(@Param('id') id: string) {
     const session = sessions.get(id);
     if (!session) throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
-    if (session.status !== 'paused') {
+    if (session.status !== 'paused' && session.status !== 'awaiting_click_assist') {
       throw new HttpException(`Cannot resume: status is "${session.status}"`, HttpStatus.CONFLICT);
+    }
+    // Clear click-assist data when resuming from click-assist state
+    if (session.status === 'awaiting_click_assist') {
+      (session as any)._click_assist = null;
+      this.logger.log(`Resuming from click-assist: user will handle the click manually`);
     }
     session.status = 'executing';
     session.error = undefined; // clear any pause/verification error
@@ -872,6 +877,7 @@ export class ComputerUseController {
         timestamp: new Date().toISOString(),
       };
       session.status = 'awaiting_click_assist';
+      session.error = `Click failed for "${failedTarget}" — click it manually, then press Resume`;
       session.updated_at = new Date().toISOString();
 
       this.logger.log(`Click assist: ${elements.length} elements identified for "${failedTarget}" — waiting for user`);

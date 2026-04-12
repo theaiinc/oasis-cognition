@@ -217,6 +217,26 @@
     border: 1px solid var(--border);
     color: var(--text-dim);
   }
+  .click-assist-banner {
+    display: none;
+    background: rgba(245, 158, 11, 0.15);
+    border: 1px solid rgba(245, 158, 11, 0.4);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin: 4px 8px;
+    font-size: 11px;
+    line-height: 1.4;
+    color: var(--amber);
+    flex-shrink: 0;
+  }
+  .click-assist-banner .banner-title {
+    font-weight: 600;
+    margin-bottom: 2px;
+  }
+  .click-assist-banner .banner-hint {
+    color: var(--text-dim);
+    font-size: 10px;
+  }
   .btn-mic.active {
     background: rgba(168, 85, 247, 0.15);
     border-color: var(--accent);
@@ -265,6 +285,12 @@
   <!-- Steps -->
   <div class="steps" id="steps">
     <div class="idle-msg" id="idleMsg">Waiting for session data...</div>
+  </div>
+
+  <!-- Click-assist banner (shown when click fails on desktop) -->
+  <div class="click-assist-banner" id="clickAssistBanner">
+    <div class="banner-title">Click failed — manual action needed</div>
+    <div class="banner-hint" id="clickAssistTarget">Please perform the click manually, then press Resume.</div>
   </div>
 
   <!-- Steering input -->
@@ -427,13 +453,29 @@
     steerSend.disabled = !isActive;
     stopBtn.style.opacity = isActive ? '1' : '0.4';
 
-    // Stop/Resume button
-    if (status === 'paused') {
+    // Stop/Resume button — show Resume for paused or awaiting_click_assist
+    if (status === 'paused' || status === 'awaiting_click_assist') {
       stopBtn.textContent = 'RESUME';
       stopBtn.className = 'btn btn-resume';
     } else {
       stopBtn.textContent = 'EMERGENCY STOP';
       stopBtn.className = 'btn btn-stop';
+    }
+
+    // Click-assist banner — show when waiting for user to click manually
+    const banner = document.getElementById('clickAssistBanner');
+    const bannerTarget = document.getElementById('clickAssistTarget');
+    if (status === 'awaiting_click_assist') {
+      banner.style.display = 'block';
+      // Show the failed target from session error if available
+      const errMsg = state.error || '';
+      if (errMsg) {
+        bannerTarget.textContent = errMsg;
+      } else {
+        bannerTarget.textContent = 'Please perform the click manually, then press Resume.';
+      }
+    } else {
+      banner.style.display = 'none';
     }
 
     // Don't auto-close — keep overlay alive for next session

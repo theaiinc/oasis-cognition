@@ -205,6 +205,7 @@ TOOL_PLAN_ALLOWED_TOOLS: tuple[str, ...] = (
     "read_worktree_file",
     "get_diff",
     "computer_action",
+    "web_search",
 )
 
 
@@ -933,7 +934,7 @@ If DECISION is ACT:
 ACTION: <tool_name OR teach_rule OR update_rule OR delete_rule>
   (must be a single token, e.g. `grep` — NOT a sentence like "Use grep to…")
 
-For executor tools (bash, read_file, list_dir, grep, find_files, browse_url, create_worktree, write_file, edit_file, apply_patch, read_worktree_file, get_diff, search_artifacts, read_artifact), add parameters as:
+For executor tools (bash, read_file, list_dir, grep, find_files, browse_url, create_worktree, write_file, edit_file, apply_patch, read_worktree_file, get_diff, search_artifacts, read_artifact, web_search), add parameters as:
 PARAM_<NAME>: <value>
 Use UPPER_SNAKE for NAME matching the JSON param names below, e.g. PARAM_PATH, PARAM_PATTERN, PARAM_WORKTREE_ID, PARAM_OLD_STRING, PARAM_NEW_STRING, PARAM_CONTENT, PARAM_PATCH, PARAM_COMMAND, PARAM_URL, PARAM_NAME, PARAM_RECURSIVE (true/false), PARAM_START_LINE (1-based), PARAM_END_LINE (1-based inclusive), PARAM_QUERY, PARAM_ARTIFACT_ID.
 

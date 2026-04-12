@@ -82,17 +82,43 @@ def _run_control(action: str, **kwargs) -> dict[str, Any]:
 
 # ── Screenshot helper ──────────────────────────────────────────────────────
 
+def _hide_overlay() -> None:
+    """Hide the CU overlay before screenshots so it doesn't pollute OCR/vision/cache."""
+    try:
+        import subprocess
+        subprocess.run(["osascript", "-e",
+            'tell application "System Events" to tell process "Electron" to '
+            'set visible to false'],
+            capture_output=True, timeout=1)
+    except Exception:
+        pass
+
+
+def _show_overlay() -> None:
+    """Show the CU overlay after screenshots."""
+    try:
+        import subprocess
+        subprocess.run(["osascript", "-e",
+            'tell application "System Events" to tell process "Electron" to '
+            'set visible to true'],
+            capture_output=True, timeout=1)
+    except Exception:
+        pass
+
+
 def _take_screenshot(region: tuple[int, int, int, int] | None = None, max_width: int = 1024) -> str:
     """Capture screen (or region) and return as base64 JPEG string.
 
-    On macOS, uses OasisScreenCapture.app so Screen Recording permission
-    shows "Oasis Screen Capture" — never imports pyautogui/Quartz in this process.
+    Hides the CU overlay before capture and shows it after, so screenshots
+    are clean for OCR, vision LLM, and caching.
     """
     if _os.path.isfile(_CAPTURE_BIN):
+        _hide_overlay()
         args = ["--max-width", str(max_width)]
         if region:
             args += ["--region", f"{region[0]},{region[1]},{region[2]},{region[3]}"]
         raw = _run_app_bundle(_CAPTURE_APP, args, timeout=10)
+        _show_overlay()
         if raw:
             return raw.strip()
 
@@ -288,8 +314,26 @@ async def _focus_window(app_or_title: str) -> dict[str, Any]:
         app_name = _extract_app_name(app_or_title)
         logger.info("focus_window: input=%r → app_name=%r", app_or_title, app_name)
 
-        # Try direct app activation (most reliable)
-        script = f'tell application "{app_name}" to activate'
+        # Activate the app AND ensure its window is visible, un-minimized,
+        # and raised to front (not just the app activation which may leave
+        # the window hidden behind other windows).
+        script = f'''
+tell application "{app_name}" to activate
+delay 0.2
+tell application "System Events"
+    tell process "{app_name}"
+        set frontmost to true
+        try
+            -- Un-minimize the first window if minimized
+            set miniaturized of window 1 to false
+        end try
+        try
+            -- Raise window 1 to front
+            perform action "AXRaise" of window 1
+        end try
+    end tell
+end tell
+'''
         try:
             subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
             time.sleep(0.5)
@@ -657,22 +701,36 @@ async def execute_computer_action(
             scr_name = target_scr.get("name", f"Screen {target_screen_idx or 0}")
 
             maximize_script = f'''
+tell application "{safe_app}" to activate
+delay 1.0
 tell application "System Events"
     tell process "{safe_app}"
         set frontmost to true
-        delay 0.5
-        try
-            set win to front window
-            -- Move to target screen and maximize
-            set position of win to {{{sx}, {sy + menu_bar_h}}}
-            delay 0.2
-            set size of win to {{{sw}, {sh - menu_bar_h}}}
-        on error
-            -- App may not have a window yet or doesn't support resizing
+        delay 0.3
+        -- Retry loop: Electron apps may take a moment to create windows
+        set maxRetries to 5
+        set moved to false
+        repeat maxRetries times
             try
-                click button 2 of front window
+                set win to window 1
+                -- Un-minimize if needed
+                try
+                    set miniaturized of win to false
+                end try
+                -- Move to target screen and maximize
+                set position of win to {{{sx}, {sy + menu_bar_h}}}
+                delay 0.2
+                set size of win to {{{sw}, {sh - menu_bar_h}}}
+                -- Raise window to front
+                try
+                    perform action "AXRaise" of win
+                end try
+                set moved to true
+                exit repeat
+            on error
+                delay 0.5
             end try
-        end try
+        end repeat
     end tell
 end tell
 '''
@@ -996,7 +1054,7 @@ except Exception as e:
             return {"success": False, "output": f"chrome_navigate error: {e}", "screenshot": ""}
 
     if action == "find_ui_element":
-        # CUA: Find a UI element — Chrome Bridge DOM first, ui_parser OCR/GroundingDINO fallback
+        # CUA: Find a UI element — Chrome Bridge DOM first, ui_parser OCR/OmniParser fallback
         if not text:
             return {"success": False, "output": "find_ui_element requires text (element query)", "screenshot": ""}
 
@@ -1173,7 +1231,21 @@ end tell
                     detections = data.get("detections", [])
                     if detections:
                         det = detections[0]
-                        if best_overall is None or det.get("score", 0) > best_overall.get("score", 0):
+                        det_score = det.get("score", 0)
+                        best_score = best_overall.get("score", 0) if best_overall else -1
+                        # Strongly prefer primary screen (index 0): only use secondary
+                        # if its score is significantly higher (>0.3 better)
+                        is_primary = scr.get("index", 0) == 0
+                        best_is_primary = best_screen is not None and best_screen.get("index", 0) == 0
+                        if best_overall is None:
+                            use_this = True
+                        elif is_primary and not best_is_primary:
+                            use_this = True  # always prefer primary over secondary
+                        elif not is_primary and best_is_primary:
+                            use_this = det_score > best_score + 0.3  # secondary needs much higher score
+                        else:
+                            use_this = det_score > best_score  # same screen type: higher wins
+                        if use_this:
                             best_overall = det
                             best_screen = scr
                             best_screenshot = scr_screenshot
@@ -1425,7 +1497,19 @@ end tell
             }, timeout=10)
             if resp.get("success"):
                 payload = resp.get("payload", {})
-                logger.info("Chrome Bridge click: '%s' → success (bounds: %s)", text, payload.get("bounds"))
+                href = payload.get("href")
+                logger.info("Chrome Bridge click: '%s' → success (bounds: %s, href: %s)", text, payload.get("bounds"), href)
+
+                # If the click was via DOM fallback and the element is a link,
+                # navigate directly since synthetic clicks may not trigger
+                # client-side routing (GitHub Turbo, Next.js, etc.).
+                if href and payload.get("method") == "dom_fallback":
+                    logger.info("DOM fallback detected link — navigating to %s", href)
+                    try:
+                        await chrome_bridge.send_command("set_url", {"url": href}, timeout=10)
+                    except Exception as nav_err:
+                        logger.warning("Fallback navigation failed: %s", nav_err)
+
                 return {"success": True, "output": f"Clicked '{text}' via DOM", "screenshot": ""}
             else:
                 error = resp.get("error", "element not found")
@@ -1529,13 +1613,25 @@ end tell
     use_control_app = platform.system() == "Darwin" and _os.path.isfile(_CONTROL_BIN)
 
     if action == "screenshot":
-        # Support screen_index for capturing a specific display
+        # Support screen_region for capturing a specific display region.
+        # Default: capture only the PRIMARY screen (not all monitors) to avoid
+        # coordinate mapping issues on multi-monitor setups.
         screen_region = kwargs.get("screen_region")  # {x, y, width, height}
         if screen_region:
             region = (screen_region["x"], screen_region["y"], screen_region["width"], screen_region["height"])
             screenshot = _take_screenshot(region=region)
         else:
-            screenshot = _take_screenshot()
+            # Default to primary screen only
+            try:
+                screens_info = await _list_screens()
+                primary = (screens_info.get("screens") or [{}])[0]
+                if primary.get("width"):
+                    region = (primary.get("x", 0), primary.get("y", 0), primary["width"], primary["height"])
+                    screenshot = _take_screenshot(region=region)
+                else:
+                    screenshot = _take_screenshot()
+            except Exception:
+                screenshot = _take_screenshot()
         return {"success": True, "output": "Screenshot captured", "screenshot": screenshot}
 
     if action == "get_screen_size":
@@ -1568,8 +1664,29 @@ end tell
         ctrl_kwargs["amount"] = amount
     if duration != 0.5:
         ctrl_kwargs["duration"] = duration
+    # Mark agent as acting — interference monitor should ignore this input
+    from services.dev_agent.input_monitor import input_monitor as _input_monitor
+    _input_monitor.set_agent_acting(True)
+
     # App-targeted keystrokes: handle directly via AppleScript (more reliable than routing through control app)
+    # Auto-detect frontmost app if no explicit app target is given for keyboard actions.
+    # This prevents keystrokes from being lost when OasisComputerControl.app steals focus.
     app_target = kwargs.get("app")
+    if not app_target and action in ("key_press", "hotkey", "type_text"):
+        try:
+            _detect_proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e",
+                'tell application "System Events" to get name of first application process whose frontmost is true',
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            _detect_out, _ = await asyncio.wait_for(_detect_proc.communicate(), timeout=3)
+            _detected = _detect_out.decode().strip()
+            if _detected and _detected not in ("Oasis Computer Control", "OasisComputerControl"):
+                app_target = _detected
+                logger.info("Auto-detected frontmost app for %s: '%s'", action, app_target)
+        except Exception:
+            pass  # Fall through to OasisComputerControl.app
+
     if app_target and action in ("key_press", "hotkey", "type_text"):
         try:
             safe_app = app_target.replace('"', '\\"')
@@ -1635,12 +1752,41 @@ end tell
                 await asyncio.wait_for(proc.communicate(), timeout=10)
                 output = f"{action}: {text or key or ','.join(keys or [])} → {app_target}"
                 logger.info("App-targeted %s to '%s' via AppleScript", action, app_target)
+                _input_monitor.set_agent_acting(False)
                 screenshot = _take_screenshot()
                 return {"success": True, "output": output, "screenshot": screenshot}
         except Exception as e:
             logger.warning("App-targeted %s failed: %s — falling back to control app", action, e)
 
+    # For click/mouse actions with an explicit app target, bring that app's
+    # window to front first so the click lands on the right window instead of
+    # whatever happens to be on top at those coordinates.
+    if app_target and action in ("click", "double_click", "right_click", "mouse_move"):
+        try:
+            _raise_script = f'''
+tell application "{app_target}" to activate
+delay 0.2
+tell application "System Events"
+    tell process "{app_target}"
+        set frontmost to true
+        try
+            perform action "AXRaise" of window 1
+        end try
+    end tell
+end tell
+'''
+            _raise_proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", _raise_script,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(_raise_proc.communicate(), timeout=5)
+            await asyncio.sleep(0.3)
+            logger.info("Auto-raised '%s' window before %s at (%s, %s)", app_target, action, x, y)
+        except Exception as e:
+            logger.debug("Auto-raise failed for '%s': %s", app_target, e)
+
     ctrl = _run_control(action, **ctrl_kwargs)
+    _input_monitor.set_agent_acting(False)
     screenshot = _take_screenshot()
     return {
         "success": ctrl.get("success", True),

@@ -280,9 +280,11 @@ async function cdpClickElement(tabId, textMatch, selector, index) {
       selector,
       index,
     });
-    return clickResult?.success
-      ? { success: true, bounds: b, method: "dom_fallback" }
-      : { success: false, error: clickResult?.error || "Click failed" };
+    if (clickResult?.success) {
+      const href = clickResult?.payload?.href || null;
+      return { success: true, bounds: b, method: "dom_fallback", href };
+    }
+    return { success: false, error: clickResult?.error || "Click failed" };
   }
 }
 

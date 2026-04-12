@@ -136,13 +136,47 @@ export class ComputerUseController {
       throw new HttpException('Goal is required', HttpStatus.BAD_REQUEST);
     }
 
+    // Clean up voice transcription — remove filler words, false starts, and normalize
+    let cleanGoal = dto.goal.trim();
+    // Always clean up CU goals — voice transcriptions often have misheard words,
+    // filler words, false starts, and unclear phrasing that confuse the planner.
+    // The LLM cleanup is fast (<2s) and only improves quality.
+    const needsCleanup = cleanGoal.length > 20; // Skip trivially short goals
+    if (needsCleanup) {
+      try {
+        const cleanupRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+          user_message:
+            `Clean up this task description. Be CONSERVATIVE — only fix obvious issues:\n` +
+            `- Fix encoding/diacritic errors (e.g., "ưhen" → "when", "réume" → "resume", "ủe" → "user")\n` +
+            `- Remove filler words (uh, um, basically, you know)\n` +
+            `- Fix misheard homophones ONLY if clearly wrong (e.g., "plot code" → "Claude Code")\n` +
+            `- Do NOT change words that are already correct — "sessions" stays "sessions", not "sections"\n` +
+            `- Do NOT rephrase or summarize — keep the original phrasing\n` +
+            `- Keep ALL specific details: app names, URLs, issue numbers, technical terms\n` +
+            `Output ONLY the cleaned text, nothing else.\n\n` +
+            `Original: ${cleanGoal}`,
+          context: {
+            system_override: 'You fix encoding errors and typos in task descriptions. Be conservative — do NOT change words that are already correct. Output ONLY the cleaned text.',
+            max_tokens: 500,
+          },
+        }, { timeout: 15000 });
+        const cleaned = (cleanupRes.data?.response_text || cleanupRes.data?.response || '').trim();
+        if (cleaned && cleaned.length > 10) {
+          this.logger.log(`Goal cleaned: "${cleanGoal.slice(0, 50)}" → "${cleaned.slice(0, 50)}"`);
+          cleanGoal = cleaned;
+        }
+      } catch (err: any) {
+        this.logger.debug(`Goal cleanup failed: ${err.message} — using original`);
+      }
+    }
+
     const sessionId = `cu-${uuidv4().slice(0, 8)}`;
     const now = new Date().toISOString();
     const policy = { ...DEFAULT_POLICY, ...dto.policy };
 
     const session: ComputerUseSession & { visionGranted: boolean } = {
       session_id: sessionId,
-      goal: dto.goal.trim(),
+      goal: cleanGoal,
       status: 'planning',
       policy,
       plan: [],
@@ -311,6 +345,76 @@ export class ComputerUseController {
 
     this.logger.log(`Feedback for ${id}: "${body.message.trim()}"`);
     return { ok: true, queued: queue.length };
+  }
+
+  /**
+   * Get click-assist data — annotated screenshot with numbered clickable elements.
+   * Used by the mobile companion to render element picker when a click fails.
+   */
+  @Get('sessions/:id/click-assist')
+  getClickAssist(@Param('id') id: string) {
+    const session = sessions.get(id);
+    if (!session) throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
+    const assist = (session as any)._click_assist;
+    if (!assist) return { active: false };
+    return {
+      active: session.status === 'awaiting_click_assist',
+      screenshot: assist.screenshot,
+      elements: assist.elements,
+      target: assist.target,
+    };
+  }
+
+  /**
+   * User selected a numbered element — click at that position and resume execution.
+   */
+  @Post('sessions/:id/click-assist')
+  async submitClickAssist(@Param('id') id: string, @Body() body: { number: number }) {
+    const session = sessions.get(id);
+    if (!session) throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
+    if (session.status !== 'awaiting_click_assist') {
+      throw new HttpException('Session is not awaiting click assist', HttpStatus.BAD_REQUEST);
+    }
+    const assist = (session as any)._click_assist;
+    if (!assist?.elements?.length) {
+      throw new HttpException('No click assist data', HttpStatus.BAD_REQUEST);
+    }
+
+    const selected = assist.elements.find((e: any) => e.number === body.number);
+    if (!selected) {
+      throw new HttpException(`Element #${body.number} not found`, HttpStatus.BAD_REQUEST);
+    }
+
+    this.logger.log(`Click assist: user selected #${body.number} "${selected.description}" at (${selected.x_ratio}, ${selected.y_ratio})`);
+
+    // Convert ratios to native screen coordinates
+    try {
+      const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+        tool: 'computer_action', action: 'list_screens',
+      }, { timeout: 5000 });
+      const screens = screensRes.data?.screens || [];
+      const scr = screens[0] || { x: 0, y: 0, width: 1920, height: 1080 };
+      const clickX = Math.round(scr.x + selected.x_ratio * scr.width);
+      const clickY = Math.round(scr.y + selected.y_ratio * scr.height);
+
+      await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+        tool: 'computer_action', action: 'click', x: clickX, y: clickY,
+      }, { timeout: 10000 });
+
+      this.logger.log(`Click assist: clicked at native (${clickX}, ${clickY})`);
+    } catch (err: any) {
+      this.logger.error(`Click assist click failed: ${err.message}`);
+    }
+
+    // Clear assist data and resume execution
+    (session as any)._click_assist = null;
+    session.status = 'executing';
+    session.updated_at = new Date().toISOString();
+
+    // Resume the adaptive loop
+    this.executeAdaptiveLoop(id).catch(() => {});
+
+    return { ok: true, clicked: selected };
   }
 
   /**
@@ -708,6 +812,74 @@ export class ComputerUseController {
     }
   }
 
+  // ── Click Assist: numbered element tagging on failed clicks ─────────────
+
+  /**
+   * When a click fails, take a screenshot, send to vision LLM to identify
+   * clickable elements with numbered tags, then pause the session for user input.
+   */
+  private async requestUserClickAssist(
+    sessionId: string,
+    screenshot: string,
+    failedTarget: string,
+  ): Promise<void> {
+    const session = sessions.get(sessionId);
+    if (!session) return;
+
+    try {
+      const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+        user_message:
+          `I tried to click "${failedTarget}" but it failed. Look at this screenshot and identify all clickable elements.\n\n` +
+          `For each clickable element (buttons, links, tabs, menu items, input fields, icons), provide:\n` +
+          `- number (1-15)\n` +
+          `- description (what it is)\n` +
+          `- x_ratio (horizontal position as 0.0-1.0 from left edge)\n` +
+          `- y_ratio (vertical position as 0.0-1.0 from top edge)\n\n` +
+          `Reply with ONLY a JSON array, no other text:\n` +
+          `[{"number":1,"description":"...","x_ratio":0.5,"y_ratio":0.3}, ...]`,
+        context: {
+          system_override:
+            'You analyze screenshots and identify clickable UI elements. ' +
+            'Output ONLY a valid JSON array. No markdown, no explanation. ' +
+            'Include buttons, links, tabs, menu items, icons, and input fields. ' +
+            'Coordinates are ratios (0.0 = left/top edge, 1.0 = right/bottom edge).',
+          max_tokens: 1000,
+          screen_image: screenshot,
+        },
+      }, { timeout: 30000 });
+
+      const text = (res.data?.response_text || res.data?.response || '').trim();
+
+      // Parse JSON array from response (may be wrapped in ```json blocks)
+      const jsonMatch = text.match(/\[[\s\S]*\]/);
+      let elements: any[] = [];
+      if (jsonMatch) {
+        try {
+          elements = JSON.parse(jsonMatch[0]);
+        } catch { /* parsing failed */ }
+      }
+
+      if (elements.length === 0) {
+        this.logger.warn(`Click assist: vision LLM returned no elements for "${failedTarget}"`);
+        return; // Don't pause — let the agent continue trying
+      }
+
+      // Store assist data on session and pause for user input
+      (session as any)._click_assist = {
+        screenshot,
+        elements,
+        target: failedTarget,
+        timestamp: new Date().toISOString(),
+      };
+      session.status = 'awaiting_click_assist';
+      session.updated_at = new Date().toISOString();
+
+      this.logger.log(`Click assist: ${elements.length} elements identified for "${failedTarget}" — waiting for user`);
+    } catch (err: any) {
+      this.logger.debug(`Click assist failed: ${err.message}`);
+    }
+  }
+
   // ── End CU Learning Memory ─────────────────────────────────────────────
 
   private async researchGoal(goal: string): Promise<string> {
@@ -889,18 +1061,22 @@ export class ComputerUseController {
       `- Only use navigate/browser when there is NO native app for the service.\n` +
       `- BROWSER-ONLY (use navigate, NOT open_app): Facebook, GitHub, Twitter/X, LinkedIn, Reddit, Google, Amazon, YouTube, any website\n` +
       `- NATIVE APP (use open_app): ChatGPT, Claude, Slack, Discord, Finder, Notes, Terminal, Mail, Messages\n` +
+      `- "Claude Code" = try open_app Claude first (desktop app). Only if no desktop app found, fall back to Terminal + 'claude' command.\n` +
       `- For native apps: open_app → read_screen → click_screen\n\n` +
       `EFFICIENCY RULES (these are critical):\n` +
       `1. Generate 3-6 steps. Fewer is better. Every step costs time.\n` +
       `2. NEVER use "screenshot" as a standalone step — "read_screen" already captures the screen AND extracts text. Use read_screen instead.\n` +
       `3. NEVER put "wait" after "navigate" — the navigate action already waits for page load.\n` +
       `4. NEVER put "screenshot" before "read_screen" — read_screen already takes a screenshot.\n` +
-      `5. ALWAYS prefer "navigate" with a direct URL when you can construct it from the goal.\n` +
-      `   Examples: "page called kiveteam" → navigate to https://www.facebook.com/kiveteam\n` +
-      `            "github repo oasis" → navigate to https://github.com/theaiinc/oasis-cognition\n` +
-      `            "my twitter profile" → navigate to https://twitter.com/USERNAME\n` +
-      `   If the goal mentions a page name/slug/URL, USE IT DIRECTLY. Don't search or click through menus.\n` +
-      `6. For GitHub: use direct URLs like https://github.com/orgs/ORGNAME/repositories or https://github.com/USERNAME?tab=repositories\n` +
+      `5. ALWAYS use "navigate" with a direct URL — NEVER use "click" to navigate between pages.\n` +
+      `   navigate is 10x faster and more reliable than clicking links.\n` +
+      `   Examples: "check issues" → navigate https://github.com/theaiinc/oasis-cognition/issues\n` +
+      `            "issue 17" → navigate https://github.com/theaiinc/oasis-cognition/issues/17\n` +
+      `            "facebook profile" → navigate https://www.facebook.com/USERNAME\n` +
+      `   If you can construct the URL, ALWAYS use navigate. NEVER click links to navigate.\n` +
+      `6. For GitHub: ALWAYS construct direct URLs:\n` +
+      `   - Issues: /issues  - Specific issue: /issues/17  - PRs: /pulls  - Code: /tree/main/path\n` +
+      `   NEVER click "Issues" tab or any GitHub nav link — navigate to the URL directly.\n` +
       `7. BEFORE typing text, ALWAYS click the input field first with click_screen. Text input requires focus.\n` +
       `   Example: To type in ChatGPT → click_screen "Message ChatGPT input" THEN type "your query"\n` +
       `   Example: To type in a search bar → click_screen "Search" THEN type "search term"\n` +
@@ -1499,12 +1675,16 @@ CRITICAL RULES:
 2. DETECT the task context:
    - Native app tasks: open_app → read_screen → click_screen
    - Browser-only tasks: navigate → click → scroll
-3. NAVIGATE DIRECTLY when you know the URL (browser only).
-4. If a click has NO EFFECT, NEVER repeat. Try different approach.
+3. NAVIGATE DIRECTLY when you know the URL — ALWAYS prefer navigate over click for websites.
+   - GitHub: construct URLs directly (e.g., /issues, /issues/17, /pulls). NEVER click "Issues" link — navigate to the URL.
+   - Facebook: navigate to facebook.com, facebook.com/profile. NEVER click sidebar links.
+   - Any website: if you can construct the URL, navigate — it's 10x faster and more reliable than clicking.
+4. If a click TIMES OUT or has NO EFFECT, NEVER repeat the same click. Use navigate with a direct URL instead.
 5. "done" requires REAL EVIDENCE. Show what changed.
 6. key_press works in the currently focused app.
 7. After open_app, the screen shows OCR text from the native app — use click_screen to interact.
 8. SCROLL PREFERENCE: When looking for an element, scroll UP first (nav bars, inputs, buttons are usually above). Only scroll DOWN if scrolling up finds nothing. Never scroll more than 3 times in the same direction without taking an action.
+9. switch_tab: only try ONCE. If the tab doesn't exist, immediately use navigate instead. NEVER retry switch_tab.
 9. NEVER do consecutive read_screen or scroll without a real action (click, type, navigate) in between. If you can't find what you need after 2 reads, take a concrete action.`;
 
   private async executeAdaptiveLoop(sessionId: string): Promise<void> {
@@ -1528,6 +1708,11 @@ CRITICAL RULES:
     let prevPageText = '';
     let extraStepsUsed = 0;
     let consecutiveGoalRejections = 0;
+
+    // Start user interference detection
+    await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-interference/start`, {
+      session_id: sessionId,
+    }, { timeout: 5000 }).catch(() => {});
 
     // Launch the always-on-top overlay window via dev-agent
     try {
@@ -1564,25 +1749,32 @@ CRITICAL RULES:
                 screen_region: { x: scr.x, y: scr.y, width: scr.width, height: scr.height },
               }, { timeout: 10000 });
               const scrImage = ssRes.data?.screenshot;
-              if (!scrImage || scrImage.length < 10000) continue;
+              if (!scrImage || scrImage.length < 5000) {
+                this.logger.debug(`Screen "${scr.name}": screenshot too small (${scrImage?.length || 0} chars)`);
+                continue;
+              }
 
               // Describe this screen with vision LLM
+              this.logger.log(`Reading screen "${scr.name}" (${scrImage.length} chars)...`);
               const vRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
                 user_message:
                   `Describe this screenshot of screen "${scr.name}" (${scr.width}x${scr.height}). ` +
                   `I'm looking for the "${(session as any)._native_app_mode}" app. ` +
-                  `List all visible windows/apps and their UI elements. Be concise.`,
+                  `List ALL visible windows, apps, and clickable UI elements. Be thorough.`,
                 context: {
-                  system_override: 'Describe the screenshot. List visible apps and UI elements.',
-                  max_tokens: 600,
+                  system_override: 'Describe the screenshot thoroughly. List ALL visible apps and UI elements with their positions.',
+                  max_tokens: 800,
                   screen_image: scrImage,
                 },
-              }, { timeout: 20000 });
+              }, { timeout: 30000 }); // Increased timeout for large screenshots
               const desc = (vRes.data?.response_text || vRes.data?.response || '').trim();
               if (desc) {
                 descriptions.push(`[Screen: ${scr.name}]\n${desc}`);
+                this.logger.log(`Screen "${scr.name}": ${desc.length} chars description`);
               }
-            } catch { /* skip this screen */ }
+            } catch (scrErr: any) {
+              this.logger.warn(`Failed to read screen "${scr.name}": ${scrErr.message}`);
+            }
           }
         } catch { /* ignore list_screens failure */ }
 
@@ -1635,16 +1827,26 @@ CRITICAL RULES:
       }
       prevPageText = pageText;
 
-      // Stuck detection — if the last 2 actions were the same click with no page change
+      // Stuck detection — if recent actions failed or repeated with no effect
       let stuckNote = '';
-      if (actionHistory.length >= 2 && pageChangeNote.includes('UNCHANGED')) {
-        const last2 = actionHistory.slice(-2);
-        const sameAction = last2.every(h => {
-          const m = h.match(/→\s*"([^"]+)"/);
-          return m?.[1] && m[1] === (last2[0].match(/→\s*"([^"]+)"/)?.[1]);
-        });
-        if (sameAction) {
-          stuckNote = `\n⚠️ STUCK: Same action repeated with no effect. You MUST try a completely different approach — navigate to a different URL, scroll, or skip this step.\n`;
+      if (actionHistory.length >= 2) {
+        // Check for repeated same action
+        if (pageChangeNote.includes('UNCHANGED')) {
+          const last2 = actionHistory.slice(-2);
+          const sameAction = last2.every(h => {
+            const m = h.match(/→\s*"([^"]+)"/);
+            return m?.[1] && m[1] === (last2[0].match(/→\s*"([^"]+)"/)?.[1]);
+          });
+          if (sameAction) {
+            stuckNote = `\n⚠️ STUCK: Same action repeated with no effect. You MUST use "navigate" with a direct URL instead of clicking. NEVER retry a failed click.\n`;
+          }
+        }
+        // Check for consecutive click failures (timeout)
+        const recentFails = actionHistory.slice(-3).filter(h => h.includes('ERROR') || h.includes('timeout'));
+        if (recentFails.length >= 2) {
+          stuckNote += `\n⚠️ ${recentFails.length} CONSECUTIVE CLICK FAILURES. STOP clicking — use "navigate" with a direct URL. ` +
+            `Construct the URL: for GitHub issues use /issues, for a specific issue use /issues/NUMBER, for PRs use /pulls. ` +
+            `For other sites, construct the path from what you know.\n`;
         }
       }
 
@@ -1654,6 +1856,50 @@ CRITICAL RULES:
         .filter(s => s.status === 'pending')
         .map((s, i) => `  ${session.current_step + 2 + i}. ${s.action}: ${s.description}`)
         .join('\n');
+
+      // ── User interference check: pause if user is interacting ──
+      try {
+        const intfRes = await axios.get(
+          `${DEV_AGENT_URL}/internal/dev-agent/cu-interference`, { timeout: 3000 },
+        ).catch(() => null);
+
+        if (intfRes?.data?.interference) {
+          this.logger.log(`User interference detected — pausing session ${sessionId}`);
+          session.status = 'paused';
+          session.error = 'User interference detected — will resume when you stop interacting';
+          session.updated_at = new Date().toISOString();
+
+          // Wait for user to stop (poll every 2s)
+          let waitCount = 0;
+          while (session.status === 'paused' && waitCount < 60) { // max 2 minutes
+            await new Promise(r => setTimeout(r, 2000));
+            waitCount++;
+            // Check if session was cancelled while waiting (status changed by cancel endpoint)
+            if ((session.status as string) === 'cancelled') {
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-interference/stop`).catch(() => {});
+              return;
+            }
+            const check = await axios.get(
+              `${DEV_AGENT_URL}/internal/dev-agent/cu-interference`, { timeout: 3000 },
+            ).catch(() => null);
+            if (check?.data && !check.data.interference) {
+              // User stopped — short delay then resume
+              await new Promise(r => setTimeout(r, 1000));
+              session.status = 'executing';
+              session.error = undefined;
+              session.updated_at = new Date().toISOString();
+              this.logger.log(`User interference cleared after ${waitCount * 2}s — resuming with fresh screen read`);
+              break;
+            }
+          }
+          if (session.status === 'paused') {
+            // Timed out waiting — resume anyway
+            session.status = 'executing';
+            session.error = undefined;
+          }
+          continue; // Re-read screen state at top of loop
+        }
+      } catch { /* interference check failed — continue normally */ }
 
       // 2. Decide: execute as-is (skill plan) or ask LLM to adapt?
       step.status = 'running';
@@ -1716,8 +1962,10 @@ CRITICAL RULES:
 
       // 3. Parse response
       const thought = llmResponse.match(/THOUGHT:\s*(.+)/i)?.[1]?.trim() || '';
-      const action = llmResponse.match(/ACTION:\s*(\S+)/i)?.[1]?.trim().toLowerCase() || 'execute_plan';
-      const target = llmResponse.match(/TARGET:\s*(.+)/i)?.[1]?.trim() || '';
+      const action = (llmResponse.match(/ACTION:\s*(\S+)/i)?.[1] || 'execute_plan')
+        .trim().toLowerCase().replace(/^["']+|["']+$/g, ''); // Strip quotes from action name
+      const target = (llmResponse.match(/TARGET:\s*(.+)/i)?.[1] || '')
+        .trim().replace(/^["']+|["']+$/g, ''); // Strip wrapping quotes from target
 
       this.logger.log(`Step ${session.current_step + 1} [${action}]: ${thought.slice(0, 100)} | target: ${target.slice(0, 60)}`);
       step.description = thought || step.description;
@@ -1918,7 +2166,9 @@ CRITICAL RULES:
       await new Promise(r => setTimeout(r, 500));
     }
 
-    // All steps done
+    // All steps done — stop interference monitor
+    await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-interference/stop`).catch(() => {});
+
     if (session.status === 'executing') {
       session.status = 'completed';
       session.updated_at = new Date().toISOString();
@@ -3556,11 +3806,13 @@ CRITICAL RULES:
       case 'find_ui_element':
       case 'click': {
         // ── CUA unified click: Chrome Bridge DOM → ui_parser OCR/GroundingDINO → pixel fallback ──
+        const nativeAppName = (sessions.get(sid) as any)?._native_app_name;
         const cuaRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
           tool: 'computer_action',
           action: action === 'find_ui_element' ? 'find_ui_element' : 'click_ui_element',
           text: target,
-        }, { timeout: 20000 });
+          ...(nativeAppName ? { app: nativeAppName } : {}),
+        }, { timeout: 12000 });
 
         if (cuaRes.data?.success) {
           this.logger.log(`CUA ${action}: "${target}" → ${cuaRes.data.output}`);
@@ -3608,6 +3860,31 @@ CRITICAL RULES:
       case 'type': {
         if (!target) return { output: 'type action requires target text' };
 
+        // Strip LLM format artifacts — sometimes the LLM puts the action format in the target:
+        // e.g., 'type | TARGET = "actual text"' → 'actual text'
+        let typeTarget = target;
+        if (typeTarget.match(/^(type|click|navigate)\s*\|\s*TARGET\s*=\s*/i)) {
+          typeTarget = typeTarget.replace(/^(type|click|navigate)\s*\|\s*TARGET\s*=\s*/i, '').replace(/^["']|["']$/g, '').trim();
+          this.logger.log(`type: stripped LLM format from target → "${typeTarget.slice(0, 50)}"`);
+        }
+        if (!typeTarget) return { output: 'type action requires target text (empty after cleanup)' };
+
+        // Skip duplicate typing — if a previous step already typed very similar text, skip this one
+        const prevTypeSteps = (sessionId ? sessions.get(sessionId) : undefined)?.plan
+          ?.filter(s => s.status === 'completed' && s.action === 'type' && s.output) || [];
+        if (prevTypeSteps.length > 0) {
+          const lastTyped = prevTypeSteps[prevTypeSteps.length - 1].output?.replace(/^Typed:\s*/i, '').trim() || '';
+          if (lastTyped.length > 30 && typeTarget.length > 30) {
+            // Check if the same content was already typed (fuzzy — first 50 chars match)
+            const lastPrefix = lastTyped.slice(0, 50).toLowerCase();
+            const targetPrefix = typeTarget.slice(0, 50).toLowerCase();
+            if (lastPrefix === targetPrefix || lastTyped.includes(typeTarget.slice(0, 30)) || typeTarget.includes(lastTyped.slice(0, 30))) {
+              this.logger.log(`type: SKIPPING duplicate — already typed similar content in previous step`);
+              return { output: `Skipped: similar content already typed in a previous step` };
+            }
+          }
+        }
+
         // If the type target looks like a composition request (post, message, email)
         // rather than a literal string (URL, search query, short command), compose
         // proper content using the LLM with data collected from previous steps.
@@ -3619,10 +3896,10 @@ CRITICAL RULES:
         const isComposition = (
           descLower.match(/compose|post|write|draft|content|vietnamese|message/) ||
           goalLower.match(/compose.*post|write.*post|post.*on.*facebook|post.*on.*homepage|vietnamese/)
-        ) && !target.match(/^https?:\/\//) // Don't compose URLs
+        ) && !typeTarget.match(/^https?:\/\//) // Don't compose URLs
           && !descLower.match(/search|url|navigate/); // Don't compose search queries
 
-        let textToType = target;
+        let textToType = typeTarget;
         if (isComposition && typeSessCtx) {
           try {
             // Collect data from previous read_screen steps
@@ -3999,12 +4276,33 @@ CRITICAL RULES:
         } catch { /* fallback to pixel click */ }
 
         // 2. Fallback: pixel click via click_ui_element (OCR/GroundingDINO)
+        let pixelClicked = false;
         if (!domClicked) {
-          await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-            tool: 'computer_action',
-            action: 'click_ui_element',
-            text: cleanClickTarget,
-          }, { timeout: 20000 }).catch(() => null);
+          try {
+            const nativeApp = (sessions.get(sid) as any)?._native_app_name;
+            const pixelRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action',
+              action: 'click_ui_element',
+              text: cleanClickTarget,
+              ...(nativeApp ? { app: nativeApp } : {}),
+            }, { timeout: 15000 });
+            pixelClicked = !!pixelRes.data?.success;
+          } catch { /* failed */ }
+        }
+
+        // 3. If BOTH methods failed → request user click assist via mobile
+        if (!domClicked && !pixelClicked && sessionId) {
+          const assistScreen = await this.getScreenImage(sid);
+          if (assistScreen) {
+            await this.requestUserClickAssist(sessionId, assistScreen, cleanClickTarget);
+            const sess = sessions.get(sessionId);
+            if (sess?.status === 'awaiting_click_assist') {
+              return {
+                output: `Could not find "${cleanClickTarget}" — asking user to select element`,
+                screenshot: assistScreen,
+              };
+            }
+          }
         }
 
         await new Promise(r => setTimeout(r, 800));
@@ -4012,7 +4310,9 @@ CRITICAL RULES:
         return {
           output: domClicked
             ? `Clicked "${cleanClickTarget}" via DOM`
-            : `Clicked "${cleanClickTarget}" on screen`,
+            : pixelClicked
+              ? `Clicked "${cleanClickTarget}" on screen`
+              : `Attempted click on "${cleanClickTarget}"`,
           screenshot: clickScreen,
         };
       }

@@ -109,8 +109,11 @@
         }
       }
       if (candidates.length > 0) {
+        // Prefer <a> links over containers (so clicks navigate correctly)
+        const links = candidates.filter(c => c.tagName === "A");
+        const pool = links.length > 0 ? links : candidates;
         const idx = index || 0;
-        return candidates[Math.min(idx, candidates.length - 1)];
+        return pool[Math.min(idx, pool.length - 1)];
       }
 
       // Strategy 2: tree walker fallback for non-interactive elements
@@ -175,6 +178,7 @@
       visible: rect.width > 0 && rect.height > 0 && rect.top < window.innerHeight && rect.bottom > 0,
       tag: el.tagName.toLowerCase(),
       text: (el.textContent || "").trim().substring(0, 200),
+      pageUrl: window.location.href,
     };
   }
 
@@ -199,8 +203,30 @@
           }
           const bounds = getElementBounds(el);
           el.scrollIntoView({ block: "center", behavior: "instant" });
-          el.click();
-          sendResponse({ success: true, payload: { clicked: true, bounds } });
+
+          // Dispatch a full mouse event sequence so client-side routers
+          // (GitHub Turbo, Next.js, etc.) recognise the interaction as a
+          // real user click rather than a synthetic `.click()`.
+          const rect = el.getBoundingClientRect();
+          const cx = rect.left + rect.width / 2;
+          const cy = rect.top + rect.height / 2;
+          const eventOpts = {
+            bubbles: true, cancelable: true, view: window,
+            clientX: cx, clientY: cy, button: 0, buttons: 1,
+          };
+          el.dispatchEvent(new PointerEvent("pointerdown", { ...eventOpts, pointerId: 1 }));
+          el.dispatchEvent(new MouseEvent("mousedown", eventOpts));
+          el.dispatchEvent(new PointerEvent("pointerup", { ...eventOpts, pointerId: 1, buttons: 0 }));
+          el.dispatchEvent(new MouseEvent("mouseup", { ...eventOpts, buttons: 0 }));
+          el.dispatchEvent(new MouseEvent("click", { ...eventOpts, buttons: 0 }));
+
+          // Include href in response so caller can navigate directly if
+          // client-side routing (Turbo, etc.) blocks synthetic clicks.
+          const linkEl = el.closest("a[href]") || el.querySelector("a[href]");
+          const href = linkEl && linkEl.href && !linkEl.href.startsWith("javascript:")
+            ? linkEl.href : null;
+
+          sendResponse({ success: true, payload: { clicked: true, bounds, href } });
           break;
         }
 

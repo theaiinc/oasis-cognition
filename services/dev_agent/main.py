@@ -128,6 +128,11 @@ MEMORY_SERVICE_URL = os.getenv("MEMORY_SERVICE_URL", "http://localhost:8004")
 GATEWAY_URL = os.getenv("GATEWAY_URL", "http://localhost:8000")
 
 
+class AutoGoalRequest(BaseModel):
+    goal: str
+    max_steps: int = 15
+
+
 async def _auto_create_project(project_path: str) -> str | None:
     """Auto-create a project in the gateway and return its project_id."""
     project_name = Path(project_path).name
@@ -219,6 +224,21 @@ app.add_middleware(
 )
 
 CODE_INDEXER_URL = os.getenv("CODE_INDEXER_URL", "http://localhost:8010")
+
+
+# ── Auto-goal: autonomous goal execution ──────────────────────────────────
+
+@app.post("/internal/dev-agent/auto-goal")
+async def auto_goal_endpoint(req: AutoGoalRequest):
+    """Execute a goal autonomously using the CU agent.
+
+    Takes a plain English goal (e.g. "Open Notes and create a note titled
+    Meeting Notes") and automatically executes it step-by-step using LLM-driven
+    decisions based on live screenshots.
+    """
+    from services.dev_agent.auto_goal import run_auto_goal
+    return await run_auto_goal(req.goal, req.max_steps)
+
 
 # ── Serve CU overlay HTML ──────────────────────────────────────────────────────
 from fastapi.responses import FileResponse
@@ -467,6 +487,32 @@ async def launch_cu_overlay(body: dict = {}):
     except Exception as e:
         logger.error("Failed to launch CU overlay: %s", e)
         return {"status": "error", "error": str(e)}
+
+
+# ── User interference detection ────────────────────────────────────────────
+
+from services.dev_agent.input_monitor import input_monitor
+
+
+@app.get("/internal/dev-agent/cu-interference")
+async def get_interference_status():
+    """Check if user interference is currently detected."""
+    return input_monitor.status()
+
+
+@app.post("/internal/dev-agent/cu-interference/start")
+async def start_interference_monitor(body: dict = {}):
+    """Start monitoring for user interference during a CU session."""
+    session_id = body.get("session_id", "")
+    input_monitor.start(session_id)
+    return {"status": "started", "session_id": session_id}
+
+
+@app.post("/internal/dev-agent/cu-interference/stop")
+async def stop_interference_monitor():
+    """Stop monitoring for user interference."""
+    input_monitor.stop()
+    return {"status": "stopped"}
 
 
 @app.post("/internal/dev-agent/cu-overlay/close")

@@ -227,20 +227,29 @@ try:
         f = ns.frame()
         ns_x, ns_y = int(f.origin.x), int(f.origin.y)
         ns_w, ns_h = int(f.size.width), int(f.size.height)
+        # backingScaleFactor: 2.0 on Retina, 1.0 on non-Retina, occasionally 3.0.
+        # CGDisplayCreateImage returns a CGImage in PHYSICAL pixels; NSScreen
+        # frames and mouse/event coords are in POINTS. Divide physical pixels
+        # by this factor when mapping capture-pixel coords back to click coords.
+        try:
+            scale = float(ns.backingScaleFactor())
+        except Exception:
+            scale = 1.0
         # Try to match with CG display by size and x position
         cg_match = None
         for did, cb in cg_bounds.items():
             if cb["w"] == ns_w and cb["h"] == ns_h and cb["x"] == ns_x:
                 cg_match = cb
                 break
+        name = ns.localizedName() if hasattr(ns, 'localizedName') else ""
         if cg_match:
             # Use CG coordinates (correct for CGWindowListCreateImage)
-            screens.append({"x": cg_match["x"], "y": cg_match["y"], "w": cg_match["w"], "h": cg_match["h"], "name": ns.localizedName() if hasattr(ns, 'localizedName') else ""})
+            screens.append({"x": cg_match["x"], "y": cg_match["y"], "w": cg_match["w"], "h": cg_match["h"], "name": name, "scale": scale})
         else:
             # Fallback: convert NSScreen to CG coords manually
             main_h = int(ns_screens[0].frame().size.height)
             cg_y = main_h - ns_y - ns_h
-            screens.append({"x": ns_x, "y": cg_y, "w": ns_w, "h": ns_h, "name": ns.localizedName() if hasattr(ns, 'localizedName') else ""})
+            screens.append({"x": ns_x, "y": cg_y, "w": ns_w, "h": ns_h, "name": name, "scale": scale})
     print(json.dumps(screens))
 except:
     print("[]")
@@ -259,6 +268,7 @@ except:
                         screens[i]["y"] = ns["y"]
                         screens[i]["width"] = ns["w"]
                         screens[i]["height"] = ns["h"]
+                        screens[i]["scale"] = float(ns.get("scale", 1.0))
                         if ns.get("name"):
                             screens[i]["name"] = ns["name"]
                     else:
@@ -266,6 +276,7 @@ except:
                             "index": i, "name": ns.get("name", f"Display {i + 1}"),
                             "width": ns["w"], "height": ns["h"],
                             "x": ns["x"], "y": ns["y"], "thumbnail": "",
+                            "scale": float(ns.get("scale", 1.0)),
                         })
         except Exception as e:
             logger.debug("NSScreen query failed: %s", e)
@@ -305,6 +316,100 @@ def _extract_app_name(label: str) -> str:
     return label.strip()
 
 
+async def _ns_activate_app(app_name: str) -> bool:
+    """Force-activate a macOS app via NSRunningApplication with
+    NSApplicationActivateIgnoringOtherApps.
+
+    Electron apps (Slack, Discord, VS Code, Notion, etc.) sometimes ignore
+    AppleScript/AXRaise entirely — their NSWindow subclass doesn't wire up
+    AXRaise, so the process is "frontmost" but the window stays buried.
+    NSRunningApplication.activate(options: .activateIgnoringOtherApps) is the
+    only reliable way to force the window forward in that case.
+
+    Runs inside OasisScreenCapture.app's Python (has AppKit + TCC context)
+    so we don't trigger a TCC prompt for the parent process.
+    """
+    import asyncio
+    capture_python = _os.path.join(_CAPTURE_APP, "Contents", "MacOS", "python3")
+    if not _os.path.isfile(capture_python):
+        return False
+    safe_name = app_name.replace('"', '\\"').replace("\\", "\\\\")
+    script = f'''
+import sys
+try:
+    from AppKit import NSRunningApplication, NSWorkspace
+    # NSApplicationActivateIgnoringOtherApps = 1 << 1 = 2
+    OPT_IGNORING = 1 << 1
+    target = "{safe_name}".lower()
+    for app in NSWorkspace.sharedWorkspace().runningApplications():
+        name = (app.localizedName() or "").lower()
+        bid = (app.bundleIdentifier() or "").lower()
+        if name == target or target in name or target in bid:
+            ok = app.activateWithOptions_(OPT_IGNORING)
+            print("ok" if ok else "fail")
+            sys.exit(0)
+    print("notfound")
+except Exception as e:
+    print(f"err:{{e}}")
+'''
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            capture_python, "-c", script,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=4)
+        result = stdout.decode().strip()
+        if result == "ok":
+            logger.info("_ns_activate_app(%s): NSRunningApplication.activate succeeded", app_name)
+            return True
+        logger.debug("_ns_activate_app(%s) → %s", app_name, result)
+    except Exception as e:
+        logger.debug("_ns_activate_app(%s) error: %s", app_name, e)
+    return False
+
+
+async def _raise_app_window(app_name: str, attempts: int = 1) -> None:
+    """Best-effort bring an app's frontmost window forward.
+
+    Order of operations (matches well-known Electron quirk workaround):
+      1. AppleScript `activate` + `set frontmost to true` + AXRaise
+      2. If AXRaise is silently ignored (Electron), fall back to
+         NSRunningApplication.activate(.activateIgnoringOtherApps)
+
+    Both steps are cheap and idempotent; we run NS activation unconditionally
+    after AppleScript because detecting "AXRaise was ignored" is unreliable
+    (the action returns success even when the window doesn't actually raise).
+    """
+    import asyncio
+    safe_app = app_name.replace('"', '\\"')
+    script = f'''
+tell application "{safe_app}" to activate
+delay 0.15
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        try
+            set miniaturized of window 1 to false
+        end try
+        try
+            perform action "AXRaise" of window 1
+        end try
+    end tell
+end tell
+'''
+    for _ in range(max(1, attempts)):
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "osascript", "-e", script,
+                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            )
+            await asyncio.wait_for(proc.communicate(), timeout=5)
+        except Exception as e:
+            logger.debug("_raise_app_window AppleScript failed for %s: %s", app_name, e)
+        # Electron fallback — runs every time; no-op if AXRaise already worked.
+        await _ns_activate_app(app_name)
+
+
 async def _focus_window(app_or_title: str) -> dict[str, Any]:
     """Activate/focus a window by app name or window title. macOS uses AppleScript, Linux uses wmctrl."""
     import subprocess
@@ -336,6 +441,9 @@ end tell
 '''
         try:
             subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+            # Electron fallback — NSRunningApplication.activate(.activateIgnoringOtherApps)
+            # in case AXRaise silently no-oped on an Electron window.
+            await _ns_activate_app(app_name)
             time.sleep(0.5)
             return {"success": True, "output": f"Focused: {app_name}", "screenshot": ""}
         except Exception as e:
@@ -745,6 +853,9 @@ end tell
                                 text, scr_name, sx, sy + menu_bar_h, sw, sh - menu_bar_h)
                 else:
                     logger.debug("open_application: maximize script error: %s", mx_stderr.decode()[:200])
+                # Electron fallback: some Electron windows never respond to AXRaise,
+                # leaving the window positioned correctly but buried behind others.
+                await _ns_activate_app(safe_app)
             except Exception as e:
                 logger.debug("open_application: maximize failed for %r: %s", text, e)
 
@@ -1263,16 +1374,39 @@ end tell
                 except Exception:
                     pass
 
-                # Scale from image space to per-screen native coords, then add screen offset
+                # Scale from image space to per-screen native coords, then add screen offset.
+                # NOTE: best_screen["width"] is in POINTS (click/event coord space),
+                # while img_w is the captured image width in PIXELS. On Retina displays
+                # CGDisplayCreateImage returns physical pixels (2x points), and our
+                # ratio-based scale = points / pixels correctly collapses that down.
+                # The per-screen backingScaleFactor is stored on best_screen["scale"]
+                # for visibility and as a sanity check.
                 scale_x = best_screen["width"] / img_w
                 scale_y = best_screen["height"] / img_h
                 native_cx = best_overall["center"][0] * scale_x + best_screen["x"]
                 native_cy = best_overall["center"][1] * scale_y + best_screen["y"]
 
+                backing = float(best_screen.get("scale", 1.0))
+                # If the image happens to be captured at physical pixels without
+                # our resize step (img_w ≈ points × backing), 1/scale_x ≈ backing.
+                # Flag large drift as a configuration smell rather than silently
+                # clicking in the wrong spot.
+                if backing > 1.0 and scale_x > 0:
+                    implied = 1.0 / scale_x
+                    if abs(implied - backing) > 0.25 and abs(implied - 1.0) > 0.25:
+                        logger.warning(
+                            "find_ui_element: screen '%s' scale drift — backingScaleFactor=%.2f "
+                            "but image/point ratio implies %.2f (img_w=%d, pts=%d). "
+                            "Click targeting may be off if CGDisplayCreateImage returned "
+                            "physical pixels without matching resize.",
+                            best_screen.get("name", "?"), backing, implied, img_w, best_screen["width"],
+                        )
+
                 logger.info(
-                    "find_ui_element: '%s' found via %s on screen '%s' — "
+                    "find_ui_element: '%s' found via %s on screen '%s' (scale=%.1f) — "
                     "img(%d,%d) img_size=%dx%d scr_offset=(%d,%d) scr_size=%dx%d → native(%.0f,%.0f)",
                     text, best_overall.get("method", "?"), best_screen.get("name", "?"),
+                    backing,
                     int(best_overall["center"][0]), int(best_overall["center"][1]),
                     img_w, img_h, best_screen["x"], best_screen["y"],
                     best_screen["width"], best_screen["height"], native_cx, native_cy,
@@ -1763,23 +1897,10 @@ end tell
     # whatever happens to be on top at those coordinates.
     if app_target and action in ("click", "double_click", "right_click", "mouse_move"):
         try:
-            _raise_script = f'''
-tell application "{app_target}" to activate
-delay 0.2
-tell application "System Events"
-    tell process "{app_target}"
-        set frontmost to true
-        try
-            perform action "AXRaise" of window 1
-        end try
-    end tell
-end tell
-'''
-            _raise_proc = await asyncio.create_subprocess_exec(
-                "osascript", "-e", _raise_script,
-                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-            )
-            await asyncio.wait_for(_raise_proc.communicate(), timeout=5)
+            # AppleScript AXRaise + NSRunningApplication.activate fallback.
+            # Electron apps routinely ignore AXRaise, so the NS activation
+            # inside _raise_app_window is what actually brings them forward.
+            await _raise_app_window(app_target)
             await asyncio.sleep(0.3)
             logger.info("Auto-raised '%s' window before %s at (%s, %s)", app_target, action, x, y)
         except Exception as e:

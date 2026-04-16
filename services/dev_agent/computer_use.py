@@ -410,8 +410,37 @@ end tell
         await _ns_activate_app(app_name)
 
 
+def _frontmost_app_name() -> str:
+    """Return the name of the currently frontmost app (macOS). Empty string on failure."""
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["osascript", "-e",
+             'tell application "System Events" to return name of first application process whose frontmost is true'],
+            capture_output=True, text=True, timeout=3,
+        )
+        return r.stdout.strip()
+    except Exception:
+        return ""
+
+
+def _frontmost_matches(target: str, frontmost: str) -> bool:
+    """True if the given frontmost name matches the target app (fuzzy: 'Google Chrome' ~= 'Chrome')."""
+    if not frontmost or not target:
+        return False
+    t = target.lower().strip()
+    f = frontmost.lower().strip()
+    return t == f or t in f or f in t
+
+
 async def _focus_window(app_or_title: str) -> dict[str, Any]:
-    """Activate/focus a window by app name or window title. macOS uses AppleScript, Linux uses wmctrl."""
+    """Activate/focus a window by app name or window title. macOS uses AppleScript, Linux uses wmctrl.
+
+    On macOS, verifies the app actually became frontmost by polling
+    `System Events`'s frontmost-process name. Retries up to 3 times with
+    backoff. Returns success=False if the app never became frontmost — callers
+    can then decide to fail the action instead of silently hallucinating.
+    """
     import subprocess
 
     if platform.system() == "Darwin":
@@ -439,15 +468,25 @@ tell application "System Events"
     end tell
 end tell
 '''
-        try:
-            subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
-            # Electron fallback — NSRunningApplication.activate(.activateIgnoringOtherApps)
-            # in case AXRaise silently no-oped on an Electron window.
-            await _ns_activate_app(app_name)
-            time.sleep(0.5)
-            return {"success": True, "output": f"Focused: {app_name}", "screenshot": ""}
-        except Exception as e:
-            logger.warning("AppleScript activate failed for '%s': %s", app_name, e)
+        for attempt in range(3):
+            try:
+                subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+                # Electron fallback — NSRunningApplication.activate(.activateIgnoringOtherApps)
+                # in case AXRaise silently no-oped on an Electron window.
+                await _ns_activate_app(app_name)
+                time.sleep(0.4 + 0.2 * attempt)  # give WindowServer time to promote
+
+                # Verify frontmost — this is the critical check that was missing.
+                fm = _frontmost_app_name()
+                if _frontmost_matches(app_name, fm):
+                    logger.info("focus_window: %r verified frontmost (attempt %d, frontmost=%r)", app_name, attempt + 1, fm)
+                    return {"success": True, "output": f"Focused: {app_name} (verified frontmost)", "screenshot": ""}
+                logger.warning("focus_window: %r NOT frontmost yet (attempt %d, frontmost=%r)", app_name, attempt + 1, fm or "<unknown>")
+            except Exception as e:
+                logger.warning("AppleScript activate failed for '%s' attempt %d: %s", app_name, attempt + 1, e)
+
+        # Primary path didn't confirm frontmost — fall through to fallbacks below.
+        logger.warning("focus_window: primary path exhausted retries for %r — trying fallbacks", app_name)
 
         # Fallback: if the extracted name didn't work, try the raw input
         if app_name != app_or_title:
@@ -455,7 +494,10 @@ end tell
                 script_raw = f'tell application "{app_or_title}" to activate'
                 subprocess.run(["osascript", "-e", script_raw], capture_output=True, timeout=5)
                 time.sleep(0.5)
-                return {"success": True, "output": f"Focused: {app_or_title}", "screenshot": ""}
+                fm_raw = _frontmost_app_name()
+                if _frontmost_matches(app_or_title, fm_raw) or _frontmost_matches(app_name, fm_raw):
+                    return {"success": True, "output": f"Focused: {app_or_title} (verified frontmost)", "screenshot": ""}
+                logger.warning("focus_window raw-fallback: %r still not frontmost (frontmost=%r)", app_or_title, fm_raw)
             except Exception:
                 pass
 
@@ -1199,6 +1241,35 @@ except Exception as e:
             except Exception as e:
                 logger.debug("Chrome Bridge find failed: %s", e)
 
+        # Strategy 1b: Chrome Bridge deep find — when the interactive array is empty
+        # (e.g. Shadow DOM apps like NotebookLM), try finding the element directly
+        # via the content script's findElement which does deep Shadow DOM traversal.
+        if chrome_bridge.connected:
+            try:
+                resp = await chrome_bridge.send_command("get_element_bounds", {
+                    "text_match": text,
+                }, timeout=8)
+                if resp.get("success") and resp.get("payload"):
+                    payload = resp["payload"]
+                    cx = payload.get("centerX") or payload.get("vpX", 0)
+                    cy = payload.get("centerY") or payload.get("vpY", 0)
+                    label = payload.get("text", text)[:80]
+                    logger.info("find_ui_element: '%s' found via Chrome Bridge deep find at (%d,%d)", text, cx, cy)
+                    return {
+                        "success": True,
+                        "output": f"Found '{label}' via Chrome Bridge at ({cx}, {cy})",
+                        "screenshot": "",
+                        "element": {
+                            "label": label,
+                            "method": "dom",
+                            "native_center": [cx, cy],
+                            "center": [cx, cy],
+                            "tag": payload.get("tag", ""),
+                        },
+                    }
+            except Exception as e:
+                logger.debug("Chrome Bridge deep find failed: %s", e)
+
         # Strategy 2: macOS Accessibility API — find by text in focused app
         # Searches name, description, value, title, help, and AXStaticText children
         if platform.system() == "Darwin":
@@ -1435,7 +1506,36 @@ end tell
         if not text:
             return {"success": False, "output": "click_ui_element requires text (element query)", "screenshot": ""}
 
-        # Step 1: Find the element
+        # FAST PATH: Try Chrome Bridge direct click FIRST.
+        # This uses findElement in the content script with deep Shadow DOM traversal
+        # and Unicode-normalized text matching. It's the fastest and most reliable
+        # method for web pages (React, Shadow DOM, etc.).
+        # Try each non-localhost Chrome tab until we find the element.
+        if chrome_bridge.connected:
+            try:
+                # Get all tabs and try clicking in each one until success
+                tabs_resp = await chrome_bridge.send_command("get_page_text", {}, timeout=5)
+                if tabs_resp.get("success"):
+                    # First try without url_hint (active tab)
+                    resp = await chrome_bridge.send_command("click_element", {
+                        "text_match": text,
+                    }, timeout=5)
+                    if resp.get("success"):
+                        payload = resp.get("payload", {})
+                        href = payload.get("href")
+                        logger.info("click_ui_element: '%s' clicked via Chrome Bridge fast path", text)
+                        # Fallback navigation for client-side routers
+                        if href and payload.get("method") == "dom_fallback":
+                            try:
+                                await chrome_bridge.send_command("set_url", {"url": href}, timeout=10)
+                            except Exception:
+                                pass
+                        screenshot = _take_screenshot()
+                        return {"success": True, "output": f"Clicked '{text}' via DOM", "screenshot": screenshot}
+            except Exception as e:
+                logger.debug("Chrome Bridge fast-path click failed for '%s': %s", text, e)
+
+        # SLOW PATH: Full find_ui_element pipeline (Accessibility, OCR, OmniParser)
         find_result = await execute_computer_action(action="find_ui_element", text=text, x=None, y=None, **kwargs)
         if not find_result.get("success") or not find_result.get("element"):
             return {"success": False, "output": f"Could not find '{text}' on screen", "screenshot": find_result.get("screenshot", "")}
@@ -1617,6 +1717,66 @@ end tell
                 logger.warning("switch_tab via Chrome Bridge failed: %s", e)
                 return {"success": False, "output": str(e), "screenshot": ""}
         return {"success": False, "output": "Chrome Bridge not connected — cannot switch tabs", "screenshot": ""}
+
+    if action == "click_scoped":
+        # Anchor-and-traverse click via Chrome Bridge. Finds the post (or other
+        # container) by its unique text prefix (`anchor_text`), then clicks a
+        # specific control inside THAT container by aria-label or inner text.
+        # Solves the "many siblings share the same aria-label" problem common
+        # on FB, Twitter, LinkedIn timelines.
+        anchor_text = kwargs.get("anchor_text") or ""
+        target_aria_label = kwargs.get("target_aria_label") or text or ""
+        target_text = kwargs.get("target_text") or ""
+        if not anchor_text:
+            return {
+                "success": False,
+                "output": "click_scoped requires anchor_text kwarg (post prefix or unique substring)",
+                "screenshot": "",
+            }
+        if not target_aria_label and not target_text:
+            return {
+                "success": False,
+                "output": "click_scoped requires target_aria_label or target_text (at least one)",
+                "screenshot": "",
+            }
+        if not chrome_bridge.connected:
+            return {"success": False, "output": "Chrome Bridge not connected", "screenshot": ""}
+        try:
+            resp = await chrome_bridge.send_command(
+                "click_scoped",
+                {
+                    "anchor_text": anchor_text,
+                    "target_aria_label": target_aria_label,
+                    "target_text": target_text,
+                    "max_ancestors": kwargs.get("max_ancestors") or 15,
+                },
+                timeout=10,
+            )
+            if resp.get("success"):
+                payload = resp.get("payload", {})
+                logger.info(
+                    "click_scoped: anchor=%r target=%r → hit at depth %s via %s",
+                    anchor_text[:40], target_aria_label or target_text,
+                    payload.get("ancestor_depth"), payload.get("click_method", "?"),
+                )
+                screenshot = _take_screenshot()
+                return {
+                    "success": True,
+                    "output": (
+                        f"Clicked scoped (anchor='{anchor_text[:40]}…', "
+                        f"target='{target_aria_label or target_text}', "
+                        f"depth={payload.get('ancestor_depth')}, "
+                        f"method={payload.get('click_method', '?')})"
+                    ),
+                    "screenshot": screenshot,
+                }
+            error = resp.get("error", "click_scoped failed")
+            logger.info("click_scoped failed: anchor=%r target=%r → %s",
+                        anchor_text[:40], target_aria_label or target_text, error)
+            return {"success": False, "output": error, "screenshot": ""}
+        except Exception as e:
+            logger.warning("click_scoped error: %s", e)
+            return {"success": False, "output": str(e), "screenshot": ""}
 
     if action == "chrome_bridge_click":
         # Click an element via the Chrome Bridge extension using text match.

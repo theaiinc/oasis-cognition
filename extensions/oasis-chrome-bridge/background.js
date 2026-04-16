@@ -411,19 +411,128 @@ async function handleCommand(msg) {
         break;
       }
 
-      case "click_element": {
-        const tab = await findTargetTab(payload.url_hint);
-        if (!tab || !tab.id) {
-          sendResponse(id, command, false, null, "No suitable tab found");
-          return;
+      case "click_scoped": {
+        // Anchor-and-traverse click. Content script locates the target by
+        // walking up from the anchor text and down to the target aria-label;
+        // we then CDP-click at the returned coords for a trusted event.
+        const primaryTab = await findTargetTab(payload.url_hint);
+        const tabsToTry = [primaryTab];
+        if (!payload.url_hint) {
+          const allTabs = await chrome.tabs.query({});
+          for (const t of allTabs) {
+            if (t.id === primaryTab?.id) continue;
+            const url = (t.url || "").toLowerCase();
+            if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") ||
+                url.includes("localhost") || url.includes("127.0.0.1")) continue;
+            tabsToTry.push(t);
+          }
         }
-        // Use CDP trusted events (falls back to DOM .click() if CDP fails)
-        const clickResult = await cdpClickElement(
-          tab.id,
-          payload.text_match,
-          payload.selector,
-          payload.index,
-        );
+
+        let scopedResult = { success: false, error: "No suitable tab found" };
+        for (const tab of tabsToTry) {
+          if (!tab || !tab.id) continue;
+          try {
+            await ensureContentScript(tab.id);
+            // Locate only — do not let the content script dispatch the click.
+            const findRes = await chrome.tabs.sendMessage(tab.id, {
+              command: "find_scoped",
+              anchor_text: payload.anchor_text,
+              target_aria_label: payload.target_aria_label,
+              target_text: payload.target_text,
+              max_ancestors: payload.max_ancestors,
+            });
+            if (!findRes?.success || !findRes?.payload?.bounds) {
+              scopedResult = { success: false, error: findRes?.error || "click_scoped: locate failed" };
+              continue;
+            }
+            const b = findRes.payload.bounds;
+            const vpX = b.vpX != null ? b.vpX : (b.x + b.width / 2);
+            const vpY = b.vpY != null ? b.vpY : (b.y + b.height / 2);
+
+            // Trusted click via CDP.
+            try {
+              await cdpAttach(tab.id);
+              await cdpSend(tab.id, "Input.dispatchMouseEvent", {
+                type: "mouseMoved", x: vpX, y: vpY, button: "none",
+              });
+              await new Promise((r) => setTimeout(r, 50));
+              await cdpSend(tab.id, "Input.dispatchMouseEvent", {
+                type: "mousePressed", x: vpX, y: vpY, button: "left", clickCount: 1,
+              });
+              await cdpSend(tab.id, "Input.dispatchMouseEvent", {
+                type: "mouseReleased", x: vpX, y: vpY, button: "left", clickCount: 1,
+              });
+              await chrome.tabs.update(tab.id, { active: true });
+              scopedResult = {
+                success: true,
+                payload: { ...findRes.payload, click_method: "cdp" },
+              };
+              break;
+            } catch (e) {
+              // CDP failed — fall back to the content script's own DOM click.
+              const domRes = await chrome.tabs.sendMessage(tab.id, {
+                command: "click_scoped",
+                anchor_text: payload.anchor_text,
+                target_aria_label: payload.target_aria_label,
+                target_text: payload.target_text,
+                max_ancestors: payload.max_ancestors,
+              });
+              if (domRes?.success) {
+                scopedResult = {
+                  success: true,
+                  payload: { ...domRes.payload, click_method: "dom_fallback" },
+                };
+                await chrome.tabs.update(tab.id, { active: true });
+                break;
+              }
+              scopedResult = { success: false, error: domRes?.error || e.message };
+            }
+          } catch (e) {
+            scopedResult = { success: false, error: e.message || "click_scoped failed" };
+          }
+        }
+        sendResponse(id, command, scopedResult.success, scopedResult.payload || scopedResult, scopedResult.error);
+        break;
+      }
+
+      case "click_element": {
+        // Try the hinted/active tab first, then search ALL tabs for the element.
+        // This handles cases where the agent expects to be on Facebook but Chrome
+        // has a different active tab.
+        const primaryTab = await findTargetTab(payload.url_hint);
+        const tabsToTry = [primaryTab];
+
+        // If primary tab failed or no hint, also try other non-system tabs
+        if (!payload.url_hint) {
+          const allTabs = await chrome.tabs.query({});
+          for (const t of allTabs) {
+            if (t.id === primaryTab?.id) continue;
+            const url = (t.url || "").toLowerCase();
+            if (url.startsWith("chrome://") || url.startsWith("chrome-extension://") ||
+                url.includes("localhost") || url.includes("127.0.0.1")) continue;
+            tabsToTry.push(t);
+          }
+        }
+
+        let clickResult = { success: false, error: "No suitable tab found" };
+        for (const tab of tabsToTry) {
+          if (!tab || !tab.id) continue;
+          try {
+            clickResult = await cdpClickElement(
+              tab.id,
+              payload.text_match,
+              payload.selector,
+              payload.index,
+            );
+            if (clickResult.success) {
+              // Focus the tab where we found the element
+              await chrome.tabs.update(tab.id, { active: true });
+              break;
+            }
+          } catch (e) {
+            clickResult = { success: false, error: e.message || "Click failed" };
+          }
+        }
         sendResponse(id, command, clickResult.success, clickResult, clickResult.error);
         break;
       }

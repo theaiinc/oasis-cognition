@@ -1936,14 +1936,21 @@ class ResponseGeneratorService:
         output_limit = (context or {}).get(
             "max_tokens", 256 if not system_override else 2048
         )
-        # Use dedicated CU LLM client when available and this is a CU call
+        # Use dedicated CU LLM client when available and this is a CU call.
+        # Allow callers to override the model via context.model_override
+        # (e.g. DeepSeek for text-only CU decisions, vision model for screenshots).
+        model_override = (context or {}).get("model_override", "")
         llm_for_chat = self._cu_llm if (self._cu_llm and system_override) else self._llm
-        text = llm_for_chat.chat(
+        chat_kwargs: dict[str, Any] = dict(
             system=full_system,
             user_message=user_msg,
             history=chat_history,
             max_tokens=output_limit,
         )
+        if model_override:
+            chat_kwargs["model"] = model_override
+            logger.info("Using model override for chat: %s", model_override)
+        text = llm_for_chat.chat(**chat_kwargs)
         return text
 
     def stream_casual_response(

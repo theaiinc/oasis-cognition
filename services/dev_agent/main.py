@@ -119,6 +119,11 @@ class ToolRequest(BaseModel):
     screen_region: dict | None = None  # {x, y, width, height} for screen-specific capture
     app: str | None = None             # target app process name for keystroke targeting
     new_tab: bool | None = None        # open URL in new tab (Chrome Bridge)
+    # ── click_scoped fields (Chrome Bridge anchor-and-traverse click) ──
+    anchor_text: str | None = None
+    target_aria_label: str | None = None
+    target_text: str | None = None
+    max_ancestors: int | None = None
     # ── chunked read fields ──
     start_line: int | None = None   # 1-based start line for read_worktree_file
     end_line: int | None = None     # 1-based end line (inclusive) for read_worktree_file
@@ -238,6 +243,116 @@ async def auto_goal_endpoint(req: AutoGoalRequest):
     """
     from services.dev_agent.auto_goal import run_auto_goal
     return await run_auto_goal(req.goal, req.max_steps)
+
+
+# ── CU session file storage (durable memory) ──────────────────────────────────
+# Each CU session gets a plain directory at ~/.oasis/cu-sessions/<session_id>/
+# Used for: SESSION.json, MEMORY.md, SCRATCH.md, USER_NOTES.md, memory/*.md, screenshots/
+# Plain files, not git worktrees — lightweight, survives restarts.
+
+CU_SESSIONS_ROOT = os.path.expanduser("~/.oasis/cu-sessions")
+
+
+def _cu_session_path(session_id: str, *parts: str) -> str:
+    """Resolve a safe path inside a session directory (prevents traversal)."""
+    if not session_id or "/" in session_id or ".." in session_id:
+        raise ValueError(f"Invalid session_id: {session_id!r}")
+    root = os.path.join(CU_SESSIONS_ROOT, session_id)
+    if not parts:
+        return root
+    target = os.path.abspath(os.path.join(root, *parts))
+    # Reject anything that escapes the session dir
+    root_abs = os.path.abspath(root)
+    if not target.startswith(root_abs + os.sep) and target != root_abs:
+        raise ValueError(f"Path escapes session dir: {parts}")
+    return target
+
+
+class CuFileWriteRequest(BaseModel):
+    session_id: str
+    path: str       # relative to session dir (e.g. "MEMORY.md", "memory/001.md")
+    content: str
+    append: bool = False
+
+
+class CuFileReadRequest(BaseModel):
+    session_id: str
+    path: str
+    offset: int = 0   # start line (0-indexed)
+    limit: int = 0    # 0 = all
+
+
+@app.post("/internal/dev-agent/cu-file/write")
+async def cu_file_write(req: CuFileWriteRequest):
+    try:
+        target = _cu_session_path(req.session_id, req.path)
+        os.makedirs(os.path.dirname(target), exist_ok=True)
+        mode = "a" if req.append else "w"
+        with open(target, mode, encoding="utf-8") as f:
+            f.write(req.content)
+        return {"success": True, "path": target, "bytes": len(req.content)}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.post("/internal/dev-agent/cu-file/read")
+async def cu_file_read(req: CuFileReadRequest):
+    try:
+        target = _cu_session_path(req.session_id, req.path)
+        if not os.path.isfile(target):
+            return {"success": False, "error": "Not found", "content": ""}
+        with open(target, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        if req.limit > 0:
+            lines = lines[req.offset : req.offset + req.limit]
+        elif req.offset > 0:
+            lines = lines[req.offset:]
+        return {
+            "success": True,
+            "content": "".join(lines),
+            "total_lines": sum(1 for _ in open(target, encoding="utf-8", errors="replace")),
+        }
+    except Exception as e:
+        return {"success": False, "error": str(e), "content": ""}
+
+
+@app.get("/internal/dev-agent/cu-file/list")
+async def cu_file_list(session_id: str, subdir: str = ""):
+    try:
+        target = _cu_session_path(session_id, subdir) if subdir else _cu_session_path(session_id)
+        if not os.path.isdir(target):
+            return {"success": True, "files": []}
+        files = []
+        for name in sorted(os.listdir(target)):
+            full = os.path.join(target, name)
+            stat = os.stat(full)
+            files.append({
+                "name": name,
+                "is_dir": os.path.isdir(full),
+                "size": stat.st_size,
+                "mtime": stat.st_mtime,
+            })
+        return {"success": True, "files": files}
+    except Exception as e:
+        return {"success": False, "error": str(e), "files": []}
+
+
+@app.get("/internal/dev-agent/cu-file/list-sessions")
+async def cu_file_list_sessions():
+    """List all CU session directories on disk."""
+    try:
+        if not os.path.isdir(CU_SESSIONS_ROOT):
+            return {"success": True, "sessions": []}
+        sessions = []
+        for name in sorted(os.listdir(CU_SESSIONS_ROOT)):
+            full = os.path.join(CU_SESSIONS_ROOT, name)
+            if os.path.isdir(full):
+                session_json = os.path.join(full, "SESSION.json")
+                mtime = os.path.getmtime(session_json) if os.path.isfile(session_json) else os.path.getmtime(full)
+                sessions.append({"session_id": name, "mtime": mtime})
+        return {"success": True, "sessions": sessions}
+    except Exception as e:
+        return {"success": False, "error": str(e), "sessions": []}
 
 
 # ── Serve CU overlay HTML ──────────────────────────────────────────────────────
@@ -699,6 +814,15 @@ async def execute_tool(req: ToolRequest) -> dict[str, Any]:
             extra["app"] = req.app
         if req.new_tab:
             extra["new_tab"] = True
+        # click_scoped kwargs
+        if req.anchor_text is not None:
+            extra["anchor_text"] = req.anchor_text
+        if req.target_aria_label is not None:
+            extra["target_aria_label"] = req.target_aria_label
+        if req.target_text is not None:
+            extra["target_text"] = req.target_text
+        if req.max_ancestors is not None:
+            extra["max_ancestors"] = req.max_ancestors
         result = await execute_computer_action(
             action=req.action,
             x=req.x,

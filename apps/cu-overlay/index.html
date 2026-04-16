@@ -385,7 +385,7 @@
 
     currentSessionId = data.session_id;
     const status = data.status;
-    const isActive = status === 'executing' || status === 'paused' || status === 'planning';
+    const isActive = status === 'executing' || status === 'paused' || status === 'planning' || status === 'awaiting_click_assist';
     const isTerminal = status === 'completed' || status === 'failed' || status === 'cancelled';
 
     // Status dot
@@ -468,7 +468,7 @@
     if (status === 'awaiting_click_assist') {
       banner.style.display = 'block';
       // Show the failed target from session error if available
-      const errMsg = state.error || '';
+      const errMsg = data.error || '';
       if (errMsg) {
         bannerTarget.textContent = errMsg;
       } else {

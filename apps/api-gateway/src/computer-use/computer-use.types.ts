@@ -21,6 +21,12 @@ export interface ComputerUsePolicy {
   max_steps: number;
   /** Maximum seconds before the session auto-terminates. */
   max_duration_seconds: number;
+  /** Maximum cumulative LLM tokens this session can spend. 0 = unlimited. */
+  max_llm_tokens?: number;
+  /** Maximum cumulative LLM calls. 0 = unlimited. */
+  max_llm_calls?: number;
+  /** Auto-pause (instead of fail) when budget hit so the user can extend. */
+  pause_on_budget_hit?: boolean;
   /** Require user confirmation before each step (step-by-step mode). */
   require_step_approval: boolean;
 }
@@ -40,6 +46,9 @@ export const DEFAULT_POLICY: ComputerUsePolicy = {
   ],
   max_steps: 50,
   max_duration_seconds: 600, // 10 min
+  max_llm_tokens: 0,          // unlimited by default
+  max_llm_calls: 0,           // unlimited by default
+  pause_on_budget_hit: true,  // pause (not fail) so user can extend or cancel
   require_step_approval: false,
 };
 
@@ -70,6 +79,13 @@ export interface PlanStep {
   action: string;
   /** Target URL or element description. */
   target?: string;
+  /**
+   * Anchor text for scoped actions like `click_scoped`. The anchor is a unique
+   * substring (e.g. the first 30–60 chars of a target post's body) used to
+   * locate the correct container on pages with many sibling elements that
+   * share the same aria-label/text. Only used when `action === 'click_scoped'`.
+   */
+  anchor?: string;
   status: StepStatus;
   /** Atomic sub-steps generated at execution time. */
   sub_steps?: SubStep[];
@@ -91,6 +107,7 @@ export type SessionStatus =
   | 'executing'             // Steps are running
   | 'paused'                // User paused or step-approval mode
   | 'awaiting_click_assist' // Click failed — waiting for user to pick an element
+  | 'awaiting_credential'   // Agent hit a 2FA/password/captcha — needs user input to continue
   | 'completed'
   | 'failed'
   | 'cancelled';
@@ -142,6 +159,10 @@ export interface CreateSessionDto {
   share_info?: ShareInfo;
   /** Native capture target — defines what pyautogui screenshots will capture. */
   capture_target?: CaptureTarget;
+  /** Project to scope session memory to (for cross-session retrieval). */
+  project_id?: string;
+  /** User who owns this session (for multi-user contexts). */
+  user_id?: string;
 }
 
 export interface ApproveSessionDto {

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 import sys
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
@@ -47,10 +49,57 @@ class FeedbackRequest(BaseModel):
     comment: str = ""
 
 
+SEED_FILE = Path(__file__).parent / "data" / "cu_skills_seed.json"
+
+
+async def _seed_cu_guidance_skills() -> None:
+    """Upsert hand-crafted CU guidance skills from the seed JSON on startup.
+
+    Idempotent: skills are keyed by their stable `id`, so re-running on boot
+    refreshes any edits to the seed file without creating duplicates.
+    """
+    if not SEED_FILE.exists():
+        logger.info("CU skills seed file not found at %s — skipping seed", SEED_FILE)
+        return
+    try:
+        raw = json.loads(SEED_FILE.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logger.warning("Failed to parse CU skills seed %s: %s", SEED_FILE, exc)
+        return
+    if not isinstance(raw, list):
+        logger.warning("CU skills seed expected list, got %s", type(raw).__name__)
+        return
+    seeded = 0
+    for entry in raw:
+        if not isinstance(entry, dict) or not entry.get("id") or not entry.get("name"):
+            logger.warning("Skipping malformed CU skill seed entry: %r", entry)
+            continue
+        try:
+            await memory.upsert_skill_by_id(
+                skill_id=str(entry["id"]),
+                name=str(entry["name"]),
+                intent=str(entry.get("intent", "")),
+                steps=list(entry.get("steps", []) or []),
+                plan_guidance=str(entry.get("plan_guidance", "") or ""),
+                react_guidance=str(entry.get("react_guidance", "") or ""),
+                match_pattern=str(entry.get("match_pattern", "") or ""),
+                source=str(entry.get("source", "handcrafted") or "handcrafted"),
+                enabled=bool(entry.get("enabled", True)),
+            )
+            seeded += 1
+        except Exception as exc:
+            logger.warning("Failed to upsert CU skill %s: %s", entry.get("id"), exc)
+    logger.info("CU skills seed: upserted %d skill(s) from %s", seeded, SEED_FILE.name)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     setup_logging(_settings.log_level)
     logger.info("Memory service started (neo4j=%s)", _settings.neo4j_uri)
+    try:
+        await _seed_cu_guidance_skills()
+    except Exception as exc:
+        logger.warning("CU skills seeding failed (non-fatal): %s", exc)
     yield
     memory.close()
 
@@ -689,6 +738,25 @@ class UpdateSkillStatsRequest(BaseModel):
     success: bool
 
 
+class UpsertSkillRequest(BaseModel):
+    """Upsert a skill by stable id. Used to register handcrafted guidance skills.
+
+    Unlike CreateSkillRequest (which dedupes by intent fingerprint), this allows
+    callers to manage skills by their own id — suitable for versioned, curated
+    skill registries living outside the memory service.
+    """
+
+    id: str
+    name: str
+    intent: str = ""
+    steps: list[str] = []
+    plan_guidance: str = ""
+    react_guidance: str = ""
+    match_pattern: str = ""
+    source: str = "handcrafted"  # 'handcrafted' | 'learned'
+    enabled: bool = True
+
+
 @app.post("/internal/memory/cu/ui-element")
 async def save_cu_ui_element(req: SaveUIElementRequest):
     element_id = await memory.save_ui_element(
@@ -730,6 +798,28 @@ async def find_cu_skill(
 ):
     skill = await memory.find_relevant_skill(intent, context, min_success_rate)
     return {"found": skill is not None, "skill": skill}
+
+
+@app.post("/internal/memory/cu/skill/upsert")
+async def upsert_cu_skill(req: UpsertSkillRequest):
+    """Upsert a skill by stable id (used for registering handcrafted skills)."""
+    skill_id = await memory.upsert_skill_by_id(
+        skill_id=req.id, name=req.name, intent=req.intent, steps=req.steps,
+        plan_guidance=req.plan_guidance, react_guidance=req.react_guidance,
+        match_pattern=req.match_pattern, source=req.source, enabled=req.enabled,
+    )
+    return {"status": "ok", "skill_id": skill_id}
+
+
+@app.get("/internal/memory/cu/skill/guidance")
+async def list_cu_guidance_skills():
+    """List all enabled skills that carry prompt guidance.
+
+    The API gateway side filters by match_pattern client-side (small set; no
+    benefit from DB-side regex).
+    """
+    skills = await memory.list_guidance_skills()
+    return {"count": len(skills), "skills": skills}
 
 
 @app.get("/internal/memory/cu/ui-element/find")

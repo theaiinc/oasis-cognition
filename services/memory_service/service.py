@@ -121,6 +121,7 @@ class MemoryService:
             steps = json.loads(steps_raw) if isinstance(steps_raw, str) else list(steps_raw)
         except Exception:
             steps = []
+        enabled_raw = raw.get("enabled")
         return {
             "id": str(raw.get("id", "")),
             "name": str(raw.get("name", "")),
@@ -129,6 +130,12 @@ class MemoryService:
             "success_rate": cls._safe_rule_float(raw.get("success_rate"), 0.0),
             "usage_count": int(raw.get("usage_count", 0)) if raw.get("usage_count") is not None else 0,
             "created_at": str(raw.get("created_at", "")),
+            # Guidance-skill fields (optional — handcrafted skills populate these)
+            "plan_guidance": str(raw.get("plan_guidance", "") or ""),
+            "react_guidance": str(raw.get("react_guidance", "") or ""),
+            "match_pattern": str(raw.get("match_pattern", "") or ""),
+            "source": str(raw.get("source", "learned") or "learned"),
+            "enabled": True if enabled_raw is None else bool(enabled_raw),
         }
 
     @classmethod
@@ -542,6 +549,8 @@ class MemoryService:
                 "id": skill_id, "fingerprint": fp, "name": name,
                 "intent": self._normalize_rule_part(intent), "steps": steps,
                 "success_rate": 1.0, "usage_count": 1, "created_at": now,
+                "plan_guidance": "", "react_guidance": "", "match_pattern": "",
+                "source": "learned", "enabled": True,
             })
             return skill_id
 
@@ -561,7 +570,9 @@ class MemoryService:
                 session.run("""
                     CREATE (sk:Skill {id: $id, fingerprint: $fp, name: $name,
                         intent: $intent, steps: $steps, success_rate: 1.0,
-                        usage_count: 1, created_at: $now})
+                        usage_count: 1, created_at: $now,
+                        plan_guidance: '', react_guidance: '', match_pattern: '',
+                        source: 'learned', enabled: true})
                 """, id=skill_id, fp=fp, name=name,
                     intent=self._normalize_rule_part(intent),
                     steps=steps_json, now=now)
@@ -576,6 +587,90 @@ class MemoryService:
                 """, sid=actual_id, uid=uid)
 
         return actual_id
+
+    async def upsert_skill_by_id(
+        self,
+        *,
+        skill_id: str,
+        name: str,
+        intent: str = "",
+        steps: list[str] | None = None,
+        plan_guidance: str = "",
+        react_guidance: str = "",
+        match_pattern: str = "",
+        source: str = "handcrafted",
+        enabled: bool = True,
+    ) -> str:
+        """Upsert a skill by its stable id (used for seeding hand-crafted skills).
+
+        Unlike create_skill (which dedupes by fingerprint of the intent), this
+        matches by the caller-supplied id so that handcrafted skills can be
+        re-seeded on service startup without duplication.
+        """
+        steps = steps or []
+        steps_json = json.dumps(steps)
+        now = datetime.now(timezone.utc).isoformat()
+        norm_intent = self._normalize_rule_part(intent)
+        fp = self._cu_fingerprint(intent) if intent else f"handcrafted:{skill_id}"
+
+        if self._use_fallback:
+            for existing in self._fallback_skills:
+                if existing.get("id") == skill_id:
+                    existing.update({
+                        "name": name, "intent": norm_intent, "steps": steps,
+                        "plan_guidance": plan_guidance, "react_guidance": react_guidance,
+                        "match_pattern": match_pattern, "source": source, "enabled": enabled,
+                    })
+                    return skill_id
+            self._fallback_skills.append({
+                "id": skill_id, "fingerprint": fp, "name": name,
+                "intent": norm_intent, "steps": steps,
+                "success_rate": 1.0, "usage_count": 0, "created_at": now,
+                "plan_guidance": plan_guidance, "react_guidance": react_guidance,
+                "match_pattern": match_pattern, "source": source, "enabled": enabled,
+            })
+            return skill_id
+
+        with self._driver.session() as session:
+            session.run("""
+                MERGE (sk:Skill {id: $id})
+                ON CREATE SET sk.fingerprint = $fp, sk.created_at = $now,
+                    sk.success_rate = 1.0, sk.usage_count = 0
+                SET sk.name = $name, sk.intent = $intent, sk.steps = $steps,
+                    sk.plan_guidance = $plan_guidance, sk.react_guidance = $react_guidance,
+                    sk.match_pattern = $match_pattern, sk.source = $source, sk.enabled = $enabled
+            """, id=skill_id, fp=fp, now=now, name=name,
+                intent=norm_intent, steps=steps_json,
+                plan_guidance=plan_guidance, react_guidance=react_guidance,
+                match_pattern=match_pattern, source=source, enabled=enabled)
+            logger.info("Skill upserted (id=%s, source=%s): '%s'", skill_id[:12], source, name[:40])
+        return skill_id
+
+    async def list_guidance_skills(self) -> list[dict[str, Any]]:
+        """Return all enabled skills that carry prompt guidance (plan or react).
+
+        Used by the API gateway to inject per-goal skill priors into the LLM.
+        Matching is performed client-side against each skill's `match_pattern`
+        (small set; no need for DB-side regex).
+        """
+        if self._use_fallback:
+            return [
+                s for s in self._fallback_skills
+                if s.get("enabled", True)
+                and (s.get("plan_guidance") or s.get("react_guidance"))
+            ]
+
+        with self._driver.session() as session:
+            result = session.run("""
+                MATCH (sk:Skill)
+                WHERE sk.enabled = true
+                  AND (
+                    (sk.plan_guidance IS NOT NULL AND sk.plan_guidance <> '')
+                    OR (sk.react_guidance IS NOT NULL AND sk.react_guidance <> '')
+                  )
+                RETURN sk ORDER BY sk.name
+            """)
+            return [self._skill_node_to_dict(row["sk"]) for row in result]
 
     async def update_skill_stats(self, skill_id: str, success: bool) -> None:
         """Update skill success_rate using exponential moving average (alpha=0.3)."""

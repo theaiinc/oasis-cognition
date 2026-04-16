@@ -14,6 +14,7 @@
 import {
   Controller, Post, Get, Delete, Patch, Body, Param,
   Logger, HttpException, HttpStatus,
+  type OnModuleInit,
 } from '@nestjs/common';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
@@ -28,6 +29,8 @@ import type {
 } from './computer-use.types';
 import { DEFAULT_POLICY } from './computer-use.types';
 import { evaluateStepPolicy, validateSessionForExecution } from './computer-use.guard';
+import { SessionMemory, listStoredSessions, loadSessionFromDisk, promoteSessionToArtifacts } from './session-memory';
+import { matchSkills, planGuidanceFor, reactGuidanceFor } from './skills';
 
 const RESPONSE_URL = process.env.RESPONSE_URL || 'http://localhost:8005';
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
@@ -74,8 +77,72 @@ function getAppNameFromLabel(label: string): string {
 }
 
 @Controller('computer-use')
-export class ComputerUseController {
+export class ComputerUseController implements OnModuleInit {
   private readonly logger = new Logger(ComputerUseController.name);
+
+  /* ──────────────────────────── Durable memory ────────────────────────── */
+
+  /** Persist session to disk via SessionMemory. Fire-and-forget. */
+  private persistSession(session: ComputerUseSession): void {
+    const mem = new SessionMemory(session.session_id);
+    mem.snapshot(session).catch(err => {
+      this.logger.debug(`SessionMemory snapshot failed for ${session.session_id}: ${err.message}`);
+    });
+  }
+
+  /** Persist a single step's FULL output to disk. Fire-and-forget.
+   *  Files: ~/.oasis/cu-sessions/<sid>/memory/NNN-action.md */
+  private persistStep(sessionId: string, step: PlanStep, extra: { thought?: string; before?: string } = {}): void {
+    const mem = new SessionMemory(sessionId);
+    mem.writeStep(step, extra).catch(err => {
+      this.logger.debug(`SessionMemory writeStep failed for ${sessionId} step ${step.index}: ${err.message}`);
+    });
+  }
+
+  /** Append a concrete fact to MEMORY.md. Fire-and-forget. */
+  private recordFact(sessionId: string, fact: string): void {
+    const mem = new SessionMemory(sessionId);
+    mem.addFact(fact).catch(() => {});
+  }
+
+  /** Load all CU sessions from disk on startup. Re-adds them to the in-memory Map.
+   *  Phase 8: Resume any sessions that were mid-execution when the gateway died. */
+  async onModuleInit(): Promise<void> {
+    try {
+      const ids = await listStoredSessions();
+      if (ids.length === 0) return;
+      let loaded = 0;
+      let resumed = 0;
+      for (const id of ids) {
+        if (sessions.has(id)) continue;
+        const s = await loadSessionFromDisk(id);
+        if (!s) continue;
+        // Ensure required runtime fields are set
+        const hydrated = { visionGranted: false, ...s } as ComputerUseSession & { visionGranted: boolean };
+        sessions.set(id, hydrated);
+        loaded++;
+
+        // Phase 8: Resume sessions that were actively executing when gateway died.
+        // We DON'T auto-resume click-assist/paused (user-initiated states) — user must explicitly resume.
+        if (hydrated.status === 'executing' && hydrated.visionGranted) {
+          this.logger.log(`Auto-resuming interrupted session ${id} at step ${hydrated.current_step + 1}/${hydrated.plan.length}`);
+          // Mark that we interrupted so the agent knows
+          const mem = new SessionMemory(id);
+          mem.write('USER_NOTES.md',
+            `- [${new Date().toISOString()}] Session was interrupted (gateway restart). Resumed from step ${hydrated.current_step + 1}. Re-read the screen before continuing.\n`,
+            true,
+          ).catch(() => {});
+          this.executeAdaptiveLoop(id).catch(err => {
+            this.logger.warn(`Auto-resume failed for ${id}: ${err.message}`);
+          });
+          resumed++;
+        }
+      }
+      this.logger.log(`Rehydrated ${loaded} CU session(s) from disk (auto-resumed ${resumed})`);
+    } catch (err: any) {
+      this.logger.warn(`Failed to rehydrate sessions from disk: ${err.message}`);
+    }
+  }
 
   /* ──────────────────────────── Sessions ──────────────────────────────── */
 
@@ -121,6 +188,43 @@ export class ComputerUseController {
     const s = sessions.get(id);
     if (!s) throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
     return s;
+  }
+
+  /** Phase 6: Session memory inspection — lists files stored on disk. */
+  @Get('sessions/:id/memory')
+  async getSessionMemory(@Param('id') id: string) {
+    const mem = new SessionMemory(id);
+    const [rootFiles, stepFiles, memoryMd, scratchMd, userNotesMd, handoff] = await Promise.all([
+      mem.list(''),
+      mem.list('memory'),
+      mem.read('MEMORY.md'),
+      mem.read('SCRATCH.md'),
+      mem.read('USER_NOTES.md'),
+      mem.read('HANDOFF.md'),
+    ]);
+    return {
+      session_id: id,
+      memory: memoryMd,
+      scratch: scratchMd,
+      user_notes: userNotesMd,
+      handoff,
+      steps: stepFiles
+        .filter(f => !f.is_dir && f.name.endsWith('.md'))
+        .map(f => ({ name: f.name, size: f.size })),
+      files: rootFiles.map(f => ({ name: f.name, is_dir: f.is_dir, size: f.size })),
+    };
+  }
+
+  /** Phase 6: Read a specific memory file (step, handoff, etc). */
+  @Get('sessions/:id/memory/:path')
+  async getSessionMemoryFile(@Param('id') id: string, @Param('path') path: string) {
+    // Basic path sanitization — only allow known file patterns
+    if (!/^[A-Za-z0-9_\-./]+\.md$/.test(path)) {
+      throw new HttpException('Invalid path', HttpStatus.BAD_REQUEST);
+    }
+    const mem = new SessionMemory(id);
+    const content = await mem.read(path);
+    return { session_id: id, path, content };
   }
 
   /* ──────────────────────────── Create & Plan ─────────────────────────── */
@@ -201,7 +305,49 @@ export class ComputerUseController {
       this.logger.log(`Capture target: mode=${dto.capture_target.mode}, target="${dto.capture_target.target || 'all'}"`);
     }
 
+    // Phase 7: Identity & ownership — scope session memory to project/user
+    if (dto.project_id) {
+      (session as any)._project_id = dto.project_id;
+    }
+    if (dto.user_id) {
+      (session as any)._user_id = dto.user_id;
+    }
+
+    // ── Default browser app for native keyboard routing ───────────────────────
+    //
+    // Native keystroke actions (key_press hotkeys like cmd+a, the AppleScript
+    // fallback path of `type`) use an `app:` parameter to target the correct
+    // process. Without it, AppleScript sends keystrokes to whatever is
+    // frontmost — which may not be the CU target window.
+    //
+    // If the caller supplied share_info/capture_target we can resolve the app
+    // from those. But CU sessions created via API (without a screen share —
+    // e.g., from backend tests, webhooks, or headless automation) have neither.
+    // In that case, if Chrome Bridge is connected, default to Google Chrome:
+    // the Chrome Bridge's presence is strong evidence that Chrome is the
+    // intended working canvas for this session.
+    //
+    // We distinguish `_browser_app` from `_native_app_mode` intentionally:
+    // `_native_app_mode` being set forces the AppleScript path in `type` (no
+    // Chrome Bridge attempt). `_browser_app` is purely a keyboard-routing hint
+    // used as the `app:` parameter — it leaves the Chrome-Bridge-first type
+    // path intact.
+    if (!dto.share_info && !dto.capture_target && !(session as any)._native_app_mode) {
+      try {
+        const healthRes = await axios.get(`${DEV_AGENT_URL}/health`, { timeout: 2000 });
+        if (healthRes.data?.chrome_bridge === true) {
+          (session as any)._browser_app = 'Google Chrome';
+          this.logger.log(`Session ${sessionId}: no share/capture target provided; Chrome Bridge is active → defaulting _browser_app to "Google Chrome" for native keyboard routing`);
+        }
+      } catch {
+        // dev-agent unreachable — skip default silently; the session will still
+        // work for Chrome-Bridge-only actions and will surface a clearer error
+        // if native keyboard actions fail.
+      }
+    }
+
     sessions.set(sessionId, session);
+    this.persistSession(session);  // durable snapshot on creation
 
     // For screen mode, fetch the screen geometry AFTER session is stored in the map
     // Await it so geometry is ready before plan generation starts
@@ -314,24 +460,118 @@ export class ComputerUseController {
     }
     session.status = 'paused';
     session.updated_at = new Date().toISOString();
+    this.persistSession(session);
+
+    // Phase 5: Handoff note — write a human-readable checkpoint so the user
+    // (or a returning session) can understand the state without reading JSON.
+    const currentStep = session.plan[session.current_step];
+    const mem = new SessionMemory(id);
+    const note = [
+      `# Handoff — session paused at ${new Date().toISOString()}`,
+      '',
+      `**Goal:** ${session.goal}`,
+      `**At step:** ${session.current_step + 1}/${session.plan.length}`,
+      ...(currentStep ? [
+        `**Current step:** ${currentStep.action} — ${currentStep.description || '(no description)'}`,
+        ...(currentStep.target ? [`**Target:** ${currentStep.target}`] : []),
+      ] : []),
+      '',
+      'The agent is paused. To resume: POST /sessions/' + id + '/resume',
+      'To add context for the agent before resuming: POST /sessions/' + id + '/user-note with { "note": "your instruction" }',
+    ].join('\n');
+    mem.write('HANDOFF.md', note).catch(() => {});
+
     return { status: 'paused' };
+  }
+
+  /** Phase 5: User injects a note for the agent to read on next step. */
+  @Post('sessions/:id/user-note')
+  async addUserNote(@Param('id') id: string, @Body() body: { note: string }) {
+    const session = sessions.get(id);
+    if (!session) throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
+    if (!body.note?.trim()) throw new HttpException('Note required', HttpStatus.BAD_REQUEST);
+    const mem = new SessionMemory(id);
+    const entry = `- [${new Date().toISOString()}] ${body.note.trim()}\n`;
+    await mem.write('USER_NOTES.md', entry, true);
+    this.logger.log(`Session ${id}: user added note (${body.note.length} chars)`);
+    return { ok: true };
   }
 
   @Post('sessions/:id/resume')
   async resumeSession(@Param('id') id: string) {
     const session = sessions.get(id);
     if (!session) throw new HttpException('Session not found', HttpStatus.NOT_FOUND);
-    if (session.status !== 'paused' && session.status !== 'awaiting_click_assist') {
+    if (session.status !== 'paused' && session.status !== 'awaiting_click_assist' && session.status !== 'awaiting_credential') {
       throw new HttpException(`Cannot resume: status is "${session.status}"`, HttpStatus.CONFLICT);
     }
-    // Clear click-assist data when resuming from click-assist state
+    // Learn from click-assist: capture what the user did so the agent
+    // can replicate it next time without needing help.
     if (session.status === 'awaiting_click_assist') {
+      const assistData = (session as any)._click_assist;
+      const failedTarget = assistData?.target || '';
+
+      // Take a screenshot AFTER user's manual action to see what changed
+      try {
+        const afterScreen = await this.getScreenImage(id);
+        let pageText = '';
+        try {
+          const textRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'get_page_text',
+          }, { timeout: 10000 });
+          if (textRes.data?.success) pageText = (textRes.data.output as string).slice(0, 1000);
+        } catch { /* ignore */ }
+
+        // Ask the LLM to observe what the user did and extract a reusable rule
+        const learnRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+          user_message:
+            `The CU agent was trying to: "${failedTarget}" but couldn't find the element.\n` +
+            `The user manually performed the action. After the user's action, the screen shows:\n` +
+            `${pageText.slice(0, 800)}\n\n` +
+            `What did the user likely do? Extract a reusable rule:\n` +
+            `CONDITION: <when this situation occurs>\n` +
+            `CONCLUSION: <what to do instead>\n\n` +
+            `Reply with ONLY the CONDITION and CONCLUSION lines.`,
+          context: {
+            system_override: 'Observe what the user did during click-assist and extract a reusable IF/THEN rule. Reply ONLY with CONDITION: and CONCLUSION: lines.',
+            max_tokens: 200,
+            ...(afterScreen ? { screen_image: afterScreen } : {}),
+          },
+        }, { timeout: 15000 });
+
+        const ruleText = (learnRes.data?.response_text || learnRes.data?.response || '').trim();
+        const condMatch = ruleText.match(/CONDITION:\s*(.+)/i);
+        const concMatch = ruleText.match(/CONCLUSION:\s*(.+)/i);
+
+        if (condMatch && concMatch) {
+          const rule = { condition: condMatch[1].trim(), conclusion: concMatch[1].trim() };
+          this.logger.log(`Click-assist learning: ${rule.condition} → ${rule.conclusion}`);
+
+          // Store as a memory rule via the memory service
+          try {
+            await axios.post(`${MEMORY_URL}/internal/memory/rules`, {
+              condition: rule.condition,
+              conclusion: rule.conclusion,
+              source: 'click_assist_learning',
+              goal_context: session.goal,
+            }, { timeout: 5000 });
+          } catch { /* best effort */ }
+
+          // Also inject into the session's action history so the adaptive loop knows
+          const currentStep = session.plan[session.current_step];
+          if (currentStep) {
+            currentStep.output = `User manually performed: "${failedTarget}". Learned: ${rule.conclusion}`;
+          }
+        }
+      } catch (err: any) {
+        this.logger.debug(`Click-assist learning failed: ${err.message}`);
+      }
+
       (session as any)._click_assist = null;
-      this.logger.log(`Resuming from click-assist: user will handle the click manually`);
     }
     session.status = 'executing';
-    session.error = undefined; // clear any pause/verification error
+    session.error = undefined;
     session.updated_at = new Date().toISOString();
+    this.persistSession(session);
     this.executeAdaptiveLoop(id).catch(() => {});
     return { status: 'executing' };
   }
@@ -526,6 +766,7 @@ export class ComputerUseController {
     session.status = 'cancelled';
     session.visionGranted = false; // revoke vision on cancel
     session.updated_at = new Date().toISOString();
+    this.persistSession(session);
     return { status: 'cancelled' };
   }
 
@@ -897,11 +1138,11 @@ export class ComputerUseController {
           `"${goal}"\n\n` +
           `Reply with ONLY the search query (one line, no quotes).\n` +
           `IMPORTANT: Focus on the PRIMARY ACTION (delete, close, deactivate, create, change, etc.) not on secondary details.\n` +
-          `Always include the year (2025) and "step by step" for better results.\n` +
+          `Always include the current year (2026) and "step by step" for better results.\n` +
           `Examples:\n` +
-          `- "close my Facebook page Kive" → "how to delete deactivate Facebook page step by step 2025"\n` +
-          `- "list all my github repos" → "how to view all repositories on GitHub 2025"\n` +
-          `- "change my Twitter display name" → "how to change display name on Twitter X step by step 2025"`,
+          `- "close my Facebook page Kive" → "how to delete deactivate Facebook page step by step 2026"\n` +
+          `- "list all my github repos" → "how to view all repositories on GitHub 2026"\n` +
+          `- "change my Twitter display name" → "how to change display name on Twitter X step by step 2026"`,
         context: { system_override: 'Generate a web search query focused on the primary ACTION. Reply with ONLY the query.', max_tokens: 60 },
       }, { timeout: 15000 });
       const searchQuery = (queryRes.data?.response_text || queryRes.data?.response || '').trim();
@@ -971,8 +1212,11 @@ export class ComputerUseController {
     if (!session) return;
 
     // ── Skill-first: check if a learned skill can provide the plan ──
+    // Skill reuse temporarily disabled — matching is too loose and reuses
+    // plans from unrelated goals. TODO: improve skill matching precision.
     const skill = await this.querySkillForCU(goal);
-    if (skill.found && skill.steps && skill.steps.length >= 2) {
+    const useSkill = false; // DISABLED: skill matching reuses wrong plans
+    if (useSkill && skill.found && skill.steps && skill.steps.length >= 2) {
       this.logger.log(`Using learned skill (${skill.steps.length} steps) for "${goal.slice(0, 50)}"`);
       (session as any)._active_skill_id = skill.skillId;
       // Extract the question/query from the goal for the type step
@@ -1036,8 +1280,19 @@ export class ComputerUseController {
 
     const lessonsCtx = memoryCtx; // Neo4j rules replace in-memory lessons
 
+    // ── CU skill registry (DB-backed): prepend strong priors for known apps/flows ──
+    const [skillPlanGuidance, matchedSkills] = await Promise.all([
+      planGuidanceFor(goal),
+      matchSkills(goal),
+    ]);
+    if (matchedSkills.length > 0) {
+      this.logger.log(`Plan: matched ${matchedSkills.length} CU skill(s): ${matchedSkills.map(s => s.id).join(', ')}`);
+      (session as any)._matched_skills = matchedSkills.map(s => s.id);
+    }
+
     const systemPrompt =
       `You are a computer-use planner. You create SHORT, efficient step-by-step plans to control a real computer.\n\n` +
+      skillPlanGuidance +
       lessonsCtx +
       (researchContext ? `${researchContext}\nUse the research above to inform your plan. Follow the documented steps from trusted sources rather than guessing.\n\n` : '') +
       `SHARED SCREEN CONTEXT:\n${shareCtx}\n\n` +
@@ -1049,18 +1304,30 @@ export class ComputerUseController {
         'YOUR PLAN MUST START FROM THE CURRENT STATE. Do NOT include steps for things already done.\n\n' :
         'No screenshot available. Start with a "read_screen" step to observe the screen.\n\n'}` +
       `OUTPUT FORMAT: One step per line using this format (NO JSON, NO markdown):\n` +
-      `STEP: <action> | <target> | <description>\n\n` +
+      `STEP: <action> | <target> | <description>\n` +
+      `Only click_scoped takes a FOURTH field (the anchor):\n` +
+      `STEP: click_scoped | <target aria-label> | <description> | <anchor text>\n\n` +
       `ACTIONS:\n` +
-      `BROWSER:\n` +
+      `BROWSER (for ANY web page — these use the Chrome extension and are fast + reliable):\n` +
       `- navigate | <full URL> | description — opens a URL in the browser\n` +
-      `- click | <visual element description> | description — clicks a visible element in the browser\n` +
+      `- click | <button text, link text, menu item, placeholder text> | description — clicks a DOM element by text match via Chrome extension. ALWAYS use this for web pages.\n` +
+      `- click_scoped | <TARGET aria-label> | description | <ANCHOR text>\n` +
+      `    The FIELDS are: position 2 = TARGET (the control's aria-label), position 4 = ANCHOR (the container-identifying text prefix). Do NOT swap them.\n` +
+      `    Use INSTEAD of click when the page has many sibling elements sharing the same aria-label. The ANCHOR is a unique substring (30-60 chars) that identifies the container whose control you want; we walk UP from the anchor text, then DOWN inside that container for the TARGET.\n` +
+      `    TARGET = the button label you would have passed to a plain "click" (e.g. "Actions for this post", "Edit post", "Save", "Lưu").\n` +
+      `    ANCHOR = the first 30-60 chars of the target container's unique body text (e.g. the goal's quoted post prefix).\n` +
+      `    EXAMPLE (Facebook edit — three-dot menu):\n` +
+      `      STEP: click_scoped | Actions for this post | Open the target post's three-dot menu | Hôm nay mình vừa khám phá một cách làm việc với AI\n` +
+      `      (TARGET="Actions for this post" is the 2nd field, ANCHOR="Hôm nay..." is the 4th.)\n` +
+      `    EXAMPLE (same skill — Edit option in that menu):\n` +
+      `      STEP: click_scoped | Edit post | Click the Edit option | Hôm nay mình vừa khám phá một cách làm việc với AI\n` +
       `- type | <text to type> | description — types text into the focused field\n` +
       `- scroll | up/down | description — scrolls the page\n` +
       `- read_screen | | description — captures screenshot AND extracts all visible text\n` +
       `- key_press | <key or combo e.g. enter, ${hostModifier()}+l> | description\n` +
-      `NATIVE DESKTOP:\n` +
-      `- open_app | <app name> | description — focus/launch a native macOS app (Claude, Finder, Terminal, Slack, etc.)\n` +
-      `- click_screen | <element description> | description — find and click an element on the screen using vision (works on any app)\n` +
+      `NATIVE DESKTOP (ONLY for non-browser apps like Finder, Notes, Terminal):\n` +
+      `- open_app | <app name> | description — focus/launch a native macOS app\n` +
+      `- click_screen | <element description> | description — find and click using vision (ONLY for native apps, NOT for websites)\n` +
       `- wait | <seconds> | description — waits (only if page needs time to load)\n\n` +
       `IMPORTANT:\n` +
       `- PREFER native desktop apps over browser. If ChatGPT/Claude/Slack/Discord/etc. has a desktop app, use open_app — do NOT navigate to the website.\n` +
@@ -1100,7 +1367,9 @@ export class ComputerUseController {
       `- NEVER interact with localhost:3000 (Oasis UI).\n` +
       `- If the goal mentions a page name or identifier, construct the URL directly (e.g., facebook.com/PAGENAME, github.com/USER).\n` +
       `- For page management (settings, delete, etc.): navigate to the page first, then look for Settings in the sidebar.\n` +
-      `  If page settings don't work via click, try business.facebook.com/latest/settings/ for Facebook.\n\n` +
+      `  If page settings don't work via click, try business.facebook.com/latest/settings/ for Facebook.\n` +
+      `- POSTING ON SOCIAL MEDIA: use research results (from web search) to determine the exact steps.\n` +
+      `  ALWAYS include a final read_screen step to verify the post was actually published.\n\n` +
       `EXAMPLE — "list repos for org theaiinc":\n` +
       `STEP: navigate | https://github.com/orgs/theaiinc/repositories | Go directly to org repos page\n` +
       `STEP: read_screen | | Read all visible repository names\n` +
@@ -1220,6 +1489,7 @@ export class ComputerUseController {
         description: s.description || `Step ${i + 1}`,
         action: s.action || 'screenshot',
         target: s.target,
+        anchor: (s as any).anchor,
         status: 'pending' as const,
       }));
 
@@ -1540,17 +1810,20 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         const ptRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
           tool: 'computer_action',
           action: 'get_page_text',
-          text: (session as any)?._work_url_hint || '',
+          text: (session as any)?._current_tab_hint || '',
         }, { timeout: 8000 });
         if (ptRes.data?.success && ptRes.data.output) {
           pageTextCtx = `\nCURRENT PAGE CONTENT:\n${(ptRes.data.output as string).slice(0, 3000)}\n`;
         }
       } catch { /* ignore — screenshot alone is enough */ }
 
+      const skillReactHint = await reactGuidanceFor(goal);
+
       const userMessage =
         `OVERALL GOAL: ${goal}\n` +
         `CURRENT STEP (${step.index + 1}/${session.plan.length}): ${step.description}\n` +
         `STEP ACTION: ${step.action}${step.target ? ` → ${step.target}` : ''}\n` +
+        `${skillReactHint}` +
         `${previousOutputs ? `\nINFO FROM PREVIOUS STEPS:\n${previousOutputs}\n` : ''}` +
         `${discoveryCtx}${feedbackContext}` +
         `SHARED SCREEN: ${shareCtx}\n` +
@@ -1559,12 +1832,37 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
         `The primary action "${step.action}" has ALREADY been executed. Screenshot of current screen is attached.\n` +
         `${verifyHint}\n`;
 
+      // Two-stage verification:
+      // 1. VL model DESCRIBES the screenshot (no reasoning)
+      // 2. Text model (DeepSeek) DECIDES based on description + context
+      let screenDescription = pageTextCtx || '';
+      if (screen) {
+        try {
+          const descRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+            user_message: `Describe this screenshot. List all visible UI elements, text, buttons, dialogs, notifications, and the current state of the page. Be thorough and factual — no reasoning or recommendations.`,
+            context: {
+              system_override: 'You are a screenshot describer. Output ONLY a factual description of what is visible. Do NOT reason about actions, do NOT make recommendations. Just describe what you see.',
+              max_tokens: 600,
+              screen_image: screen,
+            },
+          }, { timeout: LLM_TIMEOUT_MS });
+          const desc = (descRes.data?.response_text || descRes.data?.response || '').trim();
+          if (desc) {
+            screenDescription = `\nSCREEN DESCRIPTION (from vision model):\n${desc}\n`;
+          }
+        } catch { /* vision failed — use page text only */ }
+      }
+
+      // Replace screenshot context with text description for the reasoning model
+      const verifyMessage = userMessage.replace(pageTextCtx, screenDescription);
+      const cuTextModel = process.env.OASIS_TOOL_PLAN_LLM_MODEL || 'deepseek-v3.2';
       const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
-        user_message: userMessage,
+        user_message: verifyMessage,
         context: {
           system_override: ComputerUseController.CU_AGENT_SYSTEM,
           max_tokens: 1024,
-          screen_image: screen,
+          model_override: cuTextModel,
+          // No screen_image — reasoning model gets text description instead
         },
       }, { timeout: LLM_TIMEOUT_MS });
 
@@ -1650,22 +1948,31 @@ navigate, click, type, scroll, screenshot, read_screen, key_press, wait
 You are a SMART computer-use agent controlling a real macOS desktop. You can control BOTH the web browser AND native desktop apps.
 
 OUTPUT (one field per line):
-THOUGHT: <what you see + your reasoning> (1-2 sentences max)
+THOUGHT: <describe what you SEE on screen + what you need to do next> (1-2 sentences max, NO claims of success — just observations)
 ACTION: <action>
 TARGET: <value>
 
-BROWSER ACTIONS:
+BROWSER ACTIONS (use these for ANY web page in Chrome):
 - execute_plan — run the planned step as-is
-- click | TARGET = exact text of clickable element
+- click | TARGET = text of the element to click (button label, link text, menu item, input placeholder). This uses the Chrome extension to find and click DOM elements — it is FAST and RELIABLE. ALWAYS prefer this over click_screen for websites.
+- click_scoped | TARGET = aria-label or text of the control to click; additionally requires ANCHOR on the line below ACTION (not TARGET) containing a unique container-identifying substring (e.g. a post's first 30-60 chars). Use this INSTEAD OF click when the page has many sibling elements with the SAME label (every post on a Facebook profile has its own "Actions for this post" menu — plain click hits the FIRST one, click_scoped hits the one that belongs to the anchor's container). Emit as:
+    ACTION: click_scoped
+    ANCHOR: <unique text prefix identifying the correct container, e.g. the goal's quoted post-prefix>
+    TARGET: <aria-label of the control inside that container>
 - navigate | TARGET = full URL (opens in browser)
 - type | TARGET = text to type into focused field
 - scroll | TARGET = up or down
 - read_screen — capture and read current screen content
 
-NATIVE DESKTOP ACTIONS:
+NATIVE DESKTOP ACTIONS (use ONLY for non-browser apps like Finder, Notes, Terminal):
 - open_app | TARGET = app name (e.g., "Claude", "Finder", "Terminal", "Notes", "Slack")
 - key_press | TARGET = keyboard shortcut (e.g., "enter", "command+c", "command+tab", "escape")
-- click_screen | TARGET = description of what to click on screen (uses screenshot + vision to find and click)
+- click_screen | TARGET = description of what to click (ONLY for native desktop apps, NOT for websites)
+
+MEMORY ACTIONS (use to preserve information across steps — no context loss):
+- scratch_write | TARGET = <full content to save as your working draft> — saves to SCRATCH.md (overwrites). Use this to persist drafts, summaries, or notes that you'll need in a later step. Example: after reading a long summary, write it here so it survives.
+- scratch_append | TARGET = <content to append> — appends a new paragraph to SCRATCH.md.
+- fact | TARGET = <single factual observation> — appends to MEMORY.md as a durable bullet point fact (URLs visited, usernames discovered, decisions made).
 
 CONTROL ACTIONS:
 - skip | TARGET = reason
@@ -1673,7 +1980,8 @@ CONTROL ACTIONS:
 - failed | TARGET = reason
 
 CRITICAL RULES:
-1. PREFER NATIVE APPS over browser. If an app exists as a desktop application (ChatGPT, Claude, Slack, Discord, etc.), use open_app — do NOT open Chrome.
+1. FOR WEBSITES: ALWAYS use "click" (Chrome extension DOM click) — NEVER use "click_screen" for web pages. "click" finds elements by text via the DOM and is 10x more reliable than screenshot-based clicking. "click_screen" is ONLY for native macOS apps.
+2. PREFER NATIVE APPS over browser. If an app exists as a desktop application (ChatGPT, Claude, Slack, Discord, etc.), use open_app — do NOT open Chrome.
    - "open ChatGPT" → open_app ChatGPT (NOT navigate to chatgpt.com)
    - "message on Slack" → open_app Slack (NOT navigate to slack.com)
    - "check email" → open_app Mail (NOT navigate to gmail.com)
@@ -1686,12 +1994,22 @@ CRITICAL RULES:
    - Facebook: navigate to facebook.com, facebook.com/profile. NEVER click sidebar links.
    - Any website: if you can construct the URL, navigate — it's 10x faster and more reliable than clicking.
 4. If a click TIMES OUT or has NO EFFECT, NEVER repeat the same click. Use navigate with a direct URL instead.
-5. "done" requires REAL EVIDENCE. Show what changed.
+5. "done" requires REAL EVIDENCE from the screen showing the action was completed (e.g., "Post published", confirmation toast, the content visible). Simply navigating to a page is NOT done.
 6. key_press works in the currently focused app.
 7. After open_app, the screen shows OCR text from the native app — use click_screen to interact.
 8. SCROLL PREFERENCE: When looking for an element, scroll UP first (nav bars, inputs, buttons are usually above). Only scroll DOWN if scrolling up finds nothing. Never scroll more than 3 times in the same direction without taking an action.
-9. switch_tab: only try ONCE. If the tab doesn't exist, immediately use navigate instead. NEVER retry switch_tab.
-9. NEVER do consecutive read_screen or scroll without a real action (click, type, navigate) in between. If you can't find what you need after 2 reads, take a concrete action.`;
+9. switch_tab: only try ONCE. If the tab doesn't exist, immediately use navigate instead. NEVER retry switch_tab. If you already tried switch_tab and it shows the same page, STOP switching and execute your planned action instead.
+10. NEVER do consecutive passive actions (switch_tab, read_screen, scroll, navigate to the same URL) without a REAL action (click, type) in between.
+11. TRUST THE PLAN: if the planned step is "click" on a specific element and you can see that element in the page text, EXECUTE THE CLICK. Do NOT switch tabs or navigate elsewhere — just click it.
+
+READ THE SCREEN FIRST — always analyze what the UI is showing you:
+- BEFORE attempting your planned action, look at the screenshot for ANY banners, prompts, dialogs, or calls-to-action that the page is showing.
+- If the page says "Switch to X", "Log in as", "Verify your identity", "Accept cookies", or any other prompt, you MUST handle that FIRST before proceeding with your planned action.
+- Click the prompted button (Switch Now, Accept, Continue, Dismiss, etc.) as an adapted action, then retry your planned action on the next step.
+- Common examples: "Switch into [Page] to start managing it" → click "Switch Now". Cookie consent → click "Accept". Login wall → use credentials or report failed.
+- If you see a banner or notification that blocks your target action, ALWAYS address the blocker first.
+- After completing an action (Post, Submit, Save), read_screen to VERIFY the result before claiming done.
+- If you truly don't know how to proceed, use "failed" with a description of what you're stuck on. Do NOT loop.`;
 
   private async executeAdaptiveLoop(sessionId: string): Promise<void> {
     const session = sessions.get(sessionId);
@@ -1705,7 +2023,7 @@ CRITICAL RULES:
       return;
     }
 
-    const researchCtx = (session as any)._research || '';
+    let researchCtx = (session as any)._research || '';
     // Query Neo4j for relevant CU rules
     const lessonsCtx = await this.queryMemoryForCU(session.goal);
     const MAX_EXTRA_STEPS = 8; // max adaptive steps beyond the original plan
@@ -1730,8 +2048,57 @@ CRITICAL RULES:
     } catch { /* overlay not available — not critical */ }
 
     // Walk through each planned step
+    const loopStartedAt = Date.now();
     while (session.current_step < session.plan.length && session.status === 'executing') {
       const step = session.plan[session.current_step];
+
+      // Phase 10: Budget enforcement
+      const policy = session.policy;
+      const elapsedSec = (Date.now() - loopStartedAt) / 1000;
+      if (policy.max_duration_seconds > 0 && elapsedSec > policy.max_duration_seconds) {
+        const msg = `Session exceeded max_duration_seconds (${policy.max_duration_seconds}s)`;
+        this.logger.warn(`Budget: ${msg}`);
+        if (policy.pause_on_budget_hit) {
+          session.status = 'paused';
+          session.error = msg + ' — paused. Update policy and resume to continue.';
+        } else {
+          session.status = 'failed';
+          session.error = msg;
+        }
+        session.updated_at = new Date().toISOString();
+        this.persistSession(session);
+        return;
+      }
+      const llmCalls = (session as any)._llm_calls || 0;
+      if (policy.max_llm_calls && policy.max_llm_calls > 0 && llmCalls >= policy.max_llm_calls) {
+        const msg = `Session exceeded max_llm_calls (${policy.max_llm_calls})`;
+        this.logger.warn(`Budget: ${msg}`);
+        if (policy.pause_on_budget_hit) {
+          session.status = 'paused';
+          session.error = msg + ' — paused. Update policy and resume.';
+        } else {
+          session.status = 'failed';
+          session.error = msg;
+        }
+        session.updated_at = new Date().toISOString();
+        this.persistSession(session);
+        return;
+      }
+      const llmTokens = (session as any)._llm_tokens || 0;
+      if (policy.max_llm_tokens && policy.max_llm_tokens > 0 && llmTokens >= policy.max_llm_tokens) {
+        const msg = `Session exceeded max_llm_tokens (${policy.max_llm_tokens})`;
+        this.logger.warn(`Budget: ${msg}`);
+        if (policy.pause_on_budget_hit) {
+          session.status = 'paused';
+          session.error = msg + ' — paused. Update policy and resume.';
+        } else {
+          session.status = 'failed';
+          session.error = msg;
+        }
+        session.updated_at = new Date().toISOString();
+        this.persistSession(session);
+        return;
+      }
 
       // 1. Read current page/screen state
       let pageText = '';
@@ -1741,6 +2108,25 @@ CRITICAL RULES:
         // Native app mode — capture EACH screen separately and describe with vision LLM
         // Multi-monitor: combined screenshot is too wide for the LLM to read properly
         const descriptions: string[] = [];
+
+        // Ensure the target app is actually frontmost before capturing. Without
+        // this, a foreground shift (e.g. System Preferences, Finder, another
+        // agent's Electron window) causes every subsequent tick to screenshot
+        // the wrong window — the VL describes it correctly but the agent
+        // hallucinates that it's seeing the target app.
+        const targetApp = (session as any)._native_app_mode;
+        if (targetApp) {
+          try {
+            await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'focus_window', text: targetApp,
+            }, { timeout: 4000 });
+            // Give the window server a beat to settle after activation
+            await new Promise(r => setTimeout(r, 250));
+          } catch (err: any) {
+            this.logger.debug(`Pre-capture focus on "${targetApp}" failed: ${err.message}`);
+          }
+        }
+
         try {
           const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
             tool: 'computer_action', action: 'list_screens',
@@ -1801,12 +2187,23 @@ CRITICAL RULES:
           }
         }
       } else {
-        // Browser mode — use Chrome Bridge
+        // Browser mode — use Chrome Bridge with current tab hint
+        const tabHint = (session as any)?._current_tab_hint || '';
         try {
           const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-            tool: 'computer_action', action: 'get_page_text',
+            tool: 'computer_action', action: 'get_page_text', text: tabHint,
           }, { timeout: 15000 });
-          if (pageRes.data?.success) pageText = pageRes.data.output as string;
+          if (pageRes.data?.success) {
+            pageText = pageRes.data.output as string;
+            // Update the tab hint from the actual URL we read
+            const urlMatch = pageText.match(/^URL:\s*(.+)$/m);
+            if (urlMatch) {
+              try {
+                const parsed = new URL(urlMatch[1].trim());
+                (session as any)._current_tab_hint = parsed.hostname + parsed.pathname;
+              } catch { /* ignore */ }
+            }
+          }
         } catch { /* ignore */ }
       }
       if (!pageText) {
@@ -1816,6 +2213,49 @@ CRITICAL RULES:
           }, { timeout: 30000 });
           if (ocrRes.data?.success) pageText = ocrRes.data.output as string;
         } catch { /* ignore */ }
+      }
+
+      // Vision augment: when Chrome Bridge's DOM text is stale (React portals,
+      // modals, shadow-DOM overlays are often missed), fall back to a VL
+      // description of the screenshot so the agent can actually see modal /
+      // dialog content. Gated on "DOM unchanged AFTER an active action that
+      // should have changed state" so we don't burn VL calls on passive reads.
+      if (!isNativeMode && pageText && prevPageText && pageText === prevPageText && actionHistory.length > 0) {
+        const lastAct = actionHistory[actionHistory.length - 1] || '';
+        const lastActionName = (lastAct.match(/\]\s*(\w+)|\.\s*(\w+)/)?.[1] || lastAct.match(/\.\s*(\w+)/)?.[1] || '').toLowerCase();
+        const isActive = ['click', 'type', 'click_screen', 'key_press', 'submit', 'press'].some(a => lastAct.toLowerCase().includes(a));
+        const isPassive = ['read_screen', 'wait', 'screenshot'].includes(lastActionName);
+        if (isActive && !isPassive) {
+          try {
+            const screen = await this.getScreenImage(sessionId);
+            if (screen && screen.length > 5000) {
+              this.logger.log(`Vision augment: DOM stale after "${lastAct.slice(0, 60)}" — querying VL on screenshot`);
+              const vRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+                user_message:
+                  `The DOM text for this browser page is unchanged after the last action ` +
+                  `("${lastAct.slice(0, 100)}"), but a modal/dialog/popover/dropdown may have ` +
+                  `opened that the DOM reader cannot see (React portals, overlays). ` +
+                  `Describe what is VISIBLE on screen right now. Focus on any modal, dialog, ` +
+                  `popover, or dropdown. List clickable buttons, tabs, inputs, and icons with ` +
+                  `their visible labels and approximate positions. Be concise — 20 lines max.`,
+                context: {
+                  system_override:
+                    'Describe what is visible on the screen right now. Prioritize modals, ' +
+                    'dialogs, popovers, and dropdowns. List UI elements with labels. 20 lines max.',
+                  max_tokens: 600,
+                  screen_image: screen,
+                },
+              }, { timeout: 25000 });
+              const desc = (vRes.data?.response_text || vRes.data?.response || '').trim();
+              if (desc) {
+                pageText = pageText + `\n\n⚠️ VISION AUGMENT (DOM was stale after active action — this is what the screen actually shows):\n${desc}`;
+                this.logger.log(`Vision augment: +${desc.length} chars from VL`);
+              }
+            }
+          } catch (err: any) {
+            this.logger.debug(`Vision augment failed: ${err.message}`);
+          }
+        }
       }
 
       // Page change detection
@@ -1854,6 +2294,22 @@ CRITICAL RULES:
             `Construct the URL: for GitHub issues use /issues, for a specific issue use /issues/NUMBER, for PRs use /pulls. ` +
             `For other sites, construct the path from what you know.\n`;
         }
+      }
+
+      // ── Mid-execution research: when stuck, search for how to proceed ──
+      if (stuckNote && !(session as any)._mid_research_done) {
+        try {
+          const currentStepDesc = step.description || step.action || '';
+          const stuckQuery = `how to ${currentStepDesc} step by step 2026`;
+          this.logger.log(`Mid-execution research (stuck): "${stuckQuery}"`);
+          const midResearch = await this.researchGoal(`${session.goal} — currently stuck on: ${currentStepDesc}. Screen shows: ${pageText.slice(0, 200)}`);
+          if (midResearch) {
+            researchCtx = midResearch;
+            (session as any)._research = midResearch;
+            (session as any)._mid_research_done = true;
+            this.logger.log(`Mid-execution research: got ${midResearch.length} chars`);
+          }
+        } catch { /* research failed — continue without */ }
       }
 
       // Build remaining plan context
@@ -1916,10 +2372,15 @@ CRITICAL RULES:
       // Even for skill-sourced plans, the LLM validates each step against the current screen.
       // Skills provide the PLAN (fast, no LLM planning call), but each step is still validated.
       const isSkillPlan = !!(session as any)._active_skill_id;
-      const skillHint = isSkillPlan
-        ? `\nNOTE: This plan comes from a LEARNED SKILL with a proven success rate. ` +
+      const matchedHandcraftedSkills: string[] = (session as any)._matched_skills || [];
+      const hasHandcraftedSkill = matchedHandcraftedSkills.length > 0;
+      const skillHint = (isSkillPlan || hasHandcraftedSkill)
+        ? `\nNOTE: This plan comes from a ${isSkillPlan ? 'LEARNED SKILL with a proven success rate' : `HAND-CRAFTED SKILL (${matchedHandcraftedSkills.join(', ')})`}. ` +
           `Prefer executing the planned step as-is unless the screen clearly shows it won't work. ` +
-          `Do NOT change the action type unless absolutely necessary.\n`
+          `Do NOT change the action type unless absolutely necessary. ` +
+          `In particular, do NOT rewrite a planned "read_screen" / "scroll" / "wait" step into a "click" ` +
+          `just because salient text is visible — the plan intentionally reads/scrolls first to orient, ` +
+          `then clicks a specific target later.\n`
         : '';
 
       // Build progress overview — what's been done and what's left
@@ -1931,50 +2392,152 @@ CRITICAL RULES:
         ? `\nPROGRESS SO FAR:\n${completedSummary}\n`
         : '';
 
+      // ── Durable memory context: load MEMORY.md + SCRATCH.md + USER_NOTES.md ──
+      // Agent has full visibility of facts learned, drafts saved, and user instructions.
+      const sessionMem = new SessionMemory(sessionId);
+      const [memoryMd, scratchMd, userNotesMd] = await Promise.all([
+        sessionMem.loadMemory().catch(() => ''),
+        sessionMem.loadScratch().catch(() => ''),
+        sessionMem.read('USER_NOTES.md').catch(() => ''),
+      ]);
+      const memoryBlock = memoryMd ? `\nMEMORY (facts from prior steps):\n${memoryMd.slice(0, 3000)}\n` : '';
+      const scratchBlock = scratchMd
+        ? `\nSCRATCH (your working draft — USE THIS when typing saved content):\n${scratchMd.slice(0, 3000)}\n`
+        : '';
+      const userNotesBlock = userNotesMd
+        ? `\n⚠️ USER NOTES (instructions the user left for you — FOLLOW THESE):\n${userNotesMd.slice(0, 2000)}\n`
+        : '';
+
+      // Show the most recent drift-guard rejection (if any) so the LLM can
+      // actually avoid repeating the same rejected proposal next turn.
+      const lastRejection = (session as any)?._last_rejection as string | undefined;
+      const rejectionBlock = lastRejection
+        ? `\n⚠️ YOUR PREVIOUS PROPOSAL WAS REJECTED BY THE DRIFT GUARD:\n${lastRejection}\n` +
+          `Re-propose a DIFFERENT action that addresses this rejection. Do NOT repeat the ` +
+          `same (action, target). If no valid action exists, use ACTION: failed with a ` +
+          `short reason.\n\n`
+        : '';
+
       const userPrompt =
         `GOAL: ${session.goal}\n\n` +
         (researchCtx ? `RESEARCH:\n${researchCtx.slice(0, 1500)}\n\n` : '') +
         lessonsCtx +
         skillHint +
+        userNotesBlock +
+        rejectionBlock +
         progressOverview +
+        memoryBlock +
+        scratchBlock +
         (actionHistory.length > 0 ? `RECENT ACTIONS:\n${actionHistory.slice(-5).join('\n')}\n\n` : '') +
         `CURRENT PLANNED STEP (${session.current_step + 1}/${session.plan.length}):\n` +
         `  Action: ${step.action}\n` +
         `  Target: ${step.target || '(none)'}\n` +
+        ((step as any).anchor ? `  Anchor: ${(step as any).anchor}\n` : '') +
         `  Description: ${step.description}\n\n` +
         (remainingSteps ? `REMAINING PLAN:\n${remainingSteps}\n\n` : '') +
         pageChangeNote +
         stuckNote +
         `CURRENT PAGE:\n${pageText.slice(0, 5000)}\n\n` +
         `IMPORTANT: Focus on the REMAINING plan steps. Do NOT repeat actions already completed above. ` +
-        `If a tab or page was already opened, use switch_tab to return to it instead of re-navigating.\n\n` +
+        `If a tab or page was already opened, use switch_tab to return to it instead of re-navigating. ` +
+        `When you have a long draft to type, use scratch_write to save it first, then reference SCRATCH.md when it's time to type.\n\n` +
         `Should the planned step be executed as-is, adapted, or skipped?`;
 
+      // ── Action-pinning: deterministic planned actions skip the LLM adaptation loop.
+      //
+      // read_screen / read_page / wait / key_press don't need visual validation —
+      // the plan specifies exactly what to do, and the action doesn't depend on
+      // resolving any ambiguous target against the current screen.
+      //
+      // Running the adaptive LLM for these steps wastes a call AND, more
+      // importantly, gives the LLM a chance to rewrite the planned action into a
+      // click on something visually salient (observed failure mode on Facebook:
+      // every read_screen / scroll step got rewritten into click → <post title
+      // text> because the large post-text region dominated the screen).
+      //
+      // NOTE: `scroll` is INTENTIONALLY NOT pinned. In search/locate loops the
+      // planner emits several scroll-wait-read_screen cycles in a row — and the
+      // LLM needs the chance to bail out of those cycles when read_screen shows
+      // the target is already visible. Pinning scroll caused the agent to
+      // overshoot past target posts that were already in view after 1–2 cycles.
+      // The skillHint ("do not rewrite a planned scroll into a click") stays in
+      // place to block the original failure mode without trapping the loop.
+      const PINNED_ACTION_TYPES = new Set(['read_screen', 'read_page', 'wait', 'key_press']);
+      // When a hand-crafted skill is active, ALSO pin click/click_scoped steps
+      // that have a specific named target. The skill's planGuidance chose that
+      // target for a reason (e.g. "Edit post" for the menu item, "Actions for
+      // this post" for the three-dot menu). Letting the LLM re-adapt these
+      // almost always converts them into a different target that doesn't advance
+      // the plan (observed: "Edit post" → "Actions for this post" re-opens the
+      // menu instead of clicking Edit, every single run). Chrome Bridge
+      // click_element handles text-match resolution; if the click fails, the
+      // step fails cleanly — which is better than silently substituting a
+      // wrong target that appears to succeed but doesn't produce the expected
+      // UI state.
+      const isSkillPinnedClick =
+        hasHandcraftedSkill &&
+        (step.action === 'click' || step.action === 'click_scoped') &&
+        !!step.target;
+      const actionIsPinned =
+        PINNED_ACTION_TYPES.has(step.action.toLowerCase()) || isSkillPinnedClick;
+
       let llmResponse = '';
-      try {
-        const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
-          user_message: userPrompt,
-          context: { system_override: ComputerUseController.REACT_SYSTEM, max_tokens: 512 },
-        }, { timeout: LLM_TIMEOUT_MS });
-        llmResponse = res.data?.response_text || res.data?.response || '';
-      } catch (err: any) {
-        this.logger.error(`Adaptive LLM failed: ${err.message}`);
-        step.status = 'failed';
-        step.output = `LLM error: ${err.message}`;
-        step.completed_at = new Date().toISOString();
-        session.current_step++;
-        continue;
+      if (actionIsPinned) {
+        this.logger.log(
+          `Step ${session.current_step + 1}: pinning planned action "${step.action}"` +
+          `${step.target ? ` → ${step.target.slice(0, 40)}` : ''} (deterministic — skipping LLM adaptation)`,
+        );
+        // Simulate what the REACT LLM would have returned for "run the plan as-is".
+        // The downstream parser reads THOUGHT/ACTION/TARGET lines from this string.
+        llmResponse = `THOUGHT: deterministic planned action — pinned by action-pinning rule\n` +
+          `ACTION: execute_plan\n` +
+          `TARGET: ${step.target || ''}`;
+        (session as any)._llm_calls_saved = ((session as any)._llm_calls_saved || 0) + 1;
+      } else {
+        try {
+          // Text-only adaptive decisions (no screenshot) use DeepSeek for better
+          // instruction following. Vision calls (with screen_image) use the VL model.
+          const cuTextModel = process.env.OASIS_TOOL_PLAN_LLM_MODEL || 'deepseek-v3.2';
+          const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
+            user_message: userPrompt,
+            context: { system_override: ComputerUseController.REACT_SYSTEM, max_tokens: 512, model_override: cuTextModel },
+          }, { timeout: LLM_TIMEOUT_MS });
+          llmResponse = res.data?.response_text || res.data?.response || '';
+          // Phase 10: Track budget
+          (session as any)._llm_calls = ((session as any)._llm_calls || 0) + 1;
+          if (res.data?.usage?.total_tokens) {
+            (session as any)._llm_tokens = ((session as any)._llm_tokens || 0) + res.data.usage.total_tokens;
+          }
+        } catch (err: any) {
+          this.logger.error(`Adaptive LLM failed: ${err.message}`);
+          step.status = 'failed';
+          step.output = `LLM error: ${err.message}`;
+          step.completed_at = new Date().toISOString();
+          session.current_step++;
+          continue;
+        }
       }
 
       // 3. Parse response
       const thought = llmResponse.match(/THOUGHT:\s*(.+)/i)?.[1]?.trim() || '';
-      const action = (llmResponse.match(/ACTION:\s*(\S+)/i)?.[1] || 'execute_plan')
+      let action = (llmResponse.match(/ACTION:\s*(\S+)/i)?.[1] || 'execute_plan')
         .trim().toLowerCase().replace(/^["']+|["']+$/g, ''); // Strip quotes from action name
-      const target = (llmResponse.match(/TARGET:\s*(.+)/i)?.[1] || '')
+      let target = (llmResponse.match(/TARGET:\s*(.+)/i)?.[1] || '')
         .trim().replace(/^["']+|["']+$/g, ''); // Strip wrapping quotes from target
+      // click_scoped supplies ANCHOR: <container-identifying substring> on an
+      // extra line. Parse it now so downstream executeComputerAction can read
+      // it off step.anchor (set alongside step.action/target below).
+      const llmAnchor = (llmResponse.match(/ANCHOR:\s*(.+)/i)?.[1] || '')
+        .trim().replace(/^["']+|["']+$/g, '');
 
       this.logger.log(`Step ${session.current_step + 1} [${action}]: ${thought.slice(0, 100)} | target: ${target.slice(0, 60)}`);
-      step.description = thought || step.description;
+      // Store the LLM's thought as context but keep the original step description
+      // so the plan shows what the step IS, not the LLM's running commentary/claims.
+      (step as any)._thought = thought || '';
+      // Only update description if it was empty (e.g., auto-generated check steps)
+      if (!step.description && thought) {
+        step.description = thought;
+      }
 
       // 4. Handle the decision
       if (action === 'done') {
@@ -2063,14 +2626,109 @@ CRITICAL RULES:
         continue;
       }
 
-      // 5. Execute — either the planned step or an adapted action
+      // ── Memory actions: scratch_write, scratch_append, fact ─────────────
+      // These don't need a plan step to consume — they're meta-actions that
+      // persist to the session's durable memory. They do NOT advance current_step
+      // because they're orthogonal to the plan's progress; the LLM can keep
+      // executing the actual planned step next iteration.
+      if (action === 'scratch_write') {
+        const mem = new SessionMemory(sessionId);
+        await mem.writeScratch(target);
+        actionHistory.push(`${session.current_step + 1}. SCRATCH_WRITE (${target.length} chars)`);
+        this.logger.log(`Session ${sessionId}: wrote SCRATCH.md (${target.length} chars)`);
+        continue;
+      }
+      if (action === 'scratch_append') {
+        const mem = new SessionMemory(sessionId);
+        const current = await mem.loadScratch();
+        await mem.writeScratch(current + (current ? '\n\n' : '') + target);
+        actionHistory.push(`${session.current_step + 1}. SCRATCH_APPEND (${target.length} chars)`);
+        continue;
+      }
+      if (action === 'fact') {
+        this.recordFact(sessionId, target);
+        actionHistory.push(`${session.current_step + 1}. FACT: ${target.slice(0, 80)}`);
+        continue;
+      }
+
+      // 5. Guard: if LLM keeps choosing switch_tab instead of executing the plan,
+      // force the planned action after 2 consecutive switch_tab attempts.
+      const recentSwitchTabs = actionHistory.slice(-2).filter(h => h.includes('switch_tab')).length;
+      if (action === 'switch_tab' && recentSwitchTabs >= 2) {
+        this.logger.warn(`Overriding LLM switch_tab (${recentSwitchTabs + 1}x) — forcing planned action: ${step.action}`);
+        action = 'execute_plan';
+        target = step.target || '';
+      }
+
+      // Execute — either the planned step or an adapted action
       const execAction = action === 'execute_plan' ? step.action : action;
       const execTarget = action === 'execute_plan' ? (step.target || '') : target;
+
+      // ── Drift guard: validate the resolved (action, target) before execution. ──
+      // Rejects destructive clicks, post-body-text drift when a skill is active,
+      // and silent action-type swaps on pinned plan steps. On rejection we do NOT
+      // execute; we loop back and re-ask the LLM with the rejection reason.
+      // Sessions that rack up too many rejections are failed outright to prevent
+      // indefinite drift loops.
+      const validation = this.validateProposedAction(
+        step,
+        { action: execAction, target: execTarget },
+        session,
+        matchedHandcraftedSkills,
+      );
+      if (!validation.ok) {
+        const prev = ((session as any)._action_rejections || 0);
+        const rejections = prev + 1;
+        (session as any)._action_rejections = rejections;
+        const MAX_SESSION_REJECTIONS = 5;
+        this.logger.warn(
+          `Rejected proposed action [${execAction}${execTarget ? ` → ${execTarget.slice(0, 60)}` : ''}] ` +
+          `(${rejections}/${MAX_SESSION_REJECTIONS}): ${validation.reason}`,
+        );
+        actionHistory.push(
+          `${session.current_step + 1}. REJECTED [${execAction}${execTarget ? ` "${execTarget.slice(0, 40)}"` : ''}]: ${(validation.reason || '').slice(0, 120)}`,
+        );
+        // Make the rejection visible to the next LLM call via the userPrompt builder.
+        (session as any)._last_rejection = validation.reason;
+
+        if (rejections >= MAX_SESSION_REJECTIONS) {
+          this.logger.error(
+            `Session ${sessionId}: exceeded ${MAX_SESSION_REJECTIONS} action rejections — failing session to prevent drift.`,
+          );
+          step.status = 'failed';
+          step.output = `Drift guard: ${rejections} proposed actions rejected as invalid. Last rejection: ${validation.reason}`;
+          step.completed_at = new Date().toISOString();
+          session.status = 'failed';
+          session.error = `Drift guard triggered — agent proposed ${rejections} invalid actions. Last: ${(validation.reason || '').slice(0, 240)}`;
+          session.updated_at = new Date().toISOString();
+          this.generateSessionSummary(sessionId).catch(() => {});
+          if ((session as any)._active_skill_id) {
+            axios.patch(
+              `${MEMORY_URL}/internal/memory/cu/skill/${(session as any)._active_skill_id}/stats`,
+              { success: false },
+              { timeout: 5000 },
+            ).catch(() => {});
+          }
+          return;
+        }
+        // Don't advance the step, don't mutate step.action/target — loop back
+        // to get a fresh LLM proposal with the rejection reason in context.
+        continue;
+      }
+      // Valid action — clear the last-rejection hint so it doesn't linger in
+      // prompts for future independent steps.
+      (session as any)._last_rejection = undefined;
 
       // Update the step to reflect what we're actually doing
       if (action !== 'execute_plan') {
         step.action = execAction;
         step.target = execTarget;
+        // Capture the LLM-supplied anchor for click_scoped. Plan-level
+        // anchors (from the skill's planGuidance emitted by draftPlan)
+        // remain intact when action === 'execute_plan'.
+        if (execAction === 'click_scoped' && llmAnchor) {
+          (step as any).anchor = llmAnchor;
+        }
       }
 
       try {
@@ -2085,6 +2743,24 @@ CRITICAL RULES:
         if (result.screenshot) session.live_screenshot = result.screenshot;
 
         actionHistory.push(`${session.current_step + 1}. ${execAction}${execTarget ? ` → "${execTarget.slice(0, 50)}"` : ''} → ${result.output.slice(0, 80)}`);
+
+        // Durable per-step history: write FULL output to memory/NNN-action.md
+        this.persistStep(sessionId, step, {
+          thought: (step as any)._thought || thought,
+          before: pageText ? pageText.slice(0, 2000) : undefined,
+        });
+
+        // Record concrete facts to MEMORY.md based on action type
+        if (execAction === 'type' && execTarget) {
+          this.recordFact(sessionId, `Typed: "${execTarget.slice(0, 300)}"`);
+        } else if (execAction === 'navigate' && execTarget) {
+          this.recordFact(sessionId, `Navigated to: ${execTarget}`);
+        } else if (execAction === 'click' && result.output && !result.output.includes('timeout')) {
+          this.recordFact(sessionId, `Clicked: "${execTarget.slice(0, 100)}"`);
+        } else if (execAction === 'read_screen' || execAction === 'read_page') {
+          const m = result.output.match(/^URL:\s*(.+)$/m);
+          if (m) this.recordFact(sessionId, `Read page: ${m[1].trim()}`);
+        }
 
         // ── CU Learning: save action + UI element to memory (fire-and-forget) ──
         const uiElemId = await this.saveUIElementToMemory(
@@ -2124,9 +2800,19 @@ CRITICAL RULES:
           /verification.code/i, /confirm.your.identity/i, /captcha/i,
         ];
         if (VERIFICATION_PATTERNS.some(p => p.test(result.output))) {
-          session.status = 'paused';
-          session.error = 'Verification required. Complete it in the browser, then resume.';
+          session.status = 'awaiting_credential';
+          session.error = 'Verification required (2FA / captcha / identity check). Complete it in the browser, then resume.';
           session.updated_at = new Date().toISOString();
+          this.persistSession(session);
+          // Write a human-readable handoff so the user knows what's needed
+          new SessionMemory(sessionId).write('HANDOFF.md',
+            `# Credential needed — ${new Date().toISOString()}\n\n` +
+            `The website is asking for verification (2FA, captcha, or identity confirmation).\n\n` +
+            `**What to do:**\n` +
+            `1. Complete the verification in the browser yourself.\n` +
+            `2. Then POST /sessions/${sessionId}/resume to continue.\n` +
+            `3. Optionally, POST /sessions/${sessionId}/user-note with instructions first.\n`,
+          ).catch(() => {});
           return;
         }
       } catch (err: any) {
@@ -2134,23 +2820,29 @@ CRITICAL RULES:
         step.output = err.message;
         step.completed_at = new Date().toISOString();
         actionHistory.push(`${session.current_step + 1}. ${execAction} → ERROR: ${err.message.slice(0, 60)}`);
+        // Durable per-step history for failed steps too
+        this.persistStep(sessionId, step, {
+          thought: (step as any)._thought || thought,
+          before: pageText ? pageText.slice(0, 2000) : undefined,
+        });
       }
 
       session.current_step++;
       session.updated_at = new Date().toISOString();
 
-      // Track consecutive read_screen/scroll steps (no real progress)
-      if (['read_screen', 'read_page', 'scroll'].includes(execAction)) {
+      // Track consecutive passive steps (no real progress: navigate, read, scroll, open_app)
+      const passiveActions = ['read_screen', 'read_page', 'scroll', 'navigate', 'switch_tab', 'open_app'];
+      if (passiveActions.includes(execAction)) {
         consecutiveReadScreens++;
       } else {
         consecutiveReadScreens = 0;
       }
 
-      // If 4 consecutive read_screen/scroll with no real action → agent is stuck, stop
-      if (consecutiveReadScreens >= 4) {
-        this.logger.warn(`Agent stuck: ${consecutiveReadScreens} consecutive read/scroll steps — stopping`);
-        session.status = 'completed';
-        session.error = 'Agent stopped making progress (consecutive read/scroll without action). Partial completion.';
+      // If 6 consecutive passive steps without a real action (click/type) → agent is stuck, FAIL
+      if (consecutiveReadScreens >= 6) {
+        this.logger.warn(`Agent stuck: ${consecutiveReadScreens} consecutive passive steps (navigate/read/scroll) — marking FAILED`);
+        session.status = 'failed';
+        session.error = 'Agent stopped making progress — repeated navigation/reading without performing the requested action (no clicks or typing).';
         session.updated_at = new Date().toISOString();
         this.generateSessionSummary(sessionId).catch(() => {});
         return;
@@ -2169,6 +2861,9 @@ CRITICAL RULES:
         extraStepsUsed++;
       }
 
+      // Durable snapshot at the end of each loop iteration
+      this.persistSession(session);
+
       await new Promise(r => setTimeout(r, 500));
     }
 
@@ -2176,7 +2871,24 @@ CRITICAL RULES:
     await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/cu-interference/stop`).catch(() => {});
 
     if (session.status === 'executing') {
-      session.status = 'completed';
+      // Before marking complete, verify the goal was actually achieved.
+      // Detect "no real action" patterns: if the agent only navigated/read
+      // without ever clicking or typing, it likely didn't accomplish the goal.
+      const realActions = session.plan.filter(s =>
+        s.status === 'completed' &&
+        s.action && !['navigate', 'read_screen', 'read_page', 'scroll', 'screenshot', 'switch_tab', 'open_app', 'wait'].includes(s.action),
+      );
+      const goalSatisfied = await this.checkGoalSatisfaction(sessionId, session.goal, session.plan);
+
+      if (!goalSatisfied) {
+        this.logger.warn(`All steps done but goal NOT satisfied (${realActions.length} real actions). Marking FAILED.`);
+        session.status = 'failed';
+        session.error = realActions.length === 0
+          ? 'Agent completed all steps but never performed the requested action (no clicks or typing occurred).'
+          : 'Agent completed all steps but the goal was not verified as achieved.';
+      } else {
+        session.status = 'completed';
+      }
       session.updated_at = new Date().toISOString();
       this.generateSessionSummary(sessionId).catch(() => {});
     }
@@ -2399,62 +3111,127 @@ CRITICAL RULES:
     const session = sessions.get(sessionId);
     if (!session) return;
 
-    // Collect all read_screen outputs — these contain the actual data
-    const dataOutputs = session.plan
-      .filter(s => s.status === 'completed' && s.output && s.output.length > 20)
-      .filter(s => s.action === 'read_screen' || s.action === 'read_page')
+    // ── EVIDENCE-BASED SUMMARY: built from ACTUAL step outputs only ──
+    // No LLM involved in determining what happened. The LLM only polishes wording.
+
+    const completedSteps = session.plan.filter(s => s.status === 'completed');
+    const failedSteps = session.plan.filter(s => s.status === 'failed');
+
+    // Extract concrete evidence from step outputs
+    const typedContent = session.plan
+      .filter(s => s.action === 'type' && s.status === 'completed' && s.output)
+      .map(s => {
+        const m = (s.output || '').match(/^Typed:\s*(.+)/i);
+        return m ? m[1].trim() : '';
+      })
+      .filter(t => t.length > 5);
+
+    const clickedElements = session.plan
+      .filter(s => s.action === 'click' && s.status === 'completed' && s.output)
+      .filter(s => !(s.output || '').includes('timeout'))
+      .map(s => (s.output || '').slice(0, 80));
+
+    const readScreenData = session.plan
+      .filter(s => (s.action === 'read_screen' || s.action === 'read_page') && s.status === 'completed' && s.output)
       .map(s => s.output!)
-      .slice(-3); // Last 3 read_screen outputs (most relevant)
+      .slice(-2);
 
-    // Also get the last step output regardless of type
-    const lastCompleted = [...session.plan].reverse().find(s => s.status === 'completed' && s.output);
-    const failedStep = session.plan.find(s => s.status === 'failed');
+    const navigatedUrls = session.plan
+      .filter(s => s.action === 'navigate' && s.status === 'completed' && s.output)
+      .map(s => {
+        const m = (s.output || '').match(/^URL:\s*(.+)/m);
+        return m ? m[1].trim() : (s.output || '').slice(0, 60);
+      });
 
-    const dataContext = dataOutputs.length > 0
-      ? `DATA EXTRACTED FROM SCREEN:\n${dataOutputs.join('\n---\n').slice(0, 4000)}`
-      : lastCompleted?.output
-        ? `LAST STEP OUTPUT:\n${lastCompleted.output.slice(0, 2000)}`
-        : 'No data was extracted.';
+    // Build factual evidence summary
+    const evidence: string[] = [];
+    if (navigatedUrls.length > 0) {
+      const uniqueUrls = [...new Set(navigatedUrls)].slice(0, 5);
+      evidence.push(`Visited: ${uniqueUrls.join(', ')}`);
+    }
+    if (typedContent.length > 0) {
+      evidence.push(`Typed: "${typedContent.map(t => t.slice(0, 100)).join('", "')}"`);
+    }
+    if (clickedElements.length > 0) {
+      evidence.push(`Clicked: ${clickedElements.length} elements`);
+    }
+    if (failedSteps.length > 0) {
+      evidence.push(`Failed: ${failedSteps.map(s => `"${s.action}" (${(s.output || '').slice(0, 50)})`).join(', ')}`);
+    }
 
-    const statusContext = session.status === 'failed'
-      ? `The session FAILED.${failedStep ? ` Step "${failedStep.description}" failed: ${failedStep.output?.slice(0, 300)}` : ''}\n${session.error || ''}`
-      : `The session completed successfully.`;
+    // Determine status from hard evidence
+    const isFailed = session.status === 'failed';
+    const goalLower = session.goal.toLowerCase();
+    const goalNeedsPost = /\b(post|publish|share|send|create.*post)\b/.test(goalLower);
+    const goalNeedsType = /\b(post|write|type|create|compose)\b/.test(goalLower);
+    const hasTypedPost = typedContent.some(t => t.length > 20 && !t.startsWith('http'));
+    const clickedPost = clickedElements.some(o => /post|publish|share|send/i.test(o));
 
-    const prompt =
-      `You are summarizing the results of a computer-use task.\n\n` +
-      `GOAL: ${session.goal}\n` +
-      `STATUS: ${statusContext}\n\n` +
-      `${dataContext}\n\n` +
-      `Write a concise, helpful response that directly answers the user's original request.\n` +
-      `- If the data contains a list (repos, files, items), format it as a clean bullet list.\n` +
-      `- If the task failed, explain what went wrong briefly.\n` +
-      `- Do NOT mention "steps", "sessions", "OCR", or internal implementation details.\n` +
-      `- Write as if YOU did the work and are reporting back.`;
+    let statusLine: string;
+    if (isFailed) {
+      statusLine = `❌ **Task failed**: ${session.error || 'Unknown error'}`;
+    } else if (goalNeedsPost && !clickedPost) {
+      statusLine = `⚠️ **Partial**: Content may have been typed but the Post/Publish button was not confirmed as clicked.`;
+    } else if (goalNeedsType && !hasTypedPost) {
+      statusLine = `⚠️ **Partial**: The required text content was not typed.`;
+    } else {
+      statusLine = `✅ **Task completed**`;
+    }
 
+    // Build the summary WITHOUT LLM — pure evidence
+    const evidenceBlock = evidence.length > 0
+      ? `\n\n**What was done:**\n${evidence.map(e => `- ${e}`).join('\n')}`
+      : '\n\nNo actions were performed.';
+
+    const readDataBlock = readScreenData.length > 0
+      ? `\n\n**Data read from screen:**\n${readScreenData.map(d => d.slice(0, 500)).join('\n---\n')}`
+      : '';
+
+    const factualSummary = `${statusLine}${evidenceBlock}${readDataBlock}`;
+
+    // Optionally let LLM polish the wording but ONLY using the factual content above
     try {
       const res = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
-        user_message: prompt,
+        user_message:
+          `Rewrite this factual summary in a friendly, concise way. Do NOT add any information that is not already present. Do NOT invent content.\n\n` +
+          `GOAL: ${session.goal}\n\n` +
+          `FACTUAL SUMMARY:\n${factualSummary}\n\n` +
+          `Rewrite concisely. Keep the status emoji. Keep all evidence. Do not add anything new.`,
         context: {
-          system_override: 'You are Oasis, a helpful assistant. Summarize computer-use task results concisely for the user. Use markdown formatting.',
-          max_tokens: 1024,
+          system_override: 'Rewrite the given factual summary concisely. Do NOT add information. Do NOT invent results.',
+          max_tokens: 512,
         },
-      }, { timeout: LLM_TIMEOUT_MS });
+      }, { timeout: 15000 });
 
-      const summary = res.data?.response_text || res.data?.response || '';
-      if (summary) {
-        (session as any).summary = summary.trim();
-        session.updated_at = new Date().toISOString();
-        this.logger.log(`Session ${sessionId} summary generated (${summary.length} chars)`);
+      const polished = (res.data?.response_text || res.data?.response || '').trim();
+      // Sanity check: if the polished version is much longer than the factual one, it added content
+      if (polished && polished.length < factualSummary.length * 2) {
+        (session as any).summary = polished;
+      } else {
+        (session as any).summary = factualSummary;
       }
-    } catch (err: any) {
-      // Fallback: create a basic summary from the data
-      const fallback = session.status === 'failed'
-        ? `I tried to ${session.goal} but encountered an error: ${session.error || 'unknown error'}`
-        : dataOutputs.length > 0
-          ? `Here's what I found for "${session.goal}":\n\n${dataOutputs[dataOutputs.length - 1]?.slice(0, 1000) || 'Task completed.'}`
-          : `I completed the task: ${session.goal}`;
-      (session as any).summary = fallback;
-      this.logger.warn(`Summary LLM failed, using fallback: ${err.message}`);
+    } catch {
+      // LLM failed — use the raw factual summary
+      (session as any).summary = factualSummary;
+    }
+    session.updated_at = new Date().toISOString();
+    this.persistSession(session);
+    this.logger.log(`Session ${sessionId} summary generated (${((session as any).summary || '').length} chars)`);
+
+    // Phase 4: Promote session memory to artifact service for cross-session retrieval.
+    // Only promote successful/completed sessions — failed sessions with empty memory
+    // don't teach us anything useful.
+    if (session.status === 'completed') {
+      const projectId = (session as any)._project_id || undefined;
+      promoteSessionToArtifacts(sessionId, session.goal, projectId)
+        .then(artifactId => {
+          if (artifactId) {
+            this.logger.log(`Session ${sessionId} memory promoted to artifact ${artifactId}`);
+          }
+        })
+        .catch(err => {
+          this.logger.debug(`Failed to promote session ${sessionId} to artifacts: ${err.message}`);
+        });
     }
   }
 
@@ -2467,6 +3244,74 @@ CRITICAL RULES:
     goal: string,
     plan: PlanStep[],
   ): Promise<boolean> {
+    // ── Hard pre-checks: detect patterns that indicate definite failure ──
+    const completedSteps = plan.filter(s => s.status === 'completed');
+    const failedSteps = plan.filter(s => s.status === 'failed');
+
+    // Check for looping: if the same action+description repeats 3+ times, agent was stuck
+    const actionCounts = new Map<string, number>();
+    for (const s of completedSteps) {
+      const key = `${s.action}|${(s.description || '').slice(0, 40)}`;
+      actionCounts.set(key, (actionCounts.get(key) || 0) + 1);
+    }
+    const maxRepeat = Math.max(0, ...actionCounts.values());
+    if (maxRepeat >= 3) {
+      this.logger.warn(`Goal check: REJECTED — same action repeated ${maxRepeat} times (looping pattern)`);
+      return false;
+    }
+
+    // Check for high failure ratio: if >40% of steps failed, goal unlikely satisfied
+    if (completedSteps.length + failedSteps.length >= 4) {
+      const failRatio = failedSteps.length / (completedSteps.length + failedSteps.length);
+      if (failRatio > 0.4) {
+        this.logger.warn(`Goal check: REJECTED — ${failedSteps.length}/${completedSteps.length + failedSteps.length} steps failed (${(failRatio * 100).toFixed(0)}%)`);
+        return false;
+      }
+    }
+
+    // ── Evidence-based action checks ──
+    const goalLower = goal.toLowerCase();
+
+    // Extract what ACTUALLY happened from step outputs
+    const typedContent = completedSteps
+      .filter(s => s.action === 'type' && s.output)
+      .map(s => { const m = (s.output || '').match(/^Typed:\s*(.+)/i); return m ? m[1] : ''; })
+      .filter(t => t.length > 5);
+
+    const clickedOutputs = completedSteps
+      .filter(s => s.action === 'click' && s.output && !(s.output || '').includes('timeout'))
+      .map(s => (s.output || ''));
+
+    // Goal requires posting → must have typed content + clicked post button
+    const goalNeedsPost = /\b(post|publish|share|announce)\b/.test(goalLower);
+    if (goalNeedsPost) {
+      const hasTypedPost = typedContent.some(t => t.length > 20 && !t.startsWith('http'));
+      const clickedPostBtn = clickedOutputs.some(o => /Clicked.*post|Clicked.*publish|Clicked.*share/i.test(o));
+      if (!hasTypedPost) {
+        this.logger.warn(`Goal check: REJECTED — goal requires posting but no text content was typed`);
+        return false;
+      }
+      if (!clickedPostBtn) {
+        this.logger.warn(`Goal check: REJECTED — goal requires posting but Post/Publish button was not clicked`);
+        return false;
+      }
+    }
+
+    // Goal requires typing → must have type action
+    const goalNeedsType = /\b(create|write|type|compose)\b/.test(goalLower);
+    if (goalNeedsType && typedContent.length === 0) {
+      this.logger.warn(`Goal check: REJECTED — goal requires text input but nothing was typed`);
+      return false;
+    }
+
+    // Goal requires navigation → must have successful navigate
+    const goalNeedsNav = /\b(navigate|go to|open|visit)\b/.test(goalLower);
+    const navigated = completedSteps.some(s => s.action === 'navigate' && s.output && !s.output.includes('failed'));
+    if (goalNeedsNav && !navigated && completedSteps.length > 0) {
+      // Not a hard reject — navigation might have been done via other means
+    }
+
+    // If ALL hard checks pass, also do a quick LLM verification with the screen
     const currentScreen = await this.getScreenImage(sessionId);
 
     // Use Chrome Bridge get_page_text for reliable text (falls back to OCR)
@@ -2510,8 +3355,7 @@ CRITICAL RULES:
     // Include research context if available for better goal verification
     const researchCtx = (sessions.get(sessionId) as any)?._research || '';
 
-    // Include step failure context
-    const failedSteps = plan.filter(s => s.status === 'failed');
+    // Include step failure context (reuse failedSteps from pre-checks above)
     const failureCtx = failedSteps.length > 0
       ? `\nFAILED STEPS:\n${failedSteps.map(s => `  Step ${s.index + 1}: "${s.description}" → ${(s.output || '').slice(0, 200)}`).join('\n')}\n`
       : '';
@@ -2526,12 +3370,13 @@ CRITICAL RULES:
       `${currentScreen ? 'A screenshot of the current screen is attached.\n\n' : ''}` +
       `Question: Has the goal been ACTUALLY achieved?\n\n` +
       `CRITICAL RULES:\n` +
-      `- For ACTION goals (close page, delete item, change setting): verify the ACTION was performed. ` +
-      `Error messages like "This page isn't available" do NOT mean a page was closed — they mean navigation failed.\n` +
-      `- For DATA goals (list repos, find info): verify the data was captured in step outputs.\n` +
-      `- If ANY steps failed or showed error pages, the goal is likely NOT satisfied.\n` +
-      `- If the steps just navigated around without actually performing the requested action, say NO.\n` +
-      `- Look at the CURRENT SCREEN TEXT — does it show evidence the goal was achieved (e.g., "Page deleted", "Settings saved", confirmation dialog)?\n\n` +
+      `- For ACTION goals (post, create, close, delete, change): verify the ACTION was ACTUALLY performed by checking step outputs.\n` +
+      `- Steps that just "navigate" or "read_screen" are NOT evidence of completing the goal.\n` +
+      `- If the completed steps show a LOOPING pattern (same actions repeated), the agent was STUCK and the goal was NOT achieved.\n` +
+      `- If the goal required typing/posting content but no "type" or "type_text" step succeeded, answer NO.\n` +
+      `- DO NOT fabricate or assume success. If you cannot see CONCRETE evidence in the step outputs or screen text that the specific action was done, answer NO.\n` +
+      `- Error messages like "This page isn't available" or "Could not find" are FAILURES, not success.\n` +
+      `- Look at the CURRENT SCREEN — does it show the result of the goal (e.g., posted content visible, confirmation dialog, settings saved)?\n\n` +
       `Answer EXACTLY one line:\n` +
       `SATISFIED: yes\n` +
       `or\n` +
@@ -2705,41 +3550,47 @@ CRITICAL RULES:
    * Parse flat "STEP: action | target | description" lines from LLM output.
    * Also handles variations like "STEP 1: ..." or "1. navigate | ..."
    */
-  private parseStepLines(text: string): Array<{ description: string; action: string; target?: string }> {
-    const steps: Array<{ description: string; action: string; target?: string }> = [];
+  private parseStepLines(text: string): Array<{ description: string; action: string; target?: string; anchor?: string }> {
+    const steps: Array<{ description: string; action: string; target?: string; anchor?: string }> = [];
     const lines = text.split('\n').map(l => l.trim()).filter(l => l);
 
+    // Format accepted:
+    //   STEP: <action> | <target> | <description>                    (3 fields)
+    //   STEP: click_scoped | <target> | <description> | <anchor>     (4 fields)
+    // The optional 4th field is used only for click_scoped.
+    const toStep = (parts: string[]) => {
+      if (parts.length >= 2) {
+        const action = parts[0].toLowerCase();
+        const step: { description: string; action: string; target?: string; anchor?: string } = {
+          action,
+          target: parts[1] || undefined,
+          description: parts[2] || parts[1] || parts[0],
+        };
+        if (parts.length >= 4 && parts[3]) {
+          step.anchor = parts[3];
+        }
+        return step;
+      }
+      if (parts.length === 1) {
+        return { action: parts[0].toLowerCase(), description: parts[0] };
+      }
+      return null;
+    };
+
     for (const line of lines) {
-      // Match "STEP: action | target | description" or "STEP 1: action | target | description"
       const stepMatch = line.match(/^(?:STEP\s*\d*\s*:\s*)(.*)/i);
       if (stepMatch) {
         const parts = stepMatch[1].split('|').map(p => p.trim());
-        if (parts.length >= 2) {
-          steps.push({
-            action: parts[0].toLowerCase(),
-            target: parts[1] || undefined,
-            description: parts[2] || parts[1] || parts[0],
-          });
-        } else if (parts.length === 1) {
-          steps.push({
-            action: parts[0].toLowerCase(),
-            description: parts[0],
-          });
-        }
+        const step = toStep(parts);
+        if (step) steps.push(step);
         continue;
       }
 
-      // Also match numbered lines: "1. navigate | https://... | Go to page"
       const numberedMatch = line.match(/^\d+\.\s+(.*)/);
       if (numberedMatch) {
         const parts = numberedMatch[1].split('|').map(p => p.trim());
-        if (parts.length >= 2) {
-          steps.push({
-            action: parts[0].toLowerCase(),
-            target: parts[1] || undefined,
-            description: parts[2] || parts[1] || parts[0],
-          });
-        }
+        const step = toStep(parts);
+        if (step && parts.length >= 2) steps.push(step);
       }
     }
 
@@ -3029,6 +3880,183 @@ CRITICAL RULES:
   }
 
   /**
+   * Validate a proposed (action, target) pair against the plan step's intent
+   * and skill-defined constraints. Rejects drift BEFORE it executes.
+   *
+   * Why this exists: the REACT LLM at each step is given the planned action +
+   * current screen and invited to "execute as-is, adapt, or skip". In practice
+   * the adaptation latitude lets it drift — clicking post-body text instead of
+   * a menu button, clicking Cancel/Discard to "recover" from an earlier
+   * failure, swapping a planned `type` into `scroll` because the input isn't
+   * visible. Prompt-level guidance ("never click Cancel") doesn't reliably
+   * stop this. Controller-level enforcement does.
+   *
+   * Rules enforced here are derived from concrete observed failures, not
+   * speculative — each one corresponds to at least one real CU session that
+   * drifted into a bad state because it wasn't blocked.
+   *
+   * Returns { ok: true } to allow, { ok: false, reason } to reject and re-ask
+   * the LLM with the rejection reason in context.
+   */
+  private validateProposedAction(
+    step: PlanStep,
+    proposed: { action: string; target: string },
+    session: ComputerUseSession,
+    matchedSkillIds: string[],
+  ): { ok: boolean; reason?: string } {
+    const actionLower = (proposed.action || '').toLowerCase();
+    const rawTarget = proposed.target || '';
+    const targetLower = rawTarget.toLowerCase().trim();
+    const targetStripped = targetLower.replace(/^["']+|["']+$/g, '').trim();
+
+    // Rule 1 — Destructive clicks are always blocked.
+    // Plans never legitimately request these; when the LLM proposes them it's
+    // always an "attempt to recover" from an earlier failure that instead
+    // throws away in-progress work (edit drafts, posts, friendships, etc.).
+    if (actionLower === 'click' && targetStripped) {
+      const DESTRUCTIVE_TARGETS = new Set([
+        // English
+        'cancel', 'discard', 'discard changes', 'dismiss', 'close', 'exit',
+        'delete', 'delete post', 'delete comment', 'remove', 'remove post',
+        'turn off', 'hide', 'hide from profile', 'hide from timeline',
+        'move to trash', 'report', 'block', 'unfriend', 'unfollow',
+        // Vietnamese
+        'hủy', 'hủy bỏ', 'bỏ', 'đóng', 'thoát',
+        'xóa', 'xóa bài viết', 'xóa bình luận',
+        'ẩn', 'ẩn khỏi trang cá nhân', 'ẩn khỏi dòng thời gian',
+        'chặn', 'hủy kết bạn', 'bỏ theo dõi',
+      ]);
+      if (DESTRUCTIVE_TARGETS.has(targetStripped)) {
+        return {
+          ok: false,
+          reason:
+            `Destructive click target "${rawTarget}" is hard-blocked (it throws ` +
+            `away in-progress work). Plan step was "${step.action}${step.target ? ` → ${step.target}` : ''}". ` +
+            `Re-propose an action that advances the plan step. If you cannot, ` +
+            `use ACTION: failed with a short reason instead of clicking a ` +
+            `destructive control to "escape".`,
+        };
+      }
+    }
+
+    // Rule 2 — Post-body-drift for the FB edit skill.
+    // The dominant failure mode we observed: LLM sees the post's prefix text
+    // on screen and clicks it, thinking that opens the edit. It doesn't — it
+    // navigates to the post permalink, making the menu harder to target.
+    if (matchedSkillIds.includes('facebook-edit-post') && actionLower === 'click') {
+      const goal = session.goal || '';
+      const prefixMatch = goal.match(/["'“]([^"'”]{15,})["'”]/);
+      if (prefixMatch) {
+        const prefix = prefixMatch[1].toLowerCase().trim();
+        // Reject if the click's target contains a substantial chunk (>= 20 chars)
+        // of the post-prefix text, OR the click target is contained inside the prefix.
+        const probe = prefix.slice(0, 20);
+        if (targetLower.includes(probe) || prefix.includes(targetStripped.slice(0, 20))) {
+          return {
+            ok: false,
+            reason:
+              `Click target "${rawTarget.slice(0, 60)}" matches the post's own body text. ` +
+              `The skill explicitly forbids this — clicking the post text navigates to ` +
+              `its permalink and does NOT open the edit menu. Re-propose a click on a ` +
+              `specific UI control, e.g. "Actions for this post" (English aria-label of ` +
+              `the three-dot menu), "Edit post" (edit option), or "Lưu" / "Save" (save button). ` +
+              `If none of those controls are visible, use ACTION: failed instead of clicking ` +
+              `post text.`,
+          };
+        }
+      }
+    }
+
+    // Rule 3 — Action-type pin: don't silently swap a planned type into scroll.
+    // When the plan explicitly says `type` or `click → <named target>`, the
+    // LLM swapping to scroll/navigate/etc. almost always means the prior step
+    // failed but the LLM is still trying to "make progress" on the plan.
+    if (step.action === 'type' && !['type', 'execute_plan', 'done', 'failed', 'scratch_write'].includes(actionLower)) {
+      return {
+        ok: false,
+        reason:
+          `Plan step ${step.index + 1} is a "type" action (target: "${(step.target || '').slice(0, 60)}"). ` +
+          `Do not propose "${proposed.action}" instead. Either execute the planned type ` +
+          `(ACTION: execute_plan) or stop with ACTION: failed if the text input ` +
+          `isn't ready.`,
+      };
+    }
+    if (step.action === 'click' && step.target && actionLower === 'scroll') {
+      return {
+        ok: false,
+        reason:
+          `Plan step ${step.index + 1} is click → "${step.target}". Do not scroll instead. ` +
+          `The target should already be in view from the plan's preceding read/scroll steps. ` +
+          `If it isn't, the prior steps failed — use ACTION: failed rather than drifting.`,
+      };
+    }
+
+    // click_scoped is a legitimate "smarter click" — when the plan step is a
+    // plain click, the LLM may upgrade to click_scoped if it supplies an anchor
+    // (typically the goal's quoted post prefix). Don't block that swap.
+    if (step.action === 'click' && actionLower === 'click_scoped') {
+      return { ok: true };
+    }
+
+    return { ok: true };
+  }
+
+  /**
+   * Resolve the best-guess native app name to target for keyboard routing.
+   *
+   * Used by key_press / type's AppleScript fallback to set the `app:` parameter
+   * so keystrokes reach the right process. Order of precedence:
+   *   1. _native_app_mode  — set by open_app for native-app flows
+   *   2. share_info.label  — the browser/app label from screen-share (frontend)
+   *   3. capture_target    — explicit app/window capture target
+   *   4. _browser_app      — default 'Google Chrome' when Chrome Bridge is active
+   *                          (set at session create if nothing else is known)
+   *
+   * Returns null only when the session has no app context at all (e.g.,
+   * a screen-mode fullscreen CU session).
+   *
+   * ASYNC form: if nothing is set but Chrome Bridge IS currently connected
+   * (lazily checked against dev-agent), default to 'Google Chrome' and cache
+   * on the session. Synchronous callers can fall back to resolveTargetApp().
+   */
+  private async resolveTargetAppAsync(sessionId: string): Promise<string | null> {
+    const sync = this.resolveTargetApp(sessionId);
+    if (sync) return sync;
+    const session = sessions.get(sessionId);
+    if (!session) return null;
+    // Last-resort: check if Chrome Bridge is connected right now. Session-create
+    // may have missed it (dev-agent unreachable for ~1s, or a race with the
+    // bridge reconnecting). We don't want a single flaky health probe to
+    // strand the session's keyboard routing for its entire lifetime.
+    try {
+      const healthRes = await axios.get(`${DEV_AGENT_URL}/health`, { timeout: 1500 });
+      if (healthRes.data?.chrome_bridge === true) {
+        (session as any)._browser_app = 'Google Chrome';
+        this.logger.log(`resolveTargetAppAsync(${sessionId}): Chrome Bridge now active → caching _browser_app="Google Chrome"`);
+        return 'Google Chrome';
+      }
+    } catch { /* dev-agent unreachable — nothing we can do */ }
+    return null;
+  }
+
+  private resolveTargetApp(sessionId: string): string | null {
+    const session = sessions.get(sessionId);
+    if (!session) return null;
+    const nativeApp = (session as any)?._native_app_mode;
+    if (nativeApp) return nativeApp;
+    const shareInfo = (session as any)?._share_info as { displaySurface?: string; label?: string } | undefined;
+    if (shareInfo?.displaySurface && shareInfo.displaySurface !== 'monitor' && shareInfo.label) {
+      const fromLabel = getAppNameFromLabel(shareInfo.label);
+      if (fromLabel) return fromLabel;
+    }
+    const captureTarget = (session as any)?._capture_target as { mode?: string; target?: string } | undefined;
+    if (captureTarget?.target && (captureTarget.mode === 'window' || captureTarget.mode === 'app')) {
+      return captureTarget.target;
+    }
+    return (session as any)?._browser_app || null;
+  }
+
+  /**
    * Get the screen region for the session's capture target (if targeting a specific screen).
    */
   private getScreenRegion(sessionId: string): { x: number; y: number; width: number; height: number } | null {
@@ -3080,6 +4108,10 @@ CRITICAL RULES:
       } else if (captureTarget.mode === 'window' || captureTarget.mode === 'app') {
         appName = captureTarget.target || null;
       }
+    } else {
+      // No explicit share/capture — fall back to the session's browser_app
+      // (set at creation when Chrome Bridge is active).
+      appName = (session as any)?._browser_app || null;
     }
 
     if (isFullScreen) {
@@ -3144,11 +4176,17 @@ CRITICAL RULES:
 
     // 1. Primary: native screenshot via dev-agent (OasisScreenCapture.app)
     try {
-      // If targeting a specific window/app, focus it first then capture its region
-      if (captureTarget?.target && (captureTarget.mode === 'window' || captureTarget.mode === 'app')) {
+      // If targeting a specific window/app, focus it first then capture its region.
+      // Also focus _native_app_mode when set (from open_app) — otherwise any
+      // other app that pops to front between ticks hijacks the screenshot.
+      const focusTarget =
+        (captureTarget?.target && (captureTarget.mode === 'window' || captureTarget.mode === 'app'))
+          ? captureTarget.target
+          : ((session as any)?._native_app_mode || null);
+      if (focusTarget) {
         await axios.post(
           `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-          { tool: 'computer_action', action: 'focus_window', text: captureTarget.target },
+          { tool: 'computer_action', action: 'focus_window', text: focusTarget },
           { timeout: 5000 },
         ).catch(() => { /* best effort focus */ });
         await new Promise(r => setTimeout(r, 300));
@@ -3596,7 +4634,7 @@ CRITICAL RULES:
 
       // Step 1: Get Chrome URL/title context (fast, always works)
       const session3 = sessions.get(sid);
-      const workUrlHint = (sessions.get(sid) as any)?._work_url_hint || '';
+      const workUrlHint = (sessions.get(sid) as any)?._current_tab_hint || '';
       let chromeContext = '';
       let retries = 0;
       const MAX_TRANSIENT_RETRIES = 3;
@@ -3690,6 +4728,19 @@ CRITICAL RULES:
       case 'navigate': {
         // Strip quotes and whitespace the LLM sometimes wraps around URLs
         const cleanTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+
+        // Validate: reject targets that are clearly not URLs (LLM sometimes outputs
+        // instructions like "navigate to the settings page" instead of an actual URL)
+        const looksLikeUrl = /^https?:\/\//.test(cleanTarget) ||
+          /^[\w][\w.-]*\.\w{2,}(\/|$)/.test(cleanTarget); // e.g. facebook.com, notebooklm.google.com/path
+        if (!looksLikeUrl) {
+          this.logger.warn(`Navigate: rejecting non-URL target: "${cleanTarget.slice(0, 80)}"`);
+          return {
+            output: `Cannot navigate to "${cleanTarget.slice(0, 60)}" — this is not a valid URL. Use a full URL like https://example.com`,
+            screenshot: await this.getScreenImage(sid),
+          };
+        }
+
         const url = cleanTarget.startsWith('http') ? cleanTarget : `https://${cleanTarget}`;
         this.logger.log(`Navigate: ${url}`);
 
@@ -3736,8 +4787,33 @@ CRITICAL RULES:
           if (session2) {
             (session2 as any)._work_window_opened = true;
             // Track the URL domain so get_page_text can find the right window
-            try { (session2 as any)._work_url_hint = new URL(url).hostname; } catch { /* ignore */ }
+            try { (session2 as any)._current_tab_hint = new URL(url).hostname; } catch { /* ignore */ }
+            // Navigate implies we're now in browser mode — clear any stale
+            // native_app_mode flag set by an earlier open_app action. Otherwise
+            // the adaptive loop keeps describing screenshots via VL instead of
+            // reading the actual page DOM via Chrome Bridge.
+            if ((session2 as any)._native_app_mode) {
+              this.logger.log(`Navigate: clearing _native_app_mode (was "${(session2 as any)._native_app_mode}") — switching to browser mode`);
+              (session2 as any)._native_app_mode = null;
+            }
           }
+
+          // Ensure Chrome window is on the primary screen (multi-monitor fix).
+          // The agent only screenshots the primary screen, so Chrome must be there.
+          try {
+            const boundsRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'get_window_bounds', text: 'Google Chrome',
+            }, { timeout: 5000 });
+            const bounds = boundsRes.data?.bounds;
+            if (bounds && screenRegion && bounds.x >= screenRegion.x + screenRegion.width) {
+              this.logger.log(`Chrome window on secondary screen (x=${bounds.x}) — moving to primary`);
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'move_window_to_screen',
+                text: 'Google Chrome', x: screenRegion.x, y: screenRegion.y + 25,
+              }, { timeout: 5000 });
+              await new Promise(r => setTimeout(r, 500));
+            }
+          } catch { /* best effort */ }
         } else {
           // Subsequent navigates: check if the URL domain differs from the current page.
           // If different domain → open NEW TAB (keeps both pages accessible via switch_tab).
@@ -3784,7 +4860,7 @@ CRITICAL RULES:
           if (session2) {
             try {
               const parsed = new URL(url);
-              (session2 as any)._work_url_hint = parsed.hostname + parsed.pathname;
+              (session2 as any)._current_tab_hint = parsed.hostname + parsed.pathname;
             } catch { /* ignore */ }
           }
         }
@@ -3798,7 +4874,7 @@ CRITICAL RULES:
           const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
             tool: 'computer_action',
             action: 'get_page_text',
-            text: session2 ? (session2 as any)._work_url_hint || '' : '',
+            text: session2 ? (session2 as any)._current_tab_hint || '' : '',
           }, { timeout: 10000 });
           if (pageRes.data?.success && pageRes.data.output) {
             const pageTitle = (pageRes.data.output as string).match(/^Title:\s*(.+)$/m)?.[1]?.trim();
@@ -3809,10 +4885,167 @@ CRITICAL RULES:
         return { output: navOutput, screenshot: navScreen };
       }
 
+      case 'click_scoped': {
+        // Anchor-and-traverse click. Plan step supplies:
+        //   step.anchor  — unique text prefix identifying the container (e.g. a
+        //                  post's first 30–60 chars). REQUIRED.
+        //   step.target  — the target's aria-label or inner text (e.g.
+        //                  "Actions for this post", "Edit post", "Lưu").
+        //                  REQUIRED.
+        // Matches both as ARIA-LABEL first, then as inner text. Clicks via CDP
+        // (trusted event) with a DOM-event fallback if CDP is unavailable.
+        let anchorText = (step as any)?.anchor || '';
+        let scopedTarget = target || '';
+
+        // Swap-correction heuristic. The planner sometimes emits the fields in
+        // reverse order (anchor-like text in the target slot, aria-label in the
+        // anchor slot). Detect and correct this BEFORE hitting Chrome Bridge.
+        //
+        // Signals that indicate a swap:
+        //   - target is long (>= 60 chars) AND anchor is short (<= 40 chars)
+        //   - target contains >= 20 chars of the goal's quoted prefix
+        //     AND anchor looks like a short aria-label
+        const goal = (sessions.get(sid)?.goal || '');
+        const prefixMatch = goal.match(/["'“]([^"'”]{15,})["'”]/);
+        const goalPrefix = prefixMatch ? prefixMatch[1].toLowerCase() : '';
+        const targetLower = scopedTarget.toLowerCase();
+        const anchorLower = anchorText.toLowerCase();
+        const KNOWN_SHORT_LABELS = [
+          'actions for this post', 'more options for this post', 'edit post',
+          'save', 'lưu', 'post', "what's on your mind",
+          'tùy chọn khác cho bài viết này', 'chỉnh sửa bài viết',
+        ];
+        const anchorLooksLikeLabel = KNOWN_SHORT_LABELS.some(l => anchorLower.includes(l));
+        const targetLooksLikeAnchor =
+          (goalPrefix && targetLower.includes(goalPrefix.slice(0, 20))) ||
+          (scopedTarget.length >= 60 && anchorText.length <= 40);
+        if (anchorLooksLikeLabel && targetLooksLikeAnchor) {
+          this.logger.warn(
+            `click_scoped: detected swapped anchor/target — correcting ` +
+            `(was anchor="${anchorText.slice(0, 40)}" target="${scopedTarget.slice(0, 40)}")`,
+          );
+          const tmp = anchorText;
+          anchorText = scopedTarget;
+          scopedTarget = tmp;
+          // Also persist the correction back onto the step so subsequent
+          // retries use the fixed values.
+          (step as any).anchor = anchorText;
+          step.target = scopedTarget;
+        }
+
+        if (!anchorText) {
+          return { output: 'click_scoped requires step.anchor (post/container prefix text)' };
+        }
+        if (!scopedTarget) {
+          return { output: 'click_scoped requires target (aria-label or text of the control to click)' };
+        }
+        try {
+          const scopedRes = await axios.post(
+            `${DEV_AGENT_URL}/internal/dev-agent/execute`,
+            {
+              tool: 'computer_action',
+              action: 'click_scoped',
+              anchor_text: anchorText,
+              target_aria_label: scopedTarget,
+            },
+            { timeout: ACTION_TIMEOUT_MS },
+          );
+          const data = scopedRes.data || {};
+          const output = data.output || (data.success ? `click_scoped: anchor="${anchorText.slice(0, 40)}", target="${scopedTarget}"` : 'click_scoped failed');
+          await new Promise(r => setTimeout(r, 350));
+          const scopedScreen = await this.getScreenImage(sid);
+          if (!data.success) {
+            // Return as non-throwing failure — REACT loop will see the output
+            // text and can decide to retry, adapt, or give up. The drift guard
+            // prevents it from escaping into a destructive fallback.
+            this.logger.warn(`click_scoped failed: ${output}`);
+          }
+          return { output, screenshot: scopedScreen };
+        } catch (err: any) {
+          this.logger.warn(`click_scoped exception: ${err.message}`);
+          return { output: `click_scoped error: ${err.message}` };
+        }
+      }
+
       case 'find_ui_element':
       case 'click': {
+        // Pre-publish guard: refuse to click "close / cancel / discard / exit"
+        // if the agent has just typed substantial draft content that hasn't
+        // been committed via a post/publish/submit click yet. This prevents
+        // the classic failure where the agent composes a full Facebook post
+        // in Vietnamese and then clicks "close" on the composer modal,
+        // discarding all the work.
+        const cleanClickTarget = (target || '').trim();
+        const ctLower = cleanClickTarget.toLowerCase();
+        const isDiscardAction =
+          /^(close|cancel|discard|dismiss|exit|back|×|x)$/i.test(ctLower) ||
+          /^(close|cancel|discard|dismiss)\s/i.test(ctLower) ||
+          /discard.*draft|close.*without.*saving|cancel.*post|leave.*page|exit.*editor/i.test(ctLower);
+
+        if (isDiscardAction) {
+          const guardSession = sessions.get(sid);
+          const recentSteps = (guardSession?.plan || []).slice(-10);
+          // Find the most recent completed `type` action whose output starts
+          // with "Typed:". We used to exclude URL-only drafts, but that left
+          // a loophole: when the agent types a source URL into a modal
+          // (NotebookLM Add Source, Twitter link-share, etc.) and then clicks
+          // Close instead of Insert/Submit, the URL is lost. The URL IS the
+          // valuable input in those contexts — block the discard.
+          let draftType: typeof recentSteps[0] | null = null;
+          for (let i = recentSteps.length - 1; i >= 0; i--) {
+            const st = recentSteps[i];
+            if (st.status !== 'completed' || st.action !== 'type' || !st.output) continue;
+            const o = st.output.trim();
+            if (o.startsWith('Skipped:')) continue;
+            const payload = o.replace(/^Typed:\s*/i, '').trim();
+            // Require some minimum length so single-char typos don't block close.
+            if (payload.length < 10) continue;
+            draftType = st;
+            break;
+          }
+          if (draftType) {
+            // Is there a later submit/publish click BETWEEN the draft-type and now?
+            // Broadened vocabulary: include Insert, Add, OK, Done, Save — the
+            // typical modal-submit verbs — so closing AFTER a proper submit is fine.
+            const draftIdx = recentSteps.indexOf(draftType);
+            const publishAfter = recentSteps.slice(draftIdx + 1).some(s =>
+              s.status === 'completed' && s.action === 'click' &&
+              /\b(post|publish|share|send|submit|tweet|insert|^add\b|ok|done|save|confirm|apply)\b/i.test(s.target || ''),
+            );
+            if (!publishAfter) {
+              const preview = (draftType.output || '').replace(/^Typed:\s*/i, '').slice(0, 100);
+              this.logger.warn(`click: REFUSED discard "${cleanClickTarget}" — draft content still uncommitted (${preview.length} chars): "${preview}..."`);
+              return {
+                output:
+                  `⚠️ REFUSED to click "${cleanClickTarget}" — this would discard your uncommitted input. ` +
+                  `You typed "${preview.slice(0, 80)}..." in a previous step but have NOT clicked a submit button yet. ` +
+                  `Click the RIGHT submit for this context: "Insert" / "Add" / "Submit" in a source dialog, ` +
+                  `"Post" / "Publish" / "Share" in a composer, "Save" / "Done" in a settings dialog. ` +
+                  `If you genuinely want to throw the input away, first record your reasoning in scratch_write, then retry this click.`,
+              };
+            }
+          }
+        }
+
         // ── CUA unified click: Chrome Bridge DOM → ui_parser OCR/GroundingDINO → pixel fallback ──
         const nativeAppName = (sessions.get(sid) as any)?._native_app_name;
+
+        // Ensure we're on the right Chrome tab before clicking.
+        // The Chrome Bridge only searches the active tab, so switching first
+        // prevents "element not found" when the element is on a different tab.
+        if (!nativeAppName) {
+          const urlHint = (sessions.get(sid) as any)?._current_tab_hint;
+          if (urlHint) {
+            try {
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action',
+                action: 'switch_tab',
+                text: urlHint,
+              }, { timeout: 5000 });
+            } catch { /* best effort */ }
+          }
+        }
+
         const cuaRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
           tool: 'computer_action',
           action: action === 'find_ui_element' ? 'find_ui_element' : 'click_ui_element',
@@ -3830,7 +5063,7 @@ CRITICAL RULES:
               const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
                 tool: 'computer_action',
                 action: 'get_page_text',
-                text: (sessions.get(sid) as any)?._work_url_hint || '',
+                text: (sessions.get(sid) as any)?._current_tab_hint || '',
               }, { timeout: 10000 });
               if (pageRes.data?.success) {
                 postClickOutput = pageRes.data.output;
@@ -3875,19 +5108,23 @@ CRITICAL RULES:
         }
         if (!typeTarget) return { output: 'type action requires target text (empty after cleanup)' };
 
-        // Skip duplicate typing — if a previous step already typed very similar text, skip this one
+        // Skip duplicate typing ONLY when the IMMEDIATELY PREVIOUS type was
+        // byte-for-byte identical. This prevents double-submitting the same
+        // URL/text when the adaptive loop accidentally replays the last step.
+        //
+        // Previously this used fuzzy prefix matching, which caused a serious
+        // failure mode: a plan step asked to type a Vietnamese post, the LLM
+        // temporarily reused the YouTube URL as target, and the fuzzy match
+        // with step 4's URL typing silently returned "Skipped" without
+        // actually typing anything — modal stayed empty, downstream Insert
+        // clicks had nothing to submit, goal failed. Exact match only.
         const prevTypeSteps = (sessionId ? sessions.get(sessionId) : undefined)?.plan
           ?.filter(s => s.status === 'completed' && s.action === 'type' && s.output) || [];
         if (prevTypeSteps.length > 0) {
           const lastTyped = prevTypeSteps[prevTypeSteps.length - 1].output?.replace(/^Typed:\s*/i, '').trim() || '';
-          if (lastTyped.length > 30 && typeTarget.length > 30) {
-            // Check if the same content was already typed (fuzzy — first 50 chars match)
-            const lastPrefix = lastTyped.slice(0, 50).toLowerCase();
-            const targetPrefix = typeTarget.slice(0, 50).toLowerCase();
-            if (lastPrefix === targetPrefix || lastTyped.includes(typeTarget.slice(0, 30)) || typeTarget.includes(lastTyped.slice(0, 30))) {
-              this.logger.log(`type: SKIPPING duplicate — already typed similar content in previous step`);
-              return { output: `Skipped: similar content already typed in a previous step` };
-            }
+          if (lastTyped && lastTyped === typeTarget.trim()) {
+            this.logger.log(`type: SKIPPING exact duplicate of immediately previous type (both: ${typeTarget.slice(0, 60)}...)`);
+            return { output: `Skipped: identical content already typed in the immediately previous step` };
           }
         }
 
@@ -4005,10 +5242,25 @@ CRITICAL RULES:
         }
 
         // Type the text — use Chrome Bridge for browser pages (handles contenteditable),
-        // AppleScript keystroke for native apps
+        // AppleScript keystroke for native apps.
+        //
+        // Regardless of path, keep the target window frontmost so either
+        //   (a) Chrome Bridge types into the active tab, or
+        //   (b) AppleScript keystrokes reach the right process
+        // when the user (or the OS) pulled focus elsewhere between steps.
         let typeSuccess = false;
+        const typeTargetApp = sessionId ? await this.resolveTargetAppAsync(sessionId) : null;
         if (!nativeApp) {
-          // Browser mode: try Chrome Bridge type_text (works with contenteditable like Facebook)
+          // Browser mode: ensure Chrome window is frontmost, then try Chrome Bridge
+          // type_text (works with contenteditable like Facebook's edit modal).
+          if (typeTargetApp) {
+            try {
+              await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action', action: 'focus_window', text: typeTargetApp,
+              }, { timeout: 3000 });
+              await new Promise(r => setTimeout(r, 150));
+            } catch { /* best-effort — continue even if focus failed */ }
+          }
           try {
             const bridgeRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
               tool: 'computer_action', action: 'chrome_bridge_type', text: textToType,
@@ -4020,13 +5272,19 @@ CRITICAL RULES:
           } catch { /* fallback */ }
         }
         if (!typeSuccess) {
-          // Native app or Chrome Bridge fallback: AppleScript keystroke
+          // Native app or Chrome Bridge fallback: AppleScript keystroke.
+          // Pass the resolved app so keystrokes don't leak to whatever is
+          // frontmost if the user switched windows mid-session.
+          const appForKeystroke = nativeApp || typeTargetApp;
           await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
             {
               tool: 'computer_action', action: 'type_text', text: textToType,
-              ...(nativeApp ? { app: nativeApp } : {}),
+              ...(appForKeystroke ? { app: appForKeystroke } : {}),
             },
             { timeout: ACTION_TIMEOUT_MS });
+          if (appForKeystroke) {
+            this.logger.log(`type: AppleScript fallback → "${appForKeystroke}" (${textToType.length} chars)`);
+          }
         }
         await new Promise(r => setTimeout(r, 300));
 
@@ -4060,12 +5318,29 @@ CRITICAL RULES:
           payload.action = 'key_press';
           payload.key = target;
         }
-        // Target keystrokes to the active native app (prevents keystrokes going to wrong window)
-        const keySess = sessionId ? sessions.get(sessionId) : undefined;
-        const keyApp = (keySess as any)?._native_app_mode;
+        // Target keystrokes to the CU session's active app so they don't leak
+        // to whatever is frontmost. Resolver consults _native_app_mode, then
+        // share_info / capture_target, then _browser_app (Chrome default).
+        // Async variant: if no explicit binding, re-probe Chrome Bridge now to
+        // recover from a flaky health check at session-create time.
+        const keyApp = sessionId ? await this.resolveTargetAppAsync(sessionId) : null;
         if (keyApp) {
           payload.app = keyApp; // --app flag → AppleScript targets this process
+          // Focus the window first so the AppleScript keystroke lands in the
+          // correct process context. Critical for hotkeys like cmd+a whose
+          // effect depends on which window has keyboard focus.
+          try {
+            await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'focus_window', text: keyApp,
+            }, { timeout: 3000 });
+            // Tiny settle delay for the window manager to finish the front swap.
+            await new Promise(r => setTimeout(r, 150));
+          } catch (err: any) {
+            this.logger.debug(`key_press: focus_window "${keyApp}" failed (${err.message}); sending keystroke anyway`);
+          }
           this.logger.log(`key_press: targeting "${keyApp}" process`);
+        } else {
+          this.logger.warn(`key_press: no resolvable target app for session ${sessionId} — keystroke "${target}" will go to whatever is frontmost`);
         }
         await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, payload, { timeout: ACTION_TIMEOUT_MS });
         await new Promise(r => setTimeout(r, 300));
@@ -4129,19 +5404,38 @@ CRITICAL RULES:
         }, { timeout: ACTION_TIMEOUT_MS }).catch(() => null);
         await new Promise(r => setTimeout(r, 1000));
 
-        // 2. Also try focus_window to ensure it's frontmost
-        await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-          tool: 'computer_action',
-          action: 'focus_window',
-          text: target,
-        }, { timeout: ACTION_TIMEOUT_MS }).catch(() => {});
+        // 2. focus_window with verify. The new dev-agent focus_window returns
+        // success=false if the app never became frontmost — retry up to 3 times
+        // before proceeding, so we don't screenshot/describe the wrong window.
+        let frontmostVerified = false;
+        let lastFocusOutput = '';
+        for (let focusAttempt = 0; focusAttempt < 3; focusAttempt++) {
+          try {
+            const focusRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action',
+              action: 'focus_window',
+              text: target,
+            }, { timeout: ACTION_TIMEOUT_MS });
+            lastFocusOutput = focusRes.data?.output || '';
+            if (focusRes.data?.success) {
+              frontmostVerified = true;
+              break;
+            }
+            this.logger.warn(`open_app: focus_window returned success=false (attempt ${focusAttempt + 1}): ${lastFocusOutput.slice(0, 120)}`);
+          } catch (err: any) {
+            this.logger.warn(`open_app: focus_window threw on attempt ${focusAttempt + 1}: ${err.message}`);
+          }
+          await new Promise(r => setTimeout(r, 600 + 400 * focusAttempt));
+        }
         await new Promise(r => setTimeout(r, 500));
 
         // 3. Take screenshot (full screen — captures all displays for native apps)
         const appScreen = await this.getScreenImage(sid);
 
         // 4. Read each screen separately with vision LLM (multi-monitor aware)
-        let appOutput = `Opened ${target}`;
+        let appOutput = frontmostVerified
+          ? `Opened ${target}`
+          : `Opened ${target} BUT could not verify it is frontmost — ${lastFocusOutput.slice(0, 200)}. The window may be minimized, on another Space, or hidden behind another app. Consider using switch_app or click on the Dock icon to bring it forward before continuing.`;
         try {
           const screensRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
             tool: 'computer_action', action: 'list_screens',
@@ -4206,6 +5500,83 @@ CRITICAL RULES:
         // Native screen click — uses screenshot + ui_parser to find element, then clicks at screen coordinates
         if (!target) return { output: 'click_screen requires element description' };
         const cleanClickTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+
+        // ── Web-app redirect: if we're in a Chrome tab (no native_app_mode,
+        // _work_window_opened was set by navigate, and _current_tab_hint
+        // exists), try Chrome Bridge "click" FIRST. click_screen on a web app
+        // is prone to picking up the wrong element (featured tiles, sidebars)
+        // because the ui_parser works on a flat pixel image with no knowledge
+        // of focused tab vs. background content. Chrome Bridge's DOM matching
+        // respects the active tab and accessibility semantics.
+        {
+          const csSession = sessions.get(sid);
+          const inBrowser = !!(csSession as any)?._work_window_opened &&
+                            !(csSession as any)?._native_app_mode;
+          if (inBrowser) {
+            try {
+              const domRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                tool: 'computer_action',
+                action: 'click_ui_element',
+                text: cleanClickTarget,
+              }, { timeout: 8000 });
+              if (domRes?.data?.success) {
+                this.logger.log(`click_screen → redirected to Chrome Bridge click (web app): "${cleanClickTarget}"`);
+                await new Promise(r => setTimeout(r, 600));
+                const afterScreen = await this.getScreenImage(sid);
+                return {
+                  output: `Clicked via Chrome Bridge (web app redirect): ${cleanClickTarget}`,
+                  screenshot: afterScreen,
+                };
+              }
+              this.logger.debug(`click_screen web-redirect: Chrome Bridge miss — falling back to native click_screen for "${cleanClickTarget}"`);
+            } catch (err: any) {
+              this.logger.debug(`click_screen web-redirect error: ${err.message} — falling back`);
+            }
+          }
+        }
+
+        // Pre-discard guard (same as `click` — applies to native click_screen too).
+        // Refuse to click close/cancel/discard if there's uncommitted draft text.
+        {
+          const ctL = cleanClickTarget.toLowerCase();
+          const isDiscard =
+            /^(close|cancel|discard|dismiss|exit|back|×|x)$/i.test(ctL) ||
+            /^(close|cancel|discard|dismiss)\s/i.test(ctL) ||
+            /discard.*draft|close.*without.*saving|cancel.*post|leave.*page|exit.*editor/i.test(ctL);
+          if (isDiscard) {
+            const gs = sessions.get(sid);
+            const recent = (gs?.plan || []).slice(-10);
+            let draftT: typeof recent[0] | null = null;
+            for (let i = recent.length - 1; i >= 0; i--) {
+              const st = recent[i];
+              if (st.status !== 'completed' || st.action !== 'type' || !st.output) continue;
+              const o = st.output.trim();
+              if (o.startsWith('Skipped:')) continue;
+              const payload = o.replace(/^Typed:\s*/i, '').trim();
+              // Include URLs this time — in a modal context (e.g. NotebookLM
+              // Add Source) the URL IS the input that would be lost on close.
+              if (payload.length < 10) continue;
+              draftT = st;
+              break;
+            }
+            if (draftT) {
+              const dIdx = recent.indexOf(draftT);
+              const pubAfter = recent.slice(dIdx + 1).some(s =>
+                s.status === 'completed' && /^(click|click_screen)$/.test(s.action) &&
+                /\b(post|publish|share|send|submit|tweet|insert|^add\b|ok|done|save|confirm|apply)\b/i.test(s.target || ''),
+              );
+              if (!pubAfter) {
+                const preview = (draftT.output || '').replace(/^Typed:\s*/i, '').slice(0, 100);
+                this.logger.warn(`click_screen: REFUSED discard "${cleanClickTarget}" — draft still uncommitted: "${preview}..."`);
+                return {
+                  output:
+                    `⚠️ REFUSED to click_screen "${cleanClickTarget}" — this would discard your uncommitted input ` +
+                    `("${preview}..."). Click the right submit: Insert/Add/Submit in a source dialog, Post/Publish/Share in a composer.`,
+                };
+              }
+            }
+          }
+        }
 
         // Pre-publish check: if clicking a "Post/Publish/Submit" button, read the
         // composed content first and verify it's not duplicated or malformed.
@@ -4341,33 +5712,29 @@ CRITICAL RULES:
       }
 
       case 'switch_tab': {
-        // Activate an existing Chrome tab by title or URL match (no navigation)
+        // Activate an existing Chrome tab by title or URL match (no navigation).
         if (!target) return { output: 'switch_tab requires target tab name or URL' };
         const cleanTabTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
 
         let switched = false;
-        // 1. Try Chrome Bridge switch_tab command (activates tab by title/URL match)
+        // 1. Primary: dev-agent's switch_tab action (uses Chrome Bridge's
+        // chrome.tabs API, matching by title OR url substring, case-insensitive).
         try {
-          const bridge = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-            tool: 'computer_action', action: 'chrome_bridge_command',
-            text: JSON.stringify({ command: 'switch_tab', query: cleanTabTarget }),
+          const res = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+            tool: 'computer_action', action: 'switch_tab', text: cleanTabTarget,
           }, { timeout: 10000 }).catch(() => null);
-
-          // Fallback: use the Chrome Bridge via the dev-agent's send_command
-          if (!bridge?.data?.success) {
-            // Direct Chrome Bridge WebSocket
-            const wsRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-              tool: 'chrome_bridge_send',
-              command: 'switch_tab',
-              payload: { query: cleanTabTarget },
-            }, { timeout: 8000 }).catch(() => null);
-            if (wsRes?.data?.success) switched = true;
-          } else {
+          if (res?.data?.success) {
             switched = true;
+            this.logger.log(`switch_tab via Chrome Bridge: ${res.data.output}`);
+          } else {
+            this.logger.warn(`switch_tab via Chrome Bridge failed: ${res?.data?.output || 'no response'}`);
           }
-        } catch { /* continue */ }
+        } catch (err: any) {
+          this.logger.warn(`switch_tab axios error: ${err.message}`);
+        }
 
-        // 2. Fallback: try clicking on the tab title in the tab bar
+        // 2. Fallback: keyboard shortcut (Cmd+N on Mac) iteration — only tries if
+        // Chrome Bridge didn't work (extension not loaded / bridge disconnected).
         if (!switched) {
           try {
             await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
@@ -4378,6 +5745,30 @@ CRITICAL RULES:
         }
 
         await new Promise(r => setTimeout(r, 500));
+
+        // Update _current_tab_hint to the new tab's URL so subsequent
+        // clicks and reads target the correct tab
+        if (switched) {
+          try {
+            const ptRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action', action: 'get_page_text',
+            }, { timeout: 8000 });
+            if (ptRes.data?.success && ptRes.data.output) {
+              const urlMatch = (ptRes.data.output as string).match(/^URL:\s*(.+)$/m);
+              if (urlMatch) {
+                const s = sessions.get(sid);
+                if (s) {
+                  try {
+                    const parsed = new URL(urlMatch[1].trim());
+                    (s as any)._current_tab_hint = parsed.hostname + parsed.pathname;
+                    this.logger.log(`Tab switch updated hint: ${(s as any)._current_tab_hint}`);
+                  } catch { /* ignore parse error */ }
+                }
+              }
+            }
+          } catch { /* best effort */ }
+        }
+
         const tabScreen = await this.getScreenImage(sid);
         return {
           output: switched ? `Switched to tab: ${cleanTabTarget}` : `Could not find tab: ${cleanTabTarget}`,

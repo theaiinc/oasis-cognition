@@ -404,7 +404,7 @@ export function ComputerUsePanel({
   }, []);
 
   useEffect(() => {
-    if (activeSession && ['planning', 'executing', 'paused'].includes(activeSession.status)) {
+    if (activeSession && ['planning', 'executing', 'paused', 'awaiting_click_assist'].includes(activeSession.status)) {
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = setInterval(() => pollSession(activeSession.session_id), 2000);
     }
@@ -605,6 +605,7 @@ export function ComputerUsePanel({
       case 'awaiting_approval': return 'border-amber-800 text-amber-300';
       case 'executing': return 'border-emerald-800 text-emerald-300';
       case 'paused': return 'border-yellow-800 text-yellow-300';
+      case 'awaiting_click_assist': return 'border-amber-800 text-amber-300';
       case 'completed': return 'border-emerald-800 text-emerald-300';
       case 'failed': return 'border-red-800 text-red-300';
       case 'cancelled': return 'border-slate-700 text-slate-400';
@@ -839,6 +840,37 @@ export function ComputerUsePanel({
                 </div>
               )}
 
+              {/* ── Click-assist banner (when click failed on desktop) ── */}
+              {activeSession.status === 'awaiting_click_assist' && (
+                <div className="space-y-2">
+                  <div className="rounded-lg border border-amber-800/60 bg-amber-950/20 p-2.5">
+                    <p className="text-xs font-medium text-amber-400 mb-1">Click failed — manual action needed</p>
+                    <p className="text-[11px] text-slate-400">
+                      {activeSession.error || 'Please perform the click manually on screen, then press Resume to continue.'}
+                    </p>
+                  </div>
+                  <div className="flex items-center gap-2">
+                    <Button
+                      size="sm"
+                      onClick={handleResume}
+                      className="bg-emerald-600 hover:bg-emerald-500 gap-1 text-xs"
+                    >
+                      <Play className="w-3 h-3" />
+                      Resume
+                    </Button>
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      onClick={handleCancel}
+                      className="border-red-800 text-red-400 hover:bg-red-950/30 gap-1 text-xs"
+                    >
+                      <Ban className="w-3 h-3" />
+                      Cancel
+                    </Button>
+                  </div>
+                </div>
+              )}
+
               {/* ── Pause / Resume / Cancel controls (when executing or paused) ── */}
               {(activeSession.status === 'executing' || activeSession.status === 'paused') && (
                 <div className="flex items-center gap-2">
@@ -880,8 +912,8 @@ export function ComputerUsePanel({
                 </div>
               )}
 
-              {/* ── Steering input (during execution or paused) ── */}
-              {(activeSession.status === 'executing' || activeSession.status === 'paused') && (
+              {/* ── Steering input (during execution, paused, or click-assist) ── */}
+              {(activeSession.status === 'executing' || activeSession.status === 'paused' || activeSession.status === 'awaiting_click_assist') && (
                 <div className="flex items-center gap-1.5">
                   <input
                     type="text"

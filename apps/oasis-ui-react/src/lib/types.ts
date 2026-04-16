@@ -98,7 +98,7 @@ export interface CodeGraphData {
 export type CuStepStatus = 'pending' | 'running' | 'completed' | 'failed' | 'skipped' | 'blocked';
 export type CuSessionStatus =
   | 'planning' | 'awaiting_approval' | 'executing' | 'paused'
-  | 'completed' | 'failed' | 'cancelled';
+  | 'awaiting_click_assist' | 'completed' | 'failed' | 'cancelled';
 
 export interface CuSubStep {
   index: number;

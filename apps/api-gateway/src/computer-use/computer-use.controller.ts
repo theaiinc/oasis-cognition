@@ -360,7 +360,7 @@ export class ComputerUseController implements OnModuleInit {
 
     // Ask LLM to draft a plan (non-blocking; client polls status)
     this.draftPlan(sessionId, dto.goal, policy, dto.screen_image).catch((err) => {
-      if (session.status !== 'failed') {
+      if (session.status !== 'failed' && (session.status as string) !== 'cancelled') {
         const detail = err.response?.data ? JSON.stringify(err.response.data).slice(0, 300) : err.message;
         this.logger.error(`Plan generation failed for ${sessionId}: ${detail}`);
         session.status = 'failed';
@@ -1259,6 +1259,7 @@ export class ComputerUseController implements OnModuleInit {
           status: 'pending' as const,
         };
       });
+      if ((session.status as string) === 'cancelled') return;
       session.status = 'awaiting_approval';
       session.updated_at = new Date().toISOString();
       return; // Skill provides the plan — skip LLM planning
@@ -1445,6 +1446,7 @@ export class ComputerUseController implements OnModuleInit {
       }
 
       if (rawSteps.length === 0) {
+        if ((session.status as string) === 'cancelled') return;
         this.logger.warn(`All plan attempts failed for ${sessionId}, creating fallback plan`);
         session.plan = [
           { index: 0, description: 'Read current screen to observe state', action: 'read_screen', status: 'pending' as const },
@@ -1493,6 +1495,7 @@ export class ComputerUseController implements OnModuleInit {
         status: 'pending' as const,
       }));
 
+      if ((session.status as string) === 'cancelled') return;
       session.status = 'awaiting_approval';
       session.updated_at = new Date().toISOString();
       this.logger.log(`Plan ready for ${sessionId}: ${session.plan.length} steps`);
@@ -1501,9 +1504,11 @@ export class ComputerUseController implements OnModuleInit {
         ? JSON.stringify(err.response.data).slice(0, 500)
         : err.message || 'Unknown error';
       this.logger.error(`Plan generation error for ${sessionId}: ${detail}`);
-      session.status = 'failed';
-      session.error = `Plan generation failed: ${detail}`;
-      session.updated_at = new Date().toISOString();
+      if ((session.status as string) !== 'cancelled') {
+        session.status = 'failed';
+        session.error = `Plan generation failed: ${detail}`;
+        session.updated_at = new Date().toISOString();
+      }
       throw err;
     }
   }
@@ -2564,7 +2569,8 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
                 action: 'read_screen',
                 target: '',
                 status: 'pending',
-              });
+                _auto: true,
+              } as any);
             }
             continue;
           }
@@ -2692,28 +2698,38 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
         (session as any)._last_rejection = validation.reason;
 
         if (rejections >= MAX_SESSION_REJECTIONS) {
-          this.logger.error(
-            `Session ${sessionId}: exceeded ${MAX_SESSION_REJECTIONS} action rejections — failing session to prevent drift.`,
+          // Instead of failing the session outright, FORCE-EXECUTE the planned
+          // action one last time. The LLM has clearly lost the thread, but the
+          // plan itself may still be sound — e.g. it kept proposing
+          // switch_tab/navigate to re-read source data when it should just type
+          // (the typing path's composition pass already pulls collected data).
+          // If the forced execution genuinely doesn't work, the next loop
+          // iteration will surface a real failure (timeout, element not found)
+          // instead of a synthetic "drift" failure that masks what actually
+          // would have happened.
+          this.logger.warn(
+            `Session ${sessionId}: hit ${MAX_SESSION_REJECTIONS} rejections — force-executing planned action ${step.action}${step.target ? ` → ${step.target.slice(0, 60)}` : ''} as last resort instead of failing.`,
           );
-          step.status = 'failed';
-          step.output = `Drift guard: ${rejections} proposed actions rejected as invalid. Last rejection: ${validation.reason}`;
-          step.completed_at = new Date().toISOString();
-          session.status = 'failed';
-          session.error = `Drift guard triggered — agent proposed ${rejections} invalid actions. Last: ${(validation.reason || '').slice(0, 240)}`;
-          session.updated_at = new Date().toISOString();
-          this.generateSessionSummary(sessionId).catch(() => {});
-          if ((session as any)._active_skill_id) {
-            axios.patch(
-              `${MEMORY_URL}/internal/memory/cu/skill/${(session as any)._active_skill_id}/stats`,
-              { success: false },
-              { timeout: 5000 },
-            ).catch(() => {});
-          }
-          return;
+          actionHistory.push(
+            `${session.current_step + 1}. FORCE-EXECUTE planned ${step.action} after ${rejections} rejections`,
+          );
+          (session as any)._action_rejections = 0; // reset so we don't insta-fail next step
+          (session as any)._last_rejection = null;
+          // Fall through into the normal execute path with the planned action.
+          // We do this by re-binding action/target to the plan and clearing the
+          // validation reject so the rest of the loop body runs as if the LLM
+          // had said execute_plan from the start.
+          // (action and target are mutated to mirror what execute_plan resolves to)
+          // eslint-disable-next-line no-param-reassign
+          // @ts-ignore – action/target are mutated in this large loop
+          action = 'execute_plan';
+          // @ts-ignore
+          target = step.target || '';
+        } else {
+          // Don't advance the step, don't mutate step.action/target — loop back
+          // to get a fresh LLM proposal with the rejection reason in context.
+          continue;
         }
-        // Don't advance the step, don't mutate step.action/target — loop back
-        // to get a fresh LLM proposal with the rejection reason in context.
-        continue;
       }
       // Valid action — clear the last-rejection hint so it doesn't linger in
       // prompts for future independent steps.
@@ -2723,6 +2739,19 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
       if (action !== 'execute_plan') {
         step.action = execAction;
         step.target = execTarget;
+        // Reflect the adapted action in the visible description so the
+        // overlay shows what the agent is ACTUALLY doing, not the original
+        // plan text. Without this, the user sees "Open Facebook composer"
+        // while the agent is actually doing switch_tab to GitHub.
+        // Only annotate once — subsequent re-substitutions on the same
+        // step keep the original description intact (avoids "→ adapted: X
+        // → adapted: Y" pile-ups).
+        const baseDesc = (step as any)._original_description ?? step.description ?? '';
+        if (!(step as any)._original_description) {
+          (step as any)._original_description = baseDesc;
+        }
+        const tgtPreview = execTarget ? ` "${execTarget.slice(0, 40)}${execTarget.length > 40 ? '…' : ''}"` : '';
+        step.description = `${baseDesc} → adapted: ${execAction}${tgtPreview}`;
         // Capture the LLM-supplied anchor for click_scoped. Plan-level
         // anchors (from the skill's planGuidance emitted by draftPlan)
         // remain intact when action === 'execute_plan'.
@@ -2794,12 +2823,25 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
           await this.replaceDiscoveryTokens(session, step);
         }
 
-        // 2FA detection
+        // 2FA detection — restrict to user-facing page content, not URLs/tab titles.
+        // Previous matcher false-positived on URL-encoded "%2Fa" inside OAuth redirect URLs
+        // (e.g. AMD's `redirect_uri=https%3A%2F%2Fdeveloper.amd.com%2Fauth` matches /2fa/i).
+        // The read-screen output structure is:
+        //   URL: ... \n Title: ... \n\n Open tabs:\n[urls]\n\n Page content:\n[text]
+        // We extract the Page content section and use word-boundaried tokens to avoid
+        // matching arbitrary substrings.
+        const pageContentMatch = result.output.match(/\nPage content:\n([\s\S]*?)$/);
+        const verifyHaystack = pageContentMatch ? pageContentMatch[1] : result.output;
         const VERIFICATION_PATTERNS = [
-          /two.step.verification/i, /two.factor.auth/i, /2fa/i,
-          /verification.code/i, /confirm.your.identity/i, /captcha/i,
+          /\btwo[-\s]step verification\b/i,
+          /\btwo[-\s]factor authentication\b/i,
+          /\b2fa\b/i,
+          /\benter (?:the |your )?(?:verification|security|confirmation) code\b/i,
+          /\bconfirm your identity\b/i,
+          /\bcaptcha\b/i,
+          /\brecaptcha\b/i,
         ];
-        if (VERIFICATION_PATTERNS.some(p => p.test(result.output))) {
+        if (VERIFICATION_PATTERNS.some(p => p.test(verifyHaystack))) {
           session.status = 'awaiting_credential';
           session.error = 'Verification required (2FA / captcha / identity check). Complete it in the browser, then resume.';
           session.updated_at = new Date().toISOString();
@@ -2830,12 +2872,17 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
       session.current_step++;
       session.updated_at = new Date().toISOString();
 
-      // Track consecutive passive steps (no real progress: navigate, read, scroll, open_app)
+      // Track consecutive passive steps (no real progress: navigate, read, scroll, open_app).
+      // System-appended steps (`_auto: true`) are forced verification probes, not LLM stalling —
+      // they're already bounded by MAX_EXTRA_STEPS and must not be counted here, otherwise a
+      // successful plan that ends with the auto-verify phase will be falsely killed as "stuck".
       const passiveActions = ['read_screen', 'read_page', 'scroll', 'navigate', 'switch_tab', 'open_app'];
-      if (passiveActions.includes(execAction)) {
-        consecutiveReadScreens++;
-      } else {
-        consecutiveReadScreens = 0;
+      if (!(step as any)._auto) {
+        if (passiveActions.includes(execAction)) {
+          consecutiveReadScreens++;
+        } else {
+          consecutiveReadScreens = 0;
+        }
       }
 
       // If 6 consecutive passive steps without a real action (click/type) → agent is stuck, FAIL
@@ -2849,7 +2896,8 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
       }
 
       // If we've run out of planned steps but the goal might not be done,
-      // add one final check step
+      // add one final check step. Tag as `_auto` so the stuck-loop detector
+      // doesn't count these system-forced verification reads as agent stalling.
       if (session.current_step >= session.plan.length && extraStepsUsed < MAX_EXTRA_STEPS) {
         session.plan.push({
           index: session.plan.length,
@@ -2857,7 +2905,8 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
           action: 'read_screen',
           target: '',
           status: 'pending',
-        });
+          _auto: true,
+        } as any);
         extraStepsUsed++;
       }
 
@@ -3971,14 +4020,37 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
     // When the plan explicitly says `type` or `click → <named target>`, the
     // LLM swapping to scroll/navigate/etc. almost always means the prior step
     // failed but the LLM is still trying to "make progress" on the plan.
-    if (step.action === 'type' && !['type', 'execute_plan', 'done', 'failed', 'scratch_write'].includes(actionLower)) {
+    //
+    // EXCEPTION: a click on a known confirmation / context-switch button is
+    // allowed. Some sites pop a modal between the composer-open and typing
+    // (e.g. Facebook Pages: "You're posting as Steve Tran — Switch to The AI
+    // Inc?" with a "Switch Now" button). Without this exception the agent
+    // gets stuck because it CAN'T type until the modal is dismissed, and
+    // every click attempt is rejected as drift.
+    const CONTINUATION_CLICK_TARGETS = [
+      'switch now', 'switch', 'continue', 'continue posting', 'ok', 'okay',
+      'confirm', 'agree', 'i agree', 'got it', 'done', 'next', 'allow',
+      'use this account', 'post as page',
+      // Vietnamese
+      'chuyển ngay', 'chuyển', 'tiếp tục', 'đồng ý', 'xác nhận', 'cho phép',
+    ];
+    const isContinuationClick =
+      (actionLower === 'click' || actionLower === 'click_scoped') &&
+      CONTINUATION_CLICK_TARGETS.some(t => targetStripped === t || targetStripped.startsWith(t + ' '));
+    if (
+      step.action === 'type' &&
+      !['type', 'execute_plan', 'done', 'failed', 'scratch_write'].includes(actionLower) &&
+      !isContinuationClick
+    ) {
       return {
         ok: false,
         reason:
           `Plan step ${step.index + 1} is a "type" action (target: "${(step.target || '').slice(0, 60)}"). ` +
           `Do not propose "${proposed.action}" instead. Either execute the planned type ` +
           `(ACTION: execute_plan) or stop with ACTION: failed if the text input ` +
-          `isn't ready.`,
+          `isn't ready. (If a confirmation/switch dialog is blocking typing, ` +
+          `propose a click on its specific button — Switch Now, Continue, OK, ` +
+          `Confirm, etc. — which is allowed.)`,
       };
     }
     if (step.action === 'click' && step.target && actionLower === 'scroll') {
@@ -3996,6 +4068,63 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
     // (typically the goal's quoted post prefix). Don't block that swap.
     if (step.action === 'click' && actionLower === 'click_scoped') {
       return { ok: true };
+    }
+
+    // Rule 4a — Plan is navigate → URL. The LLM occasionally substitutes
+    // `scroll` (presumably thinking the page is already loaded), but if the
+    // current page is a different domain, scrolling does nothing useful and
+    // the agent then operates on the WRONG page state. Force the navigate.
+    if (
+      step.action === 'navigate' &&
+      step.target &&
+      /^https?:\/\//.test(step.target) &&
+      (actionLower === 'scroll' || actionLower === 'wait')
+    ) {
+      return {
+        ok: false,
+        reason:
+          `Plan step ${step.index + 1} is navigate → ${step.target.slice(0, 80)}. ` +
+          `Refusing "${proposed.action}" — that doesn't load a new page, and the ` +
+          `current tab may not be the destination. Use ACTION: execute_plan to ` +
+          `perform the planned navigate, or ACTION: switch_tab if you can confirm ` +
+          `the destination tab is already open.`,
+      };
+    }
+
+    // Rule 4 — Reject switch_tab when the plan says navigate to a URL,
+    // unless the switch_tab target unambiguously refers to that URL's domain.
+    // Why: the LLM repeatedly substitutes navigate→switch_tab with bare tab
+    // labels ("Facebook", "GitHub") that don't match the planned URL — sending
+    // the agent to the wrong tab. Substring-matching against tab titles is
+    // unreliable for this purpose. Force the planned URL navigation instead.
+    if (
+      step.action === 'navigate' &&
+      step.target &&
+      /^https?:\/\//.test(step.target) &&
+      actionLower === 'switch_tab'
+    ) {
+      try {
+        const plannedHost = new URL(step.target).hostname.toLowerCase();
+        const plannedHostKey = plannedHost.replace(/^www\./, '').split('.')[0]; // 'github', 'facebook'
+        const tgtL = targetStripped.toLowerCase();
+        const matchesPlanned =
+          tgtL.includes(plannedHost) ||
+          tgtL.includes(plannedHostKey) ||
+          tgtL.includes(step.target.toLowerCase());
+        if (!matchesPlanned) {
+          return {
+            ok: false,
+            reason:
+              `Plan step ${step.index + 1} is navigate → ${step.target.slice(0, 80)}. ` +
+              `Refusing switch_tab → "${rawTarget.slice(0, 60)}" because the target does ` +
+              `not unambiguously refer to that URL (host: "${plannedHost}"). switch_tab does ` +
+              `loose substring matching against tab titles, which lands on the wrong tab when ` +
+              `the query is short or generic. Use ACTION: execute_plan to perform the planned ` +
+              `navigate, or ACTION: switch_tab with a query containing the host name ` +
+              `"${plannedHostKey}" to be unambiguous.`,
+          };
+        }
+      } catch { /* not a parseable URL — fall through */ }
     }
 
     return { ok: true };
@@ -4834,6 +4963,15 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
               new_tab: newDomain, // Open new tab for different domains
             }, { timeout: 15000 });
             this.logger.log(`Navigate: ${newDomain ? 'new tab' : 'same tab'} → ${url}`);
+            // Update _current_tab_hint so subsequent reads/clicks target the
+            // tab we just navigated to. Was previously only updated on the
+            // first navigate, leaving the hint stale across subsequent
+            // navigates and making get_page_text read the WRONG tab.
+            if (session2) {
+              try {
+                (session2 as any)._current_tab_hint = new URL(url).hostname;
+              } catch { /* ignore */ }
+            }
           } catch (err: any) {
             this.logger.warn(`Chrome Bridge navigate failed: ${err.message}`);
             // Fallback: AppleScript direct navigation
@@ -4975,7 +5113,10 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
         // the classic failure where the agent composes a full Facebook post
         // in Vietnamese and then clicks "close" on the composer modal,
         // discarding all the work.
-        const cleanClickTarget = (target || '').trim();
+        // Strip surrounding quotes — the LLM commonly wraps text targets in
+        // quotes ("What's on your mind") which prevents substring matches in
+        // both Chrome Bridge and OCR. Mirror navigate/switch_tab cleanup.
+        const cleanClickTarget = (target || '').replace(/^["'\s]+|["'\s]+$/g, '').trim();
         const ctLower = cleanClickTarget.toLowerCase();
         const isDiscardAction =
           /^(close|cancel|discard|dismiss|exit|back|×|x)$/i.test(ctLower) ||
@@ -5046,6 +5187,72 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
           }
         }
 
+        // 1. Chrome Bridge DOM click first — fast, deterministic, trusted
+        // events. The previous implementation skipped this entirely and went
+        // straight to OCR/pixel clicks, which can't reliably find DOM
+        // controls like Facebook's "What's on your mind?" composer trigger
+        // (the visible text differs from the trigger element by enough that
+        // OCR coordinates land outside the click target).
+        if (action === 'click' && !nativeAppName && cleanClickTarget) {
+          try {
+            const cbRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+              tool: 'computer_action',
+              action: 'chrome_bridge_click',
+              text: cleanClickTarget,
+            }, { timeout: 10000 });
+            if (cbRes.data?.success) {
+              this.logger.log(`click via Chrome Bridge: "${cleanClickTarget.slice(0, 60)}"`);
+              await new Promise(r => setTimeout(r, 800));
+              let postOut = '';
+              try {
+                // Read the page-text of whichever tab is now active. We
+                // intentionally pass NO url_hint here: the click landed on the
+                // currently-active tab, so the post-click state lives on that
+                // same tab. Using `_current_tab_hint` here was wrong — that
+                // hint goes stale across switch_tab/back navigations and made
+                // the agent read a different tab than the one it had just
+                // clicked, then misdiagnose the page state.
+                const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
+                  tool: 'computer_action',
+                  action: 'get_page_text',
+                  text: '',
+                }, { timeout: 10000 });
+                if (pageRes.data?.success) {
+                  postOut = pageRes.data.output;
+                  // Refresh _current_tab_hint to the URL we actually landed on,
+                  // so subsequent steps don't carry the stale hint forward.
+                  const urlMatch = (pageRes.data.output as string).match(/^URL:\s*(.+)$/m);
+                  if (urlMatch) {
+                    try {
+                      const parsed = new URL(urlMatch[1].trim());
+                      const s = sessions.get(sid);
+                      if (s) (s as any)._current_tab_hint = parsed.hostname + parsed.pathname;
+                    } catch { /* ignore */ }
+                  }
+                }
+              } catch { /* ignore */ }
+              const postScreen = await this.getScreenImage(sid);
+              // ALWAYS prefix the output with "Clicked '<target>' via Chrome Bridge"
+              // — checkGoalSatisfaction's hard-check pattern looks for that
+              // exact prefix to confirm a Post/Publish/Share button was hit.
+              // Returning bare page text (postOut) silently caused the goal
+              // to be rejected as "no Post button was clicked" even when the
+              // post had actually published.
+              const clickedHeader = `Clicked "${cleanClickTarget}" via Chrome Bridge`;
+              const combinedOut = postOut ? `${clickedHeader}\n\n${postOut}` : (cbRes.data.output ? `${clickedHeader} — ${cbRes.data.output}` : clickedHeader);
+              return {
+                output: combinedOut,
+                screenshot: postScreen,
+              };
+            }
+            // Chrome Bridge responded but couldn't click — log and fall through to pixel.
+            const reason = cbRes.data?.output || cbRes.data?.error || 'no success flag';
+            this.logger.warn(`click: Chrome Bridge declined "${cleanClickTarget.slice(0, 60)}" → falling back to pixel: ${String(reason).slice(0, 120)}`);
+          } catch (e: any) {
+            this.logger.warn(`click: Chrome Bridge threw for "${cleanClickTarget.slice(0, 60)}" → falling back to pixel: ${(e.message || '').slice(0, 120)}`);
+          }
+        }
+
         const cuaRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
           tool: 'computer_action',
           action: action === 'find_ui_element' ? 'find_ui_element' : 'click_ui_element',
@@ -5057,13 +5264,17 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
           this.logger.log(`CUA ${action}: "${target}" → ${cuaRes.data.output}`);
           if (action === 'click') {
             await new Promise(r => setTimeout(r, 800));
-            // Read page text after click
+            // Read page text after click — pass NO url_hint so we read the
+            // active tab (where the click actually landed). Using
+            // `_current_tab_hint` here was wrong because it can be stale
+            // across switch_tab/back navigations and made the agent
+            // misdiagnose which page it was on after a click.
             let postClickOutput = '';
             try {
               const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
                 tool: 'computer_action',
                 action: 'get_page_text',
-                text: (sessions.get(sid) as any)?._current_tab_hint || '',
+                text: '',
               }, { timeout: 10000 });
               if (pageRes.data?.success) {
                 postClickOutput = pageRes.data.output;
@@ -5072,7 +5283,10 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
                   try {
                     const parsed = new URL(urlMatch[1].trim());
                     const s = sessions.get(sid);
-                    if (s) (s as any)._work_url_hint = parsed.hostname + parsed.pathname;
+                    if (s) {
+                      (s as any)._work_url_hint = parsed.hostname + parsed.pathname;
+                      (s as any)._current_tab_hint = parsed.hostname + parsed.pathname;
+                    }
                   } catch { /* ignore */ }
                 }
               }
@@ -5152,22 +5366,56 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
               .join('\n---\n')
               .slice(0, 3000);
 
+            // Surface what was already typed in earlier type steps. Without
+            // this the LLM composes the same English paragraph twice for a
+            // bilingual "English then Vietnamese" plan, since each compose
+            // call sees the same goal/data and has no idea this is the
+            // SECOND typing — both pass produce the higher-priority English.
+            const priorTyped = (typeSessCtx.plan
+              .filter(s => s.status === 'completed' && s.action === 'type' && s.output)
+              .map(s => (s.output || '').replace(/^Typed:\s*/i, '').trim())
+              .filter(Boolean)
+            ) as string[];
+            const priorBlock = priorTyped.length
+              ? `ALREADY-TYPED (do NOT repeat or paraphrase any of this — your output must continue the post, not restart it):\n${priorTyped.map((t, i) => `[#${i + 1}] ${t.slice(0, 600)}`).join('\n\n')}\n\n`
+              : '';
+
+            // Detect a language hint in the step description so we can
+            // explicitly direct the LLM. The plan often has steps like
+            // "Type English paragraph" / "Type Vietnamese paragraph" — we
+            // route the composition accordingly.
+            const desc = (step.description || '').toLowerCase();
+            const stepLangHint = (() => {
+              if (/\bvietnamese\b|tiếng việt|\btv\b/.test(desc)) return 'Vietnamese';
+              if (/\benglish\b|tiếng anh/.test(desc)) return 'English';
+              return null;
+            })();
+            const langDirective = stepLangHint
+              ? `- THIS STEP MUST BE IN ${stepLangHint.toUpperCase()}. The plan splits content by language; this is the ${stepLangHint} portion. Output ONLY ${stepLangHint} text — no other language, no translation, no labels.\n`
+              : `- If the goal mentions a specific language (Vietnamese, etc.), write in that language\n`;
+
             const composeRes = await axios.post(`${RESPONSE_URL}/internal/response/chat`, {
               user_message:
                 `GOAL: ${typeSessCtx.goal}\n\n` +
                 `DATA COLLECTED FROM PREVIOUS STEPS:\n${collectedData}\n\n` +
+                priorBlock +
                 `CURRENT TASK: Compose the text content to type.\n` +
                 `The user wants to type this on: ${step.description || 'a text field'}\n\n` +
                 `RULES:\n` +
-                `- Write the ACTUAL content to type, not instructions about what to type\n` +
-                `- If the goal mentions a specific language (Vietnamese, etc.), write in that language\n` +
-                `- If posting on social media, write an engaging post referencing the collected data\n` +
-                `- If the goal says "this post was done by CU agent" or similar, include that mention\n` +
-                `- Keep it natural and human-sounding\n` +
-                `- Output ONLY the text to type, nothing else — no quotes, no labels, no explanation\n`,
+                `- Write ONE single, concise paragraph for THIS step — DO NOT restate the same idea twice.\n` +
+                `  Past failure: composed two similar paragraphs that got published as one duplicated post.\n` +
+                `- Hard length cap: 600 characters for this step. For a social post total aim for 300-500.\n` +
+                `- Write the ACTUAL content to type, not instructions about what to type.\n` +
+                langDirective +
+                `- If posting on social media, write an engaging post referencing the collected data.\n` +
+                `- If the goal says "this post was done by CU agent" or similar, include that mention.\n` +
+                `- Keep it natural and human-sounding.\n` +
+                `- Output ONLY the text to type, nothing else — no quotes, no labels, no explanation,\n` +
+                `  no second draft, no "alternatively", no "or you could say".\n`,
               context: {
-                system_override: 'You compose text content. Output ONLY the text to type. No quotes, no labels, no markdown.',
-                max_tokens: 500,
+                system_override:
+                  'You compose text content. Output ONE single concise version for THIS step only. Never repeat already-typed content. Never produce two drafts. No quotes, no labels, no markdown.',
+                max_tokens: 320,
               },
             }, { timeout: 20000 });
 
@@ -5261,6 +5509,7 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
               await new Promise(r => setTimeout(r, 150));
             } catch { /* best-effort — continue even if focus failed */ }
           }
+          let bridgeRefusalReason: string | null = null;
           try {
             const bridgeRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
               tool: 'computer_action', action: 'chrome_bridge_type', text: textToType,
@@ -5268,8 +5517,30 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
             if (bridgeRes.data?.success) {
               this.logger.log(`type: Chrome Bridge typed ${textToType.length} chars`);
               typeSuccess = true;
+            } else {
+              const reason = bridgeRes.data?.output || bridgeRes.data?.error || 'no success flag';
+              bridgeRefusalReason = String(reason).slice(0, 240);
+              this.logger.warn(`type: Chrome Bridge declined (${textToType.length} chars): ${bridgeRefusalReason}`);
             }
-          } catch { /* fallback */ }
+          } catch (e: any) {
+            bridgeRefusalReason = (e.message || 'request failed').slice(0, 240);
+            this.logger.warn(`type: Chrome Bridge threw: ${bridgeRefusalReason}`);
+          }
+
+          // In browser context, an AppleScript keystroke fallback is useless
+          // when there is no focused editable — it just dumps keystrokes
+          // into the void (or worse, into a search box / nav bar / shortcut
+          // handler). Throw so the adaptive loop marks the step FAILED and
+          // the LLM gets a chance to re-open the composer / click the input
+          // field, instead of marching on to click "Post" against a blank
+          // composer.
+          if (!typeSuccess && bridgeRefusalReason) {
+            throw new Error(
+              `type intent failed: ${bridgeRefusalReason} ` +
+              `— no editable target found; the composer/modal probably isn't ` +
+              `open or focused. Click the composer trigger first, then retry type.`,
+            );
+          }
         }
         if (!typeSuccess) {
           // Native app or Chrome Bridge fallback: AppleScript keystroke.
@@ -5610,8 +5881,13 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
                 // Extract the text that was typed (after "Typed: ")
                 const typedText = lastTypedStep.output.replace(/^Typed:\s*/i, '').trim();
                 if (typedText) {
+                  // Pass replace=true so the bridge wipes the duplicated
+                  // content before retyping (this path's whole purpose is to
+                  // CLEAR the buggy double-typed text). Default is now
+                  // append for the normal type path so multi-step bilingual
+                  // posts don't lose earlier paragraphs.
                   await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-                    tool: 'computer_action', action: 'chrome_bridge_type', text: typedText,
+                    tool: 'computer_action', action: 'chrome_bridge_type', text: typedText, replace: true,
                   }, { timeout: 15000 }).catch(() => {});
                   await new Promise(r => setTimeout(r, 500));
                   this.logger.log(`Pre-publish: re-typed content without duplication`);
@@ -5649,8 +5925,14 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
           if (domRes.data?.success) {
             this.logger.log(`click_screen: DOM click succeeded for "${cleanClickTarget.slice(0, 40)}"`);
             domClicked = true;
+          } else {
+            // Chrome Bridge responded but couldn't click — log why so we can see why we fell back to pixels
+            const reason = domRes.data?.output || domRes.data?.error || 'no success flag';
+            this.logger.warn(`click_screen: Chrome Bridge declined "${cleanClickTarget.slice(0, 40)}" → falling back to pixel: ${String(reason).slice(0, 120)}`);
           }
-        } catch { /* fallback to pixel click */ }
+        } catch (e: any) {
+          this.logger.warn(`click_screen: Chrome Bridge threw for "${cleanClickTarget.slice(0, 40)}" → falling back to pixel: ${e.message?.slice(0, 120)}`);
+        }
 
         // 2. Fallback: pixel click via click_ui_element (OCR/GroundingDINO)
         let pixelClicked = false;
@@ -5715,6 +5997,22 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
         // Activate an existing Chrome tab by title or URL match (no navigation).
         if (!target) return { output: 'switch_tab requires target tab name or URL' };
         const cleanTabTarget = target.replace(/^["'\s]+|["'\s]+$/g, '').trim();
+
+        // Reject degenerate queries — LLM occasionally emits switch_tab with a
+        // bare tab index ("2", "3") expecting position-based addressing, but
+        // the bridge does substring match on title/URL. "2" then matches
+        // "(2) Facebook" or any URL fragment containing 2, sending the agent
+        // to the wrong tab. Force a real navigate instead by failing here.
+        if (cleanTabTarget.length < 3 || /^\d+$/.test(cleanTabTarget)) {
+          this.logger.warn(`switch_tab: REJECTED degenerate target "${cleanTabTarget}" — too short or digit-only. Use navigate with a full URL instead.`);
+          return {
+            output:
+              `switch_tab refused: "${cleanTabTarget}" is too short or numeric. ` +
+              `Tab matching is substring-based on title/URL, so short numeric queries match unrelated tabs. ` +
+              `Use ACTION: navigate with the full URL (e.g. https://github.com/owner/repo/issues/2), ` +
+              `or use a longer distinctive substring of the tab title.`,
+          };
+        }
 
         let switched = false;
         // 1. Primary: dev-agent's switch_tab action (uses Chrome Bridge's

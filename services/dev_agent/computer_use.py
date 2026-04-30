@@ -1689,6 +1689,11 @@ end tell
             resp = await chrome_bridge.send_command("type_text", {
                 "text": text,
                 "selector": kwargs.get("selector", ""),
+                # Forward the replace-vs-append flag to the content script.
+                # Default is APPEND so multi-step bilingual flows
+                # (English first, then Vietnamese) don't wipe earlier text.
+                # Gateway opts in to REPLACE for the pre-publish dup-fix path.
+                "replace": bool(kwargs.get("replace", False)),
             }, timeout=10)
             if resp.get("success"):
                 payload = resp.get("payload", {})
@@ -1985,6 +1990,60 @@ end tell
         try:
             safe_app = app_target.replace('"', '\\"')
             if action == "type_text" and text:
+                # AppleScript's `keystroke` command can only reliably type ASCII.
+                # Non-ASCII characters (Vietnamese diacritics, emoji, CJK, etc.)
+                # come out mangled — diacritics get stripped, base vowels get
+                # corrupted, and "đ" frequently turns into "a". When the text
+                # contains anything beyond ASCII we instead write it to the
+                # macOS clipboard and paste with cmd+v.
+                if any(ord(ch) > 127 for ch in text):
+                    # Stash existing clipboard so we don't trash the user's data.
+                    save_proc = await asyncio.create_subprocess_exec(
+                        "pbpaste",
+                        stdout=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    saved_clip, _ = await asyncio.wait_for(save_proc.communicate(), timeout=5)
+                    # Write the new content to the clipboard.
+                    set_proc = await asyncio.create_subprocess_exec(
+                        "pbcopy",
+                        stdin=asyncio.subprocess.PIPE,
+                        stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(set_proc.communicate(input=text.encode("utf-8")), timeout=5)
+                    # Bring the target app forward and paste.
+                    ax_script = f'''
+tell application "System Events"
+    tell process "{safe_app}"
+        set frontmost to true
+        delay 0.25
+        keystroke "v" using {{command down}}
+    end tell
+end tell
+'''
+                    proc = await asyncio.create_subprocess_exec(
+                        "osascript", "-e", ax_script,
+                        stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                    )
+                    await asyncio.wait_for(proc.communicate(), timeout=10)
+                    # Restore clipboard after a short delay so the paste has time
+                    # to consume it. Best-effort — clipboard restoration failure
+                    # is annoying but not catastrophic.
+                    await asyncio.sleep(0.4)
+                    try:
+                        restore_proc = await asyncio.create_subprocess_exec(
+                            "pbcopy",
+                            stdin=asyncio.subprocess.PIPE,
+                            stderr=asyncio.subprocess.PIPE,
+                        )
+                        await asyncio.wait_for(restore_proc.communicate(input=saved_clip), timeout=5)
+                    except Exception:
+                        pass
+                    output = f"type_text (clipboard paste): {len(text)} chars → {app_target}"
+                    logger.info("App-targeted type_text via clipboard paste (non-ASCII detected, %d chars) → '%s'", len(text), app_target)
+                    _input_monitor.set_agent_acting(False)
+                    screenshot = _take_screenshot()
+                    return {"success": True, "output": output, "screenshot": screenshot}
                 safe_text = text.replace('\\', '\\\\').replace('"', '\\"')
                 ax_script = f'''
 tell application "System Events"

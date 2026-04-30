@@ -126,6 +126,21 @@
         .replace(/\u2026/g, '...');                     // ellipsis → ...
       const lowerMatch = normalize(textMatch);
 
+      // FB and other sites embed the user name mid-string in placeholders, e.g.
+      // FB shows "What's on your mind, Steve?" but the LLM commonly emits
+      // "What's on your mind?" — the trailing "?" doesn't substring-match
+      // because the actual text has ", Steve" before the "?". Fall back to a
+      // punctuation-stripped variant ("what's on your mind") that DOES match
+      // when the punctuation appears later in the real label.
+      const stripTrailingPunct = (s) => s.replace(/[\s!?.,;:]+$/, "");
+      const lowerMatchTrimmed = stripTrailingPunct(lowerMatch);
+      const matchesAny = (s) => {
+        if (!s) return false;
+        if (s.includes(lowerMatch)) return true;
+        if (lowerMatchTrimmed && lowerMatchTrimmed !== lowerMatch && s.includes(lowerMatchTrimmed)) return true;
+        return false;
+      };
+
       // Strategy 1: search interactive elements by aria-label, text, title (most precise)
       // Uses deep traversal to also find elements inside Shadow DOM (NotebookLM, Google apps, etc.)
       const interactiveSelectors = 'a[href], button, [role="button"], [role="link"], [role="menuitem"], [role="tab"], [tabindex="0"], [onclick]';
@@ -143,15 +158,55 @@
           candidates.unshift(el);
           continue;
         }
-        // Contains match
-        if (label.includes(lowerMatch) || title.includes(lowerMatch) || text.includes(lowerMatch)) {
+        // Contains match (with trailing-punctuation tolerance)
+        if (matchesAny(label) || matchesAny(title) || matchesAny(text)) {
           candidates.push(el);
         }
       }
       if (candidates.length > 0) {
-        // Prefer <a> links over containers (so clicks navigate correctly)
-        const links = candidates.filter(c => c.tagName === "A");
-        const pool = links.length > 0 ? links : candidates;
+        // Action verbs (publish-style) — prefer <button> / [role="button"]
+        // over <a>. The opposite preference (links first) sends "Post" to the
+        // Facebook sidebar's "Posts" navigation link instead of the composer's
+        // actual Post button, navigating away and losing the typed draft.
+        const ACTION_VERBS = new Set([
+          "post", "publish", "share", "send", "submit", "save", "done",
+          "next", "ok", "okay", "confirm", "apply", "insert", "add", "create",
+          "đăng", "lưu", "gửi", "tiếp", "xác nhận",
+        ]);
+        const isActionVerb = ACTION_VERBS.has(lowerMatch) || ACTION_VERBS.has(lowerMatchTrimmed);
+        const buttonish = (c) => c.tagName === "BUTTON" || c.getAttribute("role") === "button";
+        const linkish = (c) => c.tagName === "A";
+
+        // When a modal/dialog is open on the page, the user's click intent is
+        // almost always something inside that modal (the composer's Post
+        // button, an "Insert" button in a source dialog, etc.). Without this
+        // scoping we can pick a same-labeled element elsewhere on the page.
+        const openDialog = Array.from(document.querySelectorAll(
+          '[role="dialog"], [aria-modal="true"], [role="alertdialog"]'
+        )).find(d => {
+          const r = d.getBoundingClientRect();
+          return r.width > 10 && r.height > 10;
+        });
+        const pickFrom = (pool) => {
+          if (isActionVerb) {
+            const buttons = pool.filter(buttonish);
+            if (buttons.length > 0) return buttons;
+            const nonLinks = pool.filter(c => !linkish(c));
+            if (nonLinks.length > 0) return nonLinks;
+            return pool;
+          }
+          const links = pool.filter(linkish);
+          return links.length > 0 ? links : pool;
+        };
+        if (openDialog) {
+          const insideDialog = candidates.filter(c => openDialog.contains(c));
+          if (insideDialog.length > 0) {
+            const pool = pickFrom(insideDialog);
+            const idx = index || 0;
+            return pool[Math.min(idx, pool.length - 1)];
+          }
+        }
+        const pool = pickFrom(candidates);
         const idx = index || 0;
         return pool[Math.min(idx, pool.length - 1)];
       }
@@ -609,27 +664,78 @@
             const sel = window.getSelection();
             const range = document.createRange();
 
-            // Select ALL existing content first — this replaces instead of appending
-            // Prevents duplication when the type action retries
-            range.selectNodeContents(target);
-            sel.removeAllRanges();
-            sel.addRange(range);
-
-            // Delete existing content, then insert new text
-            document.execCommand('delete', false);
+            // Mode selection:
+            //   - "append" (default) — move cursor to end and insert. This is
+            //     real typing behavior; multi-call flows like bilingual posts
+            //     (English first, then Vietnamese second) need this so the
+            //     second type doesn't wipe the first.
+            //   - "replace" (opt-in via msg.replace=true) — for explicit
+            //     clear-and-retype, used by the gateway's pre-publish
+            //     duplicate-fix path.
+            //   Duplicate-on-retry protection lives at the gateway level
+            //   ("Skip duplicate typing ONLY when the IMMEDIATELY PREVIOUS
+            //   type was byte-for-byte identical"), so this layer no longer
+            //   needs to defensively wipe content on every call.
+            const existing = (target.innerText || target.textContent || "");
+            const replaceMode = msg.replace === true;
+            if (replaceMode) {
+              range.selectNodeContents(target);
+              sel.removeAllRanges();
+              sel.addRange(range);
+              document.execCommand('delete', false);
+            } else {
+              // Move cursor to the end of existing content so the new text
+              // appends. If the editable is empty, this no-ops.
+              range.selectNodeContents(target);
+              range.collapse(false); // collapse to end
+              sel.removeAllRanges();
+              sel.addRange(range);
+            }
             document.execCommand('insertText', false, text);
-            sendResponse({ success: true, payload: { typed: text.length, method: 'execCommand-replace' } });
+
+            // Verify the typed text actually landed by reading back
+            // textContent. Without this we silently report success when
+            // the editable was the wrong element or the page swallowed
+            // the input — agent then proceeds to click "Post" against
+            // an empty composer.
+            const probe = (target.innerText || target.textContent || "");
+            const slice = text.slice(0, Math.min(40, text.length));
+            const ok = probe.indexOf(slice) >= 0;
+            sendResponse({
+              success: ok,
+              payload: {
+                typed: ok ? text.length : 0,
+                method: replaceMode ? 'execCommand-replace' : 'execCommand-append',
+                verified: ok,
+                priorChars: existing.length,
+              },
+              error: ok ? undefined : 'Typed text did not appear in target after insertText (probably wrong focus or read-only field)',
+            });
           } else if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA')) {
             // Regular input/textarea
             target.focus();
             target.value = text;
             target.dispatchEvent(new Event('input', { bubbles: true }));
             target.dispatchEvent(new Event('change', { bubbles: true }));
-            sendResponse({ success: true, payload: { typed: text.length, method: 'value' } });
+            // Some controlled React inputs immediately revert .value if the
+            // surrounding component didn't accept the change; verify.
+            const ok = target.value === text || (target.value || "").includes(text.slice(0, 40));
+            sendResponse({
+              success: ok,
+              payload: { typed: ok ? text.length : 0, method: 'value', verified: ok },
+              error: ok ? undefined : 'Input value reverted after assignment (controlled by framework — direct value set rejected)',
+            });
           } else {
-            // Fallback: try execCommand on whatever is focused
-            document.execCommand('insertText', false, text);
-            sendResponse({ success: true, payload: { typed: text.length, method: 'fallback' } });
+            // No real editable was found. The previous "fallback" path
+            // pretended to succeed via execCommand on document, which
+            // typed into nothing useful and let the agent march on to
+            // click Post against a blank composer. Report failure so the
+            // adaptive loop can re-open the composer or click the right
+            // text input first.
+            sendResponse({
+              success: false,
+              error: 'No editable target found (no focused contenteditable / input / textarea). Composer probably did not open. Click the composer trigger first.',
+            });
           }
           break;
         }

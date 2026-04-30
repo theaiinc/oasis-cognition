@@ -552,8 +552,15 @@ _overlay_process = None
 
 @app.post("/internal/dev-agent/cu-overlay/launch")
 async def launch_cu_overlay(body: dict = {}):
-    """Launch the Electron overlay window."""
+    """Launch the CU overlay window.
+
+    On macOS we prefer the native Swift app (apps/cu-overlay-mac/OasisCUOverlay.app)
+    because Electron windows on macOS have repaint and focus quirks that bit us
+    in production (transparent windows skipping repaints when unfocused, etc.).
+    The Electron build is kept for Windows / fallback when the .app isn't built.
+    """
     import subprocess as _subprocess
+    import sys as _sys
     global _overlay_process
 
     session_id = body.get("session_id", "")
@@ -572,33 +579,53 @@ async def launch_cu_overlay(body: dict = {}):
         _overlay_process = None
         await asyncio.sleep(0.5)
 
-    # Also kill any orphaned electron overlay processes
+    # Also kill orphaned overlay processes from BOTH backends
     try:
         import subprocess as _sp
         _sp.run(["pkill", "-f", "cu-overlay.*electron"], capture_output=True, timeout=3)
+        _sp.run(["pkill", "-f", "OasisCUOverlay"], capture_output=True, timeout=3)
     except Exception:
         pass
 
-    overlay_dir = os.path.join(os.path.dirname(__file__), "../../apps/cu-overlay")
-    overlay_dir = os.path.abspath(overlay_dir)
+    base_dir = os.path.dirname(__file__)
+    swift_app = os.path.abspath(os.path.join(
+        base_dir, "../../apps/cu-overlay-mac/OasisCUOverlay.app"
+    ))
+    swift_bin = os.path.join(swift_app, "Contents/MacOS/OasisCUOverlay")
+    use_swift = _sys.platform == "darwin" and os.path.exists(swift_bin)
 
-    # Check if electron is installed
-    npx = "npx"
-    electron_bin = os.path.join(overlay_dir, "node_modules", ".bin", "electron")
-    if os.path.exists(electron_bin):
-        cmd = [electron_bin, "main.js", f"--session={session_id}", f"--gateway={gateway_port}"]
+    if use_swift:
+        # Spawn the binary directly so we get the PID we can later terminate.
+        # `open` would launch via LaunchServices and not return a useful pid.
+        cmd = [
+            swift_bin,
+            f"--session={session_id}",
+            f"--gateway={gateway_port}",
+            "--port=8008",
+        ]
+        cwd = swift_app  # so any relative resource paths resolve under the bundle
     else:
-        cmd = [npx, "electron", "main.js", f"--session={session_id}", f"--gateway={gateway_port}"]
+        overlay_dir = os.path.abspath(os.path.join(base_dir, "../../apps/cu-overlay"))
+        electron_bin = os.path.join(overlay_dir, "node_modules", ".bin", "electron")
+        if os.path.exists(electron_bin):
+            cmd = [electron_bin, "main.js", f"--session={session_id}", f"--gateway={gateway_port}"]
+        else:
+            cmd = ["npx", "electron", "main.js", f"--session={session_id}", f"--gateway={gateway_port}"]
+        cwd = overlay_dir
 
     try:
         _overlay_process = _subprocess.Popen(
             cmd,
-            cwd=overlay_dir,
+            cwd=cwd,
             stdout=_subprocess.DEVNULL,
             stderr=_subprocess.DEVNULL,
         )
-        logger.info("CU overlay launched (pid=%d, session=%s)", _overlay_process.pid, session_id)
-        return {"status": "launched", "pid": _overlay_process.pid}
+        backend = "swift" if use_swift else "electron"
+        logger.info(
+            "CU overlay launched (pid=%d, session=%s, backend=%s)",
+            _overlay_process.pid, session_id, backend,
+        )
+        return {"status": "launched", "pid": _overlay_process.pid, "backend": backend}
     except Exception as e:
         logger.error("Failed to launch CU overlay: %s", e)
         return {"status": "error", "error": str(e)}
@@ -1268,6 +1295,305 @@ async def set_panic_key(body: dict):
     ui_key = body.get("hotkey", "meta+Escape")
     pynput_key = update_hotkey(ui_key)
     return {"hotkey": pynput_key, "ui_format": ui_key}
+
+
+# ── External-agent subprocess runner ─────────────────────────────────────────
+# Generic spawn/tail/cancel endpoints used by the api-gateway external-agents
+# module. Each subprocess is tagged with an Oasis session_id; stdout is written
+# verbatim to transcript_path (NDJSON from `claude --output-format stream-json`),
+# stderr lines are wrapped as {"kind":"stderr","text":"..."} and appended too.
+
+import asyncio as _asyncio
+import json as _json
+import signal as _signal
+import threading as _threading
+import time as _time
+from fastapi.responses import StreamingResponse as _StreamingResponse
+
+_AGENT_PROCS: dict[str, dict[str, Any]] = {}
+_AGENT_LOCK = _threading.Lock()
+
+
+class AgentSpawnRequest(BaseModel):
+    session_id: str
+    cmd: str                         # executable name or absolute path
+    args: list[str] = []
+    env: dict[str, str] | None = None  # merged over os.environ; None = inherit
+    cwd: str
+    transcript_path: str             # absolute path where NDJSON output is appended
+
+
+def _agent_transcript_dir(session_id: str) -> str:
+    """Default transcript parent dir; caller chooses full path."""
+    return os.path.expanduser(f"~/.oasis/agent-sessions/{session_id}")
+
+
+@app.post("/internal/dev-agent/worktrees/create")
+async def worktrees_create(req: CreateWorktreeRequest):
+    """Create a worktree and return its full metadata (path + branch).
+
+    The unified /execute endpoint hides these fields, so we expose a dedicated
+    endpoint for the external-agents module which needs them directly.
+    """
+    result = await dev_agent.create_worktree(name=req.name)
+    if not result.get("success"):
+        return {
+            "ok": False,
+            "error": result.get("error") or "create_worktree failed",
+        }
+    return {
+        "ok": True,
+        "success": True,
+        "worktree_id": result["worktree_id"],
+        "worktree_path": result["path"],
+        "branch": result["branch"],
+        "project_path": PROJECT_ROOT,
+    }
+
+
+class AgentPrepareRequest(BaseModel):
+    session_id: str
+    mcp_config_json: str | None = None   # if provided, written to <dir>/mcp.json
+
+
+@app.post("/internal/dev-agent/agent/prepare")
+async def agent_prepare(req: AgentPrepareRequest):
+    """Create the on-host session dir and (optionally) write the MCP config.
+
+    The api-gateway runs in Docker and can't touch the host filesystem, so it
+    goes through this endpoint to materialise the transcript + MCP config
+    paths it then passes back in the spawn request.
+    """
+    if not req.session_id or "/" in req.session_id or ".." in req.session_id:
+        return {"ok": False, "error": "invalid session_id"}
+    session_dir = _agent_transcript_dir(req.session_id)
+    os.makedirs(session_dir, exist_ok=True)
+    transcript_path = os.path.join(session_dir, "transcript.ndjson")
+    # Create empty transcript file if missing
+    try:
+        open(transcript_path, "ab").close()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"cannot create transcript: {exc}"}
+
+    mcp_config_path: str | None = None
+    if req.mcp_config_json:
+        mcp_config_path = os.path.join(session_dir, "mcp.json")
+        try:
+            # Validate it's real JSON before writing
+            _json.loads(req.mcp_config_json)
+            with open(mcp_config_path, "w", encoding="utf-8") as f:
+                f.write(req.mcp_config_json)
+        except _json.JSONDecodeError as exc:
+            return {"ok": False, "error": f"mcp_config_json is not valid JSON: {exc}"}
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "error": f"cannot write mcp config: {exc}"}
+
+    return {
+        "ok": True,
+        "session_dir": session_dir,
+        "transcript_path": transcript_path,
+        "mcp_config_path": mcp_config_path,
+    }
+
+
+def _pump_stream(fh, transcript_path: str, kind: str):
+    """Background reader: copy stdout verbatim, wrap stderr lines as NDJSON."""
+    try:
+        for raw in iter(fh.readline, b""):
+            if not raw:
+                break
+            if kind == "stdout":
+                chunk = raw
+            else:
+                text = raw.decode("utf-8", errors="replace").rstrip("\n")
+                if not text:
+                    continue
+                chunk = (_json.dumps({"kind": "stderr", "text": text}) + "\n").encode()
+            try:
+                with open(transcript_path, "ab") as tf:
+                    tf.write(chunk)
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("agent transcript write failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("agent pump (%s) crashed: %s", kind, exc)
+    finally:
+        try:
+            fh.close()
+        except Exception:
+            pass
+
+
+@app.post("/internal/dev-agent/agent/spawn")
+async def agent_spawn(req: AgentSpawnRequest):
+    """Launch an external-agent subprocess (e.g. `claude`) on the host.
+
+    The caller owns the transcript_path; we just append to it. Returns the pid
+    of the spawned process. Failures return {"ok": false, "error": ...}.
+    """
+    with _AGENT_LOCK:
+        if req.session_id in _AGENT_PROCS:
+            existing = _AGENT_PROCS[req.session_id]["proc"]
+            if existing.poll() is None:
+                return {"ok": False, "error": "session already running"}
+
+    # Ensure transcript dir + file exist
+    os.makedirs(os.path.dirname(req.transcript_path), exist_ok=True)
+    try:
+        open(req.transcript_path, "ab").close()
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"cannot create transcript: {exc}"}
+
+    # Build env (merge with parent env unless caller wants full replacement)
+    env = dict(os.environ)
+    if req.env:
+        env.update(req.env)
+
+    try:
+        proc = subprocess.Popen(
+            [req.cmd, *req.args],
+            cwd=req.cwd,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,  # new process group → clean kill of children
+            bufsize=0,
+        )
+    except FileNotFoundError:
+        return {"ok": False, "error": f"command not found: {req.cmd}"}
+    except Exception as exc:  # noqa: BLE001
+        return {"ok": False, "error": f"spawn failed: {exc}"}
+
+    _threading.Thread(target=_pump_stream, args=(proc.stdout, req.transcript_path, "stdout"), daemon=True).start()
+    _threading.Thread(target=_pump_stream, args=(proc.stderr, req.transcript_path, "stderr"), daemon=True).start()
+
+    with _AGENT_LOCK:
+        _AGENT_PROCS[req.session_id] = {
+            "proc": proc,
+            "transcript_path": req.transcript_path,
+            "started_at": _time.time(),
+        }
+
+    logger.info("agent spawned: sid=%s pid=%s cmd=%s", req.session_id, proc.pid, req.cmd)
+    return {"ok": True, "pid": proc.pid}
+
+
+@app.get("/internal/dev-agent/agent/{session_id}/status")
+async def agent_status(session_id: str):
+    with _AGENT_LOCK:
+        info = _AGENT_PROCS.get(session_id)
+    if not info:
+        return {"ok": True, "known": False}
+    proc = info["proc"]
+    transcript_path = info["transcript_path"]
+    try:
+        size = os.path.getsize(transcript_path)
+    except OSError:
+        size = 0
+    exit_code = proc.poll()
+    return {
+        "ok": True,
+        "known": True,
+        "alive": exit_code is None,
+        "exit_code": exit_code,
+        "pid": proc.pid,
+        "transcript_bytes": size,
+        "started_at": info.get("started_at"),
+    }
+
+
+@app.get("/internal/dev-agent/agent/{session_id}/tail")
+async def agent_tail(session_id: str, offset: int = Query(0), follow: int = Query(1)):
+    """Stream new NDJSON bytes from transcript since `offset`.
+
+    If follow=1 (default), the response keeps streaming while the child is
+    alive, flushing new bytes as they appear; closes when the subprocess ends
+    and the file has been drained. If follow=0, reads once and returns.
+    """
+    with _AGENT_LOCK:
+        info = _AGENT_PROCS.get(session_id)
+    if not info:
+        # Maybe gateway is recovering state from disk — try to tail the file anyway
+        # using a default location. If the file doesn't exist, return empty.
+        transcript_path = os.path.join(_agent_transcript_dir(session_id), "transcript.ndjson")
+        proc = None
+    else:
+        transcript_path = info["transcript_path"]
+        proc = info["proc"]
+
+    async def _stream():
+        cur = offset
+        idle_ticks = 0
+        while True:
+            try:
+                with open(transcript_path, "rb") as f:
+                    f.seek(cur)
+                    chunk = f.read()
+            except FileNotFoundError:
+                chunk = b""
+            if chunk:
+                cur += len(chunk)
+                idle_ticks = 0
+                yield chunk
+            else:
+                idle_ticks += 1
+
+            if not follow:
+                return
+
+            # Terminate when process is done AND we've drained
+            if proc is None:
+                # No registered process — just read once
+                return
+            if proc.poll() is not None and idle_ticks >= 2:
+                return
+            await _asyncio.sleep(0.2)
+
+    return _StreamingResponse(_stream(), media_type="application/x-ndjson")
+
+
+@app.post("/internal/dev-agent/agent/{session_id}/cancel")
+async def agent_cancel(session_id: str):
+    with _AGENT_LOCK:
+        info = _AGENT_PROCS.get(session_id)
+    if not info:
+        return {"ok": False, "error": "unknown session"}
+    proc = info["proc"]
+    if proc.poll() is not None:
+        return {"ok": True, "already_exited": True, "exit_code": proc.returncode}
+
+    # Graceful SIGTERM to the whole process group, escalate to SIGKILL after 5s.
+    def _killer():
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        except ProcessLookupError:
+            return
+        for _ in range(25):
+            _time.sleep(0.2)
+            if proc.poll() is not None:
+                return
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGKILL)
+        except ProcessLookupError:
+            return
+
+    _threading.Thread(target=_killer, daemon=True).start()
+    return {"ok": True, "signalled": True}
+
+
+@app.delete("/internal/dev-agent/agent/{session_id}")
+async def agent_forget(session_id: str):
+    """Remove the in-memory subprocess record (does not delete transcript)."""
+    with _AGENT_LOCK:
+        info = _AGENT_PROCS.pop(session_id, None)
+    if not info:
+        return {"ok": True, "removed": False}
+    proc = info["proc"]
+    if proc.poll() is None:
+        try:
+            os.killpg(os.getpgid(proc.pid), _signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+    return {"ok": True, "removed": True}
 
 
 if __name__ == "__main__":

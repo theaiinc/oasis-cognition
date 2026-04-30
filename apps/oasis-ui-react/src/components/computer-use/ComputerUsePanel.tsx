@@ -18,7 +18,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  X, Monitor, Eye, Chrome, Puzzle,
+  X, Monitor, Eye, Chrome, Puzzle, History,
   CheckCircle2, AlertTriangle, Loader2, ShieldAlert,
   ChevronDown, ChevronRight, Send, Shield, Settings2,
   SkipForward, Play, Pause, Ban, ThumbsUp, ThumbsDown,
@@ -31,6 +31,7 @@ import { useToast } from '@/hooks/use-toast';
 import { OASIS_BASE_URL } from '@/lib/constants';
 import type { CuSession, CuPlanStep, CuSubStep, CuPolicy } from '@/lib/types';
 import { CaptureTargetPicker, type CaptureTarget } from './CaptureTargetPicker';
+import { CuHistoryList } from './CuHistoryList';
 const API = `${OASIS_BASE_URL}/api/v1/computer-use`;
 
 /* ── Step status icon ──────────────────────────────────────────────────── */
@@ -312,6 +313,7 @@ export function ComputerUsePanel({
   const [expandedStep, setExpandedStep] = useState<number | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [chromeBridgeConnected, setChromeBridgeConnected] = useState<boolean | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   // Sync external capture target, or show picker if none provided.
@@ -634,6 +636,18 @@ export function ComputerUsePanel({
               <Eye className="w-2.5 h-2.5" /> Active
             </Badge>
           )}
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => setHistoryOpen(v => !v)}
+            className={cn(
+              'w-7 h-7',
+              historyOpen ? 'text-purple-400' : 'text-slate-400 hover:text-purple-400',
+            )}
+            title={historyOpen ? 'Hide history' : 'Show history'}
+          >
+            <History className="w-4 h-4" />
+          </Button>
           <Button variant="ghost" size="icon" onClick={onClose} className="text-slate-400 hover:text-white w-7 h-7">
             <X className="w-4 h-4" />
           </Button>
@@ -642,6 +656,13 @@ export function ComputerUsePanel({
 
       <ScrollArea className="flex-1 px-5 py-4">
         <div className="flex flex-col gap-4">
+
+          {/* ── Inline history (collapsible, shown above current session) ── */}
+          {historyOpen && (
+            <div className="pb-3 border-b border-slate-800/60">
+              <CuHistoryList />
+            </div>
+          )}
 
           {/* ── Capture Target Picker ── */}
           <CaptureTargetPicker
@@ -811,6 +832,23 @@ export function ComputerUsePanel({
                 <span className="text-[10px] text-slate-500 font-mono truncate">{activeSession.session_id}</span>
               </div>
               <div className="text-[11px] text-slate-400 truncate">{activeSession.goal}</div>
+
+              {/* ── Cancel button (when stuck in planning) ── */}
+              {activeSession.status === 'planning' && (
+                <div className="flex items-center gap-2 mt-1">
+                  <Loader2 className="w-3 h-3 text-blue-300 animate-spin shrink-0" />
+                  <span className="text-[11px] text-slate-400 flex-1">Drafting plan…</span>
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleCancel}
+                    className="border-red-800 text-red-400 hover:bg-red-950/30 gap-1 text-xs"
+                  >
+                    <Ban className="w-3 h-3" />
+                    Cancel
+                  </Button>
+                </div>
+              )}
 
               {/* ── APPROVE / REJECT buttons (when awaiting_approval) ── */}
               {activeSession.status === 'awaiting_approval' && (

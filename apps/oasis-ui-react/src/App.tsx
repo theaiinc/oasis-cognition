@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Activity, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack } from 'lucide-react';
+import { Terminal, Activity, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Toaster } from "@/components/ui/toaster";
@@ -28,6 +28,9 @@ import {
 import { VirtualizedChatMessages } from '@/components/chat/VirtualizedChatMessages';
 import { GraphPanel } from '@/components/graph';
 import { SettingsPanel, HistoryPanel, ArtifactsPanel } from '@/components/panels';
+import { AgentsPanel } from '@/components/agents/AgentsPanel';
+import { RolePicker } from '@/components/chat/RolePicker';
+import { WorkflowsPanel } from '@/components/workflows/WorkflowsPanel';
 import { SelfTeachingPanel } from '@/components/self-teaching/SelfTeachingPanel';
 import { ComputerUsePanel } from '@/components/computer-use/ComputerUsePanel';
 import { CaptureTargetPicker } from '@/components/computer-use/CaptureTargetPicker';
@@ -71,8 +74,13 @@ export default function App() {
   const [showGraphPanel, setShowGraphPanel] = useState(false);
   const [showSelfTeachingPanel, setShowSelfTeachingPanel] = useState(false);
   const [showComputerUsePanel, setShowComputerUsePanel] = useState(false);
+  const [showAgentsPanel, setShowAgentsPanel] = useState(false);
+  const [showWorkflowsPanel, setShowWorkflowsPanel] = useState(false);
   const [showMobilePairingPanel, setShowMobilePairingPanel] = useState(false);
   const [showArtifactsPanel, setShowArtifactsPanel] = useState(false);
+  // Active project role for routing chat → agent profile (model + preamble).
+  // Persisted per project by <RolePicker> via localStorage.
+  const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
   const [showSidebar, setShowSidebar] = useState(true);
   const [graphsBySessionId, setGraphsBySessionId] = useState<Record<string, GraphData>>({});
   const [memoryRules, setMemoryRules] = useState<Array<{ rule_id?: string; condition?: string; conclusion?: string; confidence?: number }>>([]);
@@ -311,11 +319,16 @@ export default function App() {
 
     const data = await postInteractionNdjson(
       `${OASIS_BASE_URL}/api/v1/interaction`,
-      { user_message: text, session_id: textSessionId, context },
+      {
+        user_message: text,
+        session_id: textSessionId,
+        context,
+        role_id: activeRoleId || undefined,
+      },
       signal,
     );
     return data;
-  }, [textSessionId, autonomousMode, activeProjectId]);
+  }, [textSessionId, autonomousMode, activeProjectId, activeRoleId]);
 
   const handleStopPipeline = useCallback(() => {
     abortControllerRef.current?.abort();
@@ -796,6 +809,8 @@ export default function App() {
                 setShowGraphPanel(false);
                 setShowSelfTeachingPanel(false);
                 setShowComputerUsePanel(false);
+                setShowAgentsPanel(false);
+                setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
               }
@@ -816,6 +831,8 @@ export default function App() {
                 setShowSettingsPanel(false);
                 setShowSelfTeachingPanel(false);
                 setShowComputerUsePanel(false);
+                setShowAgentsPanel(false);
+                setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
               }
@@ -835,6 +852,8 @@ export default function App() {
                 setShowSettingsPanel(false);
                 setShowGraphPanel(false);
                 setShowComputerUsePanel(false);
+                setShowAgentsPanel(false);
+                setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
               }
@@ -854,6 +873,8 @@ export default function App() {
                 setShowSettingsPanel(false);
                 setShowGraphPanel(false);
                 setShowSelfTeachingPanel(false);
+                setShowAgentsPanel(false);
+                setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
               }
@@ -861,6 +882,48 @@ export default function App() {
             title="Computer Use"
           >
             <Monitor className="w-5 h-5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn("text-slate-400 hover:text-white", showAgentsPanel && "text-emerald-400")}
+            onClick={() => {
+              setShowAgentsPanel(v => !v);
+              if (!showAgentsPanel) {
+                setShowHistoryPanel(false);
+                setShowSettingsPanel(false);
+                setShowGraphPanel(false);
+                setShowSelfTeachingPanel(false);
+                setShowComputerUsePanel(false);
+                setShowWorkflowsPanel(false);
+                setShowMobilePairingPanel(false);
+                setShowArtifactsPanel(false);
+              }
+            }}
+            title="Agents"
+          >
+            <UserCog className="w-5 h-5" />
+          </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn("text-slate-400 hover:text-white", showWorkflowsPanel && "text-violet-400")}
+            onClick={() => {
+              setShowWorkflowsPanel(v => !v);
+              if (!showWorkflowsPanel) {
+                setShowHistoryPanel(false);
+                setShowSettingsPanel(false);
+                setShowGraphPanel(false);
+                setShowSelfTeachingPanel(false);
+                setShowComputerUsePanel(false);
+                setShowAgentsPanel(false);
+                setShowMobilePairingPanel(false);
+                setShowArtifactsPanel(false);
+              }
+            }}
+            title="Workflows"
+          >
+            <Workflow className="w-5 h-5" />
           </Button>
           <Button
             variant="ghost"
@@ -874,6 +937,8 @@ export default function App() {
                 setShowGraphPanel(false);
                 setShowSelfTeachingPanel(false);
                 setShowComputerUsePanel(false);
+                setShowAgentsPanel(false);
+                setShowWorkflowsPanel(false);
                 setShowArtifactsPanel(false);
               }
             }}
@@ -893,6 +958,8 @@ export default function App() {
                 setShowGraphPanel(false);
                 setShowSelfTeachingPanel(false);
                 setShowComputerUsePanel(false);
+                setShowAgentsPanel(false);
+                setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
               }
             }}
@@ -912,6 +979,8 @@ export default function App() {
             setShowGraphPanel(false);
             setShowSelfTeachingPanel(false);
             setShowComputerUsePanel(false);
+            setShowAgentsPanel(false);
+            setShowWorkflowsPanel(false);
             setShowMobilePairingPanel(false);
             setShowArtifactsPanel(false);
           }}
@@ -923,6 +992,24 @@ export default function App() {
 
       <AnimatePresence>
         {showHistoryPanel && <HistoryPanel sessions={historySessions} currentSessionId={textSessionId} onNewChat={handleNewChat} onLoadSession={(id) => { loadSession(id); setGraphsBySessionId({}); }} onDeleteSession={deleteSession} />}
+      </AnimatePresence>
+      <AnimatePresence>
+      </AnimatePresence>
+      <AnimatePresence>
+        {showAgentsPanel && (
+          <AgentsPanel
+            onClose={() => setShowAgentsPanel(false)}
+            activeProjectId={activeProjectId}
+            activeProjectName={activeProjectName}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {showWorkflowsPanel && (
+          <WorkflowsPanel onClose={() => setShowWorkflowsPanel(false)} />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
       </AnimatePresence>
       <AnimatePresence>
         {showGraphPanel && (
@@ -983,7 +1070,11 @@ export default function App() {
         {showSettingsPanel && <SettingsPanel open={showSettingsPanel} onClose={() => setShowSettingsPanel(false)} projectConfig={projectConfig} onProjectConfigured={(cfg) => setProjectConfig({ ...cfg, configured: true })} sessionId={textSessionId} autonomousMode={autonomousMode} onAutonomousModeChange={handleAutonomousModeChange} activeProjectId={activeProjectId} onActiveProjectChange={_setActiveProjectId} />}
       </AnimatePresence>
 
-      <main className="flex-1 flex flex-col overflow-hidden relative">
+      <main className={cn(
+        "flex-1 flex flex-col overflow-hidden relative",
+        // Full-canvas panels replace the chat area entirely.
+        (showWorkflowsPanel || showAgentsPanel) && "hidden",
+      )}>
         <ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} />
 
         <div className="flex-1 overflow-hidden flex flex-col p-6 max-w-5xl mx-auto w-full">
@@ -1064,6 +1155,13 @@ export default function App() {
             pendingFiles={quickUpload.pendingFiles}
             onFileAdd={(files) => quickUpload.addFiles(files, activeProjectId)}
             onFileRemove={quickUpload.removeFile}
+            topToolbar={
+              <RolePicker
+                activeProjectId={activeProjectId}
+                value={activeRoleId}
+                onChange={setActiveRoleId}
+              />
+            }
           >
             <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="mb-4 rounded-2xl bg-slate-900/50 border border-slate-800 overflow-hidden">
               {voice.isSpeaking ? <WaveformVisualizer audioLevel={voice.audioLevel} isActive={voice.isSpeaking} tick={tick} /> : <ListeningOrb />}

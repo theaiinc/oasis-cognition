@@ -567,7 +567,7 @@ export class SpeakersController {
 
       // 2. Send to diarization service for voiceprint extraction
       // Derive extension from content-type so diarization service can detect format
-      const ct = fileRes.headers['content-type'] || 'audio/mpeg';
+      const ct = String(fileRes.headers['content-type'] || 'audio/mpeg');
       const extMap: Record<string, string> = {
         'audio/mpeg': '.mp3', 'audio/mp4': '.m4a', 'audio/x-m4a': '.m4a',
         'audio/wav': '.wav', 'audio/x-wav': '.wav', 'audio/ogg': '.ogg',

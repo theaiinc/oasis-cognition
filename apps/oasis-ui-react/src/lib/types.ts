@@ -147,6 +147,7 @@ export interface CuSession {
   updated_at: string;
   error?: string;
   visionGranted?: boolean;
+  summary?: string;
 }
 
 /* ── Context Budget / Token Usage ─────────────────────────────────────── */

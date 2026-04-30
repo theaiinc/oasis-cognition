@@ -4,11 +4,21 @@ import { v4 as uuidv4 } from 'uuid';
 import { RedisEventService } from '../events/redis-event.service';
 import { LangfuseService } from '../events/langfuse.service';
 import { SessionConfigService } from '../session/session.service';
+import { NATIVE_WORKFLOW_TOOLS, dispatchNativeWorkflowTool } from './native-workflow-tools';
+import { AgentProfilesService } from '../agent-profiles/agent-profiles.service';
+import { ProjectRolesService } from '../project-roles/project-roles.service';
 
 export interface InteractionRequest {
   user_message: string;
   session_id?: string;
   context?: Record<string, any>;
+  /** Optional project role to resolve into a profile; its bound profile's
+   *  model/provider/preamble override the default routing. Role description
+   *  is prepended to the system prompt. */
+  role_id?: string;
+  /** Optional direct profile binding (bypasses role lookup). Takes precedence
+   *  over role_id if both are present. */
+  profile_id?: string;
 }
 
 export interface ContextBudgetInfo {
@@ -213,6 +223,12 @@ const KNOWN_CALL_TOOLS_SORTED = [...new Set([...DEV_AGENT_TOOLS, ...TOOL_EXECUTO
 const GATEWAY_HANDLED_TOOLS = new Set([
   'search_artifacts',
   'read_artifact',
+  // Native workflow + trigger tools (see native-workflow-tools.ts).
+  'workflow_list', 'workflow_get', 'workflow_create', 'workflow_update', 'workflow_delete',
+  'workflow_run', 'workflow_runs_list', 'workflow_get_run', 'workflow_cancel_run',
+  'workflow_add_node', 'workflow_add_edge', 'workflow_remove_node',
+  'node_catalog',
+  'trigger_create', 'trigger_list', 'trigger_update', 'trigger_delete',
 ]);
 
 const TOOL_NAME_ALIASES: Record<string, string> = {
@@ -1213,7 +1229,11 @@ async function resolveArtifactMentions(
   artifactIds: string[],
 ): Promise<string> {
   if (!artifactIds || artifactIds.length === 0) return '';
-  const MAX_PER_ARTIFACT = 2000;
+  // Loose upper bound per artifact (~200k chars / ~50k tokens). The real trim
+  // happens in response-generator's `budget.allocate("artifact_context", ...)`
+  // which caps at 20% of the input budget. Keeping a TS-side ceiling prevents
+  // pathologically huge POST bodies to the response-generator.
+  const MAX_PER_ARTIFACT = 200_000;
   const parts: string[] = [];
   await Promise.all(
     artifactIds.map(async (id) => {
@@ -1229,7 +1249,7 @@ async function resolveArtifactMentions(
         const name = artifact?.name || id;
         const content = artifact?.transcript || artifact?.summary || '';
         const truncated = content.length > MAX_PER_ARTIFACT
-          ? content.slice(0, MAX_PER_ARTIFACT) + '... [truncated]'
+          ? content.slice(0, MAX_PER_ARTIFACT) + '\n... [truncated to 200k chars; use semantic search for the rest]'
           : content;
         if (truncated) {
           parts.push(`[${name}]: ${truncated}`);
@@ -1252,7 +1272,53 @@ export class InteractionService {
     private readonly events: RedisEventService,
     private readonly langfuse: LangfuseService,
     private readonly sessionConfig: SessionConfigService,
+    private readonly agentProfiles: AgentProfilesService,
+    private readonly projectRoles: ProjectRolesService,
   ) {}
+
+  /** Resolve role/profile hints into context overrides. Returns the fields to
+   *  spread into `req.context` so every RESPONSE_URL call downstream picks up
+   *  the role's bound model + preamble automatically. Best-effort: any lookup
+   *  failure is swallowed so a bad id doesn't break the whole turn. */
+  private async resolveRoleHints(req: InteractionRequest): Promise<Record<string, any>> {
+    const profileId = req.profile_id || null;
+    const roleId = !profileId ? (req.role_id || null) : null;
+    if (!profileId && !roleId) return {};
+    try {
+      let rolePreamble: string | undefined;
+      let resolvedProfileId = profileId;
+      if (roleId) {
+        const role = await this.projectRoles.getOrNull(roleId);
+        if (role) {
+          rolePreamble = role.description?.trim() || undefined;
+          resolvedProfileId = role.agent_profile_id || null;
+        }
+      }
+      if (!resolvedProfileId) {
+        return rolePreamble ? { system_preamble: rolePreamble } : {};
+      }
+      const profile = await this.agentProfiles.getOrNull(resolvedProfileId);
+      if (!profile) {
+        return rolePreamble ? { system_preamble: rolePreamble } : {};
+      }
+      // Compose preamble: role description first (task-level framing), profile
+      // preamble second (style/voice). Either may be empty.
+      const parts = [rolePreamble, profile.config?.system_prompt_preamble?.trim() || undefined]
+        .filter((x): x is string => !!x);
+      const preamble = parts.join('\n\n') || undefined;
+      const hints: Record<string, any> = {};
+      if (preamble) hints.system_preamble = preamble;
+      if (profile.config?.model) hints.model_override = profile.config.model;
+      if (profile.config?.provider) hints.provider_override = profile.config.provider;
+      // Propagate ids so response-generator logs / langfuse can attribute them.
+      hints._role_id = roleId || undefined;
+      hints._profile_id = profile.profile_id;
+      return hints;
+    } catch (err: any) {
+      this.logger.warn(`resolveRoleHints failed: ${err?.message || err}`);
+      return {};
+    }
+  }
 
   private _getSessionWorktreeId(sessionId: string): string | undefined {
     return this.sessionWorktrees.get(sessionId);
@@ -1266,6 +1332,18 @@ export class InteractionService {
     const sessionId = req.session_id || uuidv4();
     const interactionId = uuidv4();
     const clientMessageId = req.context?.client_message_id;
+
+    // Resolve role/profile hints and merge into context BEFORE anything else.
+    // Every downstream RESPONSE_URL call spreads req.context, so this wires the
+    // chosen model + preamble through the entire pipeline in one place.
+    const roleHints = await this.resolveRoleHints(req);
+    if (Object.keys(roleHints).length > 0) {
+      req.context = { ...(req.context || {}), ...roleHints };
+      this.logger.log(
+        `Role routing: profile=${roleHints._profile_id || '-'} role=${roleHints._role_id || '-'} ` +
+        `model=${roleHints.model_override || '(default)'} preamble=${roleHints.system_preamble ? 'yes' : 'no'}`,
+      );
+    }
 
     // When reply_to is present, build the formatted prompt for the LLM
     const replyTo = req.context?.reply_to as { message_id?: string; preview?: string } | undefined;
@@ -3208,6 +3286,10 @@ export class InteractionService {
             return false;
           })();
 
+        // Native workflow tools carry their identity in different fields
+        // (workflow_id, node_id, from_node/to_node, trigger_id, name, …) —
+        // include them so `workflow_add_node node_id=a` is treated as a
+        // distinct call from `workflow_add_node node_id=b`.
         const callSignature = JSON.stringify({
           tool: toolName,
           command: normCmd,
@@ -3217,6 +3299,15 @@ export class InteractionService {
           recursive: plan.recursive || false,
           start_line: plan.start_line != null ? Number(plan.start_line) : undefined,
           end_line: plan.end_line != null ? Number(plan.end_line) : undefined,
+          // Native workflow/trigger fields (undefined for other tools):
+          workflow_id: plan.workflow_id || undefined,
+          run_id: plan.run_id || undefined,
+          trigger_id: plan.trigger_id || undefined,
+          name: plan.name || undefined,
+          node_id: plan.node_id || undefined,
+          node_type: plan.node_type || undefined,
+          from_node: plan.from_node || undefined,
+          to_node: plan.to_node || undefined,
         });
         const priorSameCall = (skipDuplicateCheck || isReadAfterEdit)
           ? []
@@ -3230,6 +3321,14 @@ export class InteractionService {
                 recursive: (r as any).recursive || false,
                 start_line: (r as any).start_line != null ? Number((r as any).start_line) : undefined,
                 end_line: (r as any).end_line != null ? Number((r as any).end_line) : undefined,
+                workflow_id: (r as any).workflow_id || undefined,
+                run_id: (r as any).run_id || undefined,
+                trigger_id: (r as any).trigger_id || undefined,
+                name: (r as any).name || undefined,
+                node_id: (r as any).node_id || undefined,
+                node_type: (r as any).node_type || undefined,
+                from_node: (r as any).from_node || undefined,
+                to_node: (r as any).to_node || undefined,
               }) === callSignature,
             );
         if (isReadAfterEdit) {
@@ -3369,6 +3468,82 @@ export class InteractionService {
             semanticStructure,
             autonomousMode,
           );
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── Native workflow + trigger tools ─────────────────────────────
+        if (NATIVE_WORKFLOW_TOOLS.has(toolName)) {
+          // Auto-resolve missing workflow_id from the most recent successful
+          // workflow_create earlier in this run. Mirrors the worktree_id
+          // auto-resolve above — LLMs often forget to echo the ID from the
+          // previous step's output back into subsequent calls.
+          let resolvedWorkflowId: string | undefined = plan.workflow_id;
+          if (!resolvedWorkflowId) {
+            for (let i = toolResults.length - 1; i >= 0; i--) {
+              const r = toolResults[i];
+              if (r.tool === 'workflow_create' && r.success && typeof r.output === 'string') {
+                // Our dispatcher formats it as:
+                //   "Workflow created: <uuid>  \"<name>\" ..."
+                const m = r.output.match(/Workflow created:\s*([0-9a-f-]{36})/i);
+                if (m) { resolvedWorkflowId = m[1]; break; }
+              }
+            }
+            if (resolvedWorkflowId) {
+              this.logger.log(
+                `Auto-resolved workflow_id=${resolvedWorkflowId} for ${toolName} from prior workflow_create`,
+              );
+            }
+          }
+          // Similarly auto-resolve run_id from the most recent workflow_run.
+          let resolvedRunId: string | undefined = plan.run_id;
+          if (!resolvedRunId && (toolName === 'workflow_get_run' || toolName === 'workflow_cancel_run')) {
+            for (let i = toolResults.length - 1; i >= 0; i--) {
+              const r = toolResults[i];
+              if (r.tool === 'workflow_run' && r.success && typeof r.output === 'string') {
+                const m = r.output.match(/Run enqueued:\s*([0-9a-f-]{36})/i);
+                if (m) { resolvedRunId = m[1]; break; }
+              }
+            }
+          }
+          const res = await dispatchNativeWorkflowTool({
+            tool: toolName,
+            workflow_id: resolvedWorkflowId,
+            run_id: resolvedRunId,
+            trigger_id: plan.trigger_id,
+            name: plan.name,
+            description: plan.description,
+            input: plan.input,
+            workflow_json: plan.workflow_json,
+            trigger_type: plan.trigger_type,
+            trigger_config: plan.trigger_config,
+            enabled: plan.enabled,
+            limit: plan.limit,
+            node_id: plan.node_id,
+            node_type: plan.node_type,
+            node_params: plan.node_params,
+            from_node: plan.from_node,
+            from_port: plan.from_port,
+            to_node: plan.to_node,
+            to_port: plan.to_port,
+          });
+          toolResults.push({
+            tool: toolName,
+            success: res.success,
+            output: res.output,
+            blocked: false,
+            reasoning: plan.reasoning || '',
+            // Keep the discriminating fields on the result so the duplicate
+            // detector can recognise genuine retries (same node_id twice).
+            workflow_id: resolvedWorkflowId,
+            run_id: resolvedRunId,
+            trigger_id: plan.trigger_id,
+            name: plan.name,
+            node_id: plan.node_id,
+            node_type: plan.node_type,
+            from_node: plan.from_node,
+            to_node: plan.to_node,
+          } as any);
           updateThoughtsOnlyStreak();
           continue;
         }

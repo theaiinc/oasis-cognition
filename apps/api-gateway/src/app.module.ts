@@ -13,6 +13,11 @@ import { SelfTeachingModule } from './self-teaching/self-teaching.module';
 import { CodeGraphModule } from './code-graph/code-graph.module';
 import { ComputerUseModule } from './computer-use/computer-use.module';
 import { ArtifactModule } from './artifact/artifact.module';
+import { ExternalAgentsModule } from './external-agents/external-agents.module';
+import { WorkflowsModule } from './workflows/workflows.module';
+import { WebSearchModule } from './web-search/web-search.module';
+import { AgentProfilesModule } from './agent-profiles/agent-profiles.module';
+import { ProjectRolesModule } from './project-roles/project-roles.module';
 
 @Module({
   imports: [
@@ -30,6 +35,11 @@ import { ArtifactModule } from './artifact/artifact.module';
     CodeGraphModule,
     ComputerUseModule,
     ArtifactModule,
+    ExternalAgentsModule,
+    WorkflowsModule,
+    WebSearchModule,
+    AgentProfilesModule,
+    ProjectRolesModule,
   ],
 })
 export class AppModule {}

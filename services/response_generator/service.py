@@ -206,6 +206,24 @@ TOOL_PLAN_ALLOWED_TOOLS: tuple[str, ...] = (
     "get_diff",
     "computer_action",
     "web_search",
+    # Workflow + trigger tools (authored in-chat, executed by the workflow engine)
+    "workflow_list",
+    "workflow_get",
+    "workflow_create",
+    "workflow_update",
+    "workflow_delete",
+    "workflow_run",
+    "workflow_runs_list",
+    "workflow_get_run",
+    "workflow_cancel_run",
+    "node_catalog",
+    "trigger_create",
+    "trigger_list",
+    "trigger_update",
+    "trigger_delete",
+    "workflow_add_node",
+    "workflow_add_edge",
+    "workflow_remove_node",
 )
 
 
@@ -377,6 +395,40 @@ def _normalize_tool_plan_output(parsed: dict[str, Any]) -> dict[str, Any]:
                 "conclusion",
                 "confidence",
                 "rule_id",
+                # ── Workflow + trigger tool params ──
+                "description",
+                "enabled",
+                "limit",
+                "input",
+                "workflow_id",
+                "workflow_json",
+                "run_id",
+                "trigger_id",
+                "trigger_type",
+                "trigger_config",
+                "node_id",
+                "node_type",
+                "node_params",
+                "from_node",
+                "from_port",
+                "to_node",
+                "to_port",
+                # ── Computer-use action shape (passed through unchanged) ──
+                "action",
+                "x",
+                "y",
+                "text",
+                "key",
+                "keys",
+                "button",
+                "direction",
+                "amount",
+                "clicks",
+                # ── Common LLM extras ──
+                "start_line",
+                "end_line",
+                "query",
+                "artifact_id",
             ):
                 if parsed.get(key) is not None:
                     plan[key] = parsed[key]
@@ -847,6 +899,42 @@ def flat_dict_to_plan(flat: dict[str, str]) -> dict[str, Any]:
         "query",
         "limit",
         "artifact_id",
+        # Workflow + trigger tool params
+        "description",
+        "enabled",
+        "input",
+        "workflow_id",
+        "workflow_json",
+        "run_id",
+        "trigger_id",
+        "trigger_type",
+        "trigger_config",
+        "node_id",
+        "node_type",
+        "node_params",
+        "from_node",
+        "from_port",
+        "to_node",
+        "to_port",
+        # Computer-use action fields
+        "action",
+        "x",
+        "y",
+        "text",
+        "key",
+        "keys",
+        "button",
+        "direction",
+        "amount",
+        "clicks",
+        # Rules
+        "condition",
+        "conclusion",
+        "confidence",
+        "rule_id",
+        # Chunked reads
+        "start_line",
+        "end_line",
     )
     for pk in param_key_whitelist:
         if pk not in params or params[pk] is None:
@@ -1018,6 +1106,125 @@ For paths (10–11), PARAM_PATH may be `/workspace/<same path as read_file>` or 
 
 ⚠️ TOOL SELECTION RULE: apply_patch > write_file (new files only) > edit_file (last resort).
    NEVER use edit_file as your first choice. ALWAYS try apply_patch first.
+
+WORKFLOWS & TRIGGERS (n8n-style automation — compose Oasis capabilities into reusable flows):
+A **workflow** is a DAG of nodes that the workflow engine runs. Nodes can call MCP tools (mcp_tool), make HTTP requests (http), transform/branch/filter data (jexl expressions), delay, or act as input/output sentinels. **Triggers** fire workflow runs: cron (schedule), event (match Oasis events like `FeedbackReceived`), or manual.
+
+When the user asks to "create a workflow that …", "schedule X", "automate Y every morning", or similar — use these tools. Always call `node_catalog` first if you're unsure which node types exist.
+
+14. workflow_list — list workflows (no params).
+15. workflow_get — get one workflow. PARAM_WORKFLOW_ID.
+16. workflow_create — create a workflow. PARAM_NAME (required). Optional: PARAM_DESCRIPTION, PARAM_WORKFLOW_JSON (JSON string of `{"nodes":[…], "edges":[…]}`).
+17. workflow_update — patch an existing workflow. PARAM_WORKFLOW_ID (required). Optional: PARAM_NAME, PARAM_DESCRIPTION, PARAM_ENABLED (true|false), PARAM_WORKFLOW_JSON (replaces nodes/edges wholesale).
+18. workflow_delete — delete a workflow and its triggers/runs. PARAM_WORKFLOW_ID.
+19. workflow_run — manually run a workflow. PARAM_WORKFLOW_ID (required). Optional: PARAM_INPUT (JSON string passed as the run's input).
+20. workflow_runs_list — list recent runs. PARAM_WORKFLOW_ID (required). Optional: PARAM_LIMIT (default 20).
+21. workflow_get_run — inspect a run's full state (status + per-node results). PARAM_RUN_ID.
+22. workflow_cancel_run — cancel a queued/running run. PARAM_RUN_ID.
+23. node_catalog — list available node types (call this before composing a workflow you're unsure about).
+24. trigger_create — attach a trigger. PARAM_WORKFLOW_ID + PARAM_TRIGGER_TYPE (cron|event|manual) + PARAM_TRIGGER_CONFIG (JSON). Cron config: `{"expression":"0 9 * * MON","timezone":"America/Los_Angeles"}`. Event config: `{"event_type":"FeedbackReceived","filter":{"payload.session_id":"abc"}}` (event_type and filter both optional).
+25. trigger_list — list triggers on a workflow. PARAM_WORKFLOW_ID.
+26. trigger_update — toggle enabled or reconfigure. PARAM_TRIGGER_ID. Optional: PARAM_ENABLED, PARAM_TRIGGER_CONFIG.
+27. trigger_delete — PARAM_TRIGGER_ID.
+
+Node shape (for PARAM_WORKFLOW_JSON):
+```
+{
+  "nodes": [
+    {"id": "n1", "type": "input",    "params": {}},
+    {"id": "n2", "type": "mcp_tool", "params": {"tool_name":"memory_query","arguments":{"q":"recent notes"}}},
+    {"id": "n3", "type": "transform","params": {"expression": "{count: value|length}"}},
+    {"id": "n4", "type": "output",   "params": {}}
+  ],
+  "edges": [
+    {"from_node":"n1","to_node":"n2"},
+    {"from_node":"n2","to_node":"n3"},
+    {"from_node":"n3","to_node":"n4"}
+  ]
+}
+```
+Node types: input, output, mcp_tool, http, delay (`{ms:1000}`), branch (`{expression}` → `true`/`false` ports), filter (`{expression}` → emits only if truthy), transform (`{expression}` — JEXL, `value` is the input). JEXL transforms: `| length`, `| json`, `| keys`, `| lower`, `| upper`. `in` is reserved in JEXL — use `value` or `inputs["in"]`.
+
+Available MCP tools the `mcp_tool` node can call (via Oasis MCP server): `cu_list_sessions`, `cu_create_session`, `agent_spawn`, `agent_list_sessions`, `memory_query`, `memory_list_rules`, `artifact_search`, `artifact_list`, `artifact_summarize`, `oasis_ask`, `code_search_symbols`, and many more. Call `node_catalog` or just use a known tool name.
+
+⭐ PREFERRED incremental authoring (avoids JSON-blob pitfalls):
+Call workflow_create with PARAM_NAME only (no nodes), then call workflow_add_node once per node, then workflow_add_edge once per connection. This is more reliable than PARAM_WORKFLOW_JSON.
+
+🪄 workflow_id is inherited automatically: after a successful workflow_create earlier in the same turn, you may OMIT PARAM_WORKFLOW_ID on subsequent workflow_add_node / workflow_add_edge / workflow_update / workflow_run calls — the tool pipeline auto-fills it from the last workflow_create's result. The same applies to PARAM_RUN_ID on workflow_get_run / workflow_cancel_run after a workflow_run. If you want a different workflow, pass PARAM_WORKFLOW_ID explicitly.
+
+Incremental tools:
+28. workflow_add_node — add a single node. PARAM_WORKFLOW_ID + PARAM_NODE_ID + PARAM_NODE_TYPE (input|output|mcp_tool|http|delay|branch|filter|transform). Optional: PARAM_NODE_PARAMS (JSON for the node's params, e.g. `{"tool_name":"memory_query","arguments":{"q":"x"}}`).
+29. workflow_add_edge — add a single edge. PARAM_WORKFLOW_ID + PARAM_FROM_NODE + PARAM_TO_NODE. Optional: PARAM_FROM_PORT (default "out", or "true"/"false" for branch), PARAM_TO_PORT (default "in").
+30. workflow_remove_node — PARAM_WORKFLOW_ID + PARAM_NODE_ID.
+
+Example (incremental flow — PREFERRED; issue EACH of the calls below as its own DECISION: ACT step):
+
+  Step 1 — create the workflow shell (NO nodes yet):
+    REASONING: Starting the workflow; add nodes + edges on following steps.
+    DECISION: ACT
+    ACTION: workflow_create
+    PARAM_NAME: count-memories
+
+  ── After step 1, PARAM_WORKFLOW_ID is INHERITED automatically. Omit it. ──
+
+  Step 2 — add the mcp_tool node (one ACTION per node):
+    REASONING: Source node — call memory_list_rules.
+    DECISION: ACT
+    ACTION: workflow_add_node
+    PARAM_NODE_ID: a
+    PARAM_NODE_TYPE: mcp_tool
+    PARAM_NODE_PARAMS: {"tool_name": "memory_list_rules", "arguments": {}}
+
+  Step 3 — add the transform node:
+    REASONING: Shape the list into a count.
+    DECISION: ACT
+    ACTION: workflow_add_node
+    PARAM_NODE_ID: b
+    PARAM_NODE_TYPE: transform
+    PARAM_NODE_PARAMS: {"expression": "{count: value|length}"}
+
+  Step 4 — add the output node:
+    REASONING: Terminal sink for the run's output.
+    DECISION: ACT
+    ACTION: workflow_add_node
+    PARAM_NODE_ID: c
+    PARAM_NODE_TYPE: output
+    PARAM_NODE_PARAMS: {}
+
+  Step 5 — wire a → b:
+    DECISION: ACT
+    ACTION: workflow_add_edge
+    PARAM_FROM_NODE: a
+    PARAM_TO_NODE: b
+
+  Step 6 — wire b → c:
+    DECISION: ACT
+    ACTION: workflow_add_edge
+    PARAM_FROM_NODE: b
+    PARAM_TO_NODE: c
+
+Important rules for incremental authoring:
+  • One ACTION per step — do not try to combine multiple node additions in a single tool call.
+  • PARAM_NODE_ID must be unique within the workflow (use short lowercase tokens: a, b, c, fetch, count, out).
+  • PARAM_NODE_PARAMS is always a valid JSON object: `{}` for input/output, `{"ms": 1000}` for delay, `{"expression": "…"}` for transform/branch/filter, `{"tool_name":"…","arguments":{…}}` for mcp_tool, `{"method":"GET","url":"…"}` for http.
+  • For branch edges, set PARAM_FROM_PORT to "true" or "false".
+  • After ALL nodes + edges are added, answer the user with the workflow_id and a short summary — do NOT re-create or re-fetch.
+
+Example (workflow_create — every morning at 8am, summarise new artifacts and save the count):
+REASONING: User wants a daily automation — build a 3-node flow and attach a cron trigger.
+DECISION: ACT
+ACTION: workflow_create
+PARAM_NAME: daily-artifact-digest
+PARAM_DESCRIPTION: Lists artifacts each morning, emits the count.
+PARAM_WORKFLOW_JSON: {"nodes":[{"id":"q","type":"mcp_tool","params":{"tool_name":"artifact_list","arguments":{}}},{"id":"t","type":"transform","params":{"expression":"{count: value|length}"}},{"id":"o","type":"output","params":{}}],"edges":[{"from_node":"q","to_node":"t"},{"from_node":"t","to_node":"o"}]}
+
+Example (trigger_create — attach the cron to the workflow returned above):
+REASONING: Schedule the daily digest at 8am Pacific.
+DECISION: ACT
+ACTION: trigger_create
+PARAM_WORKFLOW_ID: <id-from-previous-step>
+PARAM_TRIGGER_TYPE: cron
+PARAM_TRIGGER_CONFIG: {"expression":"0 8 * * *","timezone":"America/Los_Angeles"}
 
 ═══ PATCH FORMAT (CRITICAL — follow exactly) ═══
 
@@ -1792,11 +1999,18 @@ class ResponseGeneratorService:
         memory_context = (context or {}).get("memory_context", [])
         memory_stale_hint = (context or {}).get("memory_stale_hint", "")
         system_override = (context or {}).get("system_override", "")
+        # `system_preamble` (from an Oasis project role) is PREPENDED to the
+        # default system prompt, unlike `system_override` which replaces it
+        # entirely. This lets roles layer framing on top of normal chat
+        # behavior without losing tool-use guidance.
+        system_preamble = (context or {}).get("system_preamble", "")
         artifact_context = (context or {}).get("artifact_context", "")
         artifact_search_results = (context or {}).get("artifact_search_results", [])
 
         # Build system prompt — use override if provided (e.g. computer-use planner)
         system = system_override if system_override else CASUAL_SYSTEM_PROMPT
+        if system_preamble and not system_override:
+            system = f"{system_preamble.strip()}\n\n{system}"
         if memory_stale_hint:
             system += f"\nIMPORTANT — {memory_stale_hint}\n"
         if memory_context:
@@ -1965,10 +2179,13 @@ class ResponseGeneratorService:
         rules = (context or {}).get("rules", [])
         memory_context = (context or {}).get("memory_context", [])
         memory_stale_hint = (context or {}).get("memory_stale_hint", "")
+        system_preamble = (context or {}).get("system_preamble", "")
         artifact_context = (context or {}).get("artifact_context", "")
         artifact_search_results = (context or {}).get("artifact_search_results", [])
 
         system = CASUAL_SYSTEM_PROMPT
+        if system_preamble:
+            system = f"{system_preamble.strip()}\n\n{system}"
         if memory_stale_hint:
             system += f"\nIMPORTANT — {memory_stale_hint}\n"
         if memory_context:

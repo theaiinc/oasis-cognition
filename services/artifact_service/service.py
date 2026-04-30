@@ -274,9 +274,19 @@ class ArtifactService:
                 text = ""
 
             if text:
+                # Store up to ~2M chars (~500k tokens). Very long docs still get
+                # trimmed at injection time by the response-generator's context
+                # budget allocator; we just don't want to lose content at the
+                # storage boundary.
+                MAX_TRANSCRIPT_CHARS = 2_000_000
                 await self._mem_patch(f"/internal/memory/artifacts/{artifact_id}", {
-                    "transcript": text[:50000],  # cap at 50k chars
+                    "transcript": text[:MAX_TRANSCRIPT_CHARS],
                 })
+                if len(text) > MAX_TRANSCRIPT_CHARS:
+                    logger.warning(
+                        "Transcript for %s truncated at %d chars (original %d chars)",
+                        artifact_id, MAX_TRANSCRIPT_CHARS, len(text),
+                    )
 
             # Step 2: Generate embeddings
             if text:

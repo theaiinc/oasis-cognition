@@ -59,7 +59,7 @@ export function MarkdownMessage({ text, onOptionClick }: MarkdownMessageProps) {
     <ReactMarkdown
       remarkPlugins={[remarkGfm]}
       components={{
-        code({ className, children, ...props }) {
+        code({ className, children, ref: _ref, ...props }) {
           const isInline = !className;
           if (isInline) {
             return <code className="bg-slate-800 text-emerald-300 px-1.5 py-0.5 rounded text-[13px] font-mono" {...props}>{children}</code>;

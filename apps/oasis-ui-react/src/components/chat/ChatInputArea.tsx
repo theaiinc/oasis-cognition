@@ -32,6 +32,8 @@ interface ChatInputAreaProps {
   pendingFiles?: PendingFile[];
   onFileAdd?: (files: File[]) => void;
   onFileRemove?: (id: string) => void;
+  /** Slot rendered above the textarea (e.g. <RolePicker>). */
+  topToolbar?: React.ReactNode;
 }
 
 export function ChatInputArea({
@@ -47,6 +49,7 @@ export function ChatInputArea({
   pendingFiles = [],
   onFileAdd,
   onFileRemove,
+  topToolbar,
 }: ChatInputAreaProps) {
   const [cursorPosition, setCursorPosition] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -141,6 +144,12 @@ export function ChatInputArea({
               )}
             </div>
           ))}
+        </div>
+      )}
+
+      {topToolbar && (
+        <div className="mb-2 flex items-center gap-2">
+          {topToolbar}
         </div>
       )}
 

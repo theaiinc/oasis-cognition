@@ -19,6 +19,7 @@ Index of curated docs for operators and contributors. For day-to-day agent conve
 | ------------------------------------------------------------------ | ----------------------------------------------------------------------------------------------- |
 | [Getting started](guides/getting-started.md)                       | Prerequisites, `make up`, Ollama, dev-agent, optional code indexer, health checks.              |
 | [What makes Oasis different](guides/what-makes-oasis-different.md) | Differentiators: symbolic layer, memory, code graph in the tool loop, worktrees, observability. |
+| [Workflows, agent profiles, and project roles](guides/workflows-and-roles.md) | DAG workflow engine + reusable agent configs + per-project personas; how external-agents and chat routing consume them. |
 
 
 ## Other notes

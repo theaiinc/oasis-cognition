@@ -28,8 +28,11 @@ services:
   redis:
     image: redis:7-alpine
     restart: unless-stopped
+    # Only expose to host when explicitly set — avoids clashing with other
+    # local Redis instances (e.g. octopus-redis). Inside the compose network,
+    # other services reach us as `redis:6379` regardless.
     ports:
-      - "6379:6379"
+      - "${OASIS_REDIS_HOST_PORT:-6380}:6379"
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
@@ -369,6 +372,30 @@ services:
       retries: 5
       start_period: 15s
 
+  # MCP server — exposes Oasis capabilities as Model Context Protocol tools
+  # for external voice assistants (Claude Desktop, custom agents, etc.).
+  mcp-server:
+    build:
+      context: apps/mcp-server
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8020:8020"
+    environment:
+      - MCP_PORT=8020
+      - MCP_TRANSPORT=http
+      - OASIS_GATEWAY_URL=http://api-gateway:8000
+      - OASIS_MCP_CORS_ORIGIN=${OASIS_MCP_CORS_ORIGIN:-*}
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:8020/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
   # ==========================================================================
   # UI & INTEGRATION LAYER
   # ==========================================================================
@@ -426,7 +453,7 @@ services:
     ports:
       - "7880:7880"
       - "7881:7881"
-      - "50600-50700:50600-50700/udp"
+      - "51600-51700:50600-50700/udp"
     volumes:
       - ./config/livekit/livekit.yaml:/etc/livekit.yaml
     command: ["--config", "/etc/livekit.yaml"]

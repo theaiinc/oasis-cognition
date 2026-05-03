@@ -3,6 +3,7 @@ import remarkGfm from 'remark-gfm';
 import type { ReactNode } from 'react';
 import { useMemo } from 'react';
 import { CodeBlock } from './CodeBlock';
+import { isInternalFileLink, parseFileHref, useFileViewer } from './FileViewer';
 
 function extractTextContent(children: ReactNode): string {
   if (typeof children === 'string') return children;
@@ -54,6 +55,7 @@ export function MarkdownMessage({ text, onOptionClick }: MarkdownMessageProps) {
     () => !!onOptionClick && isQuestionWithOptions(text),
     [onOptionClick, text],
   );
+  const { openFile } = useFileViewer();
 
   return (
     <ReactMarkdown
@@ -89,9 +91,23 @@ export function MarkdownMessage({ text, onOptionClick }: MarkdownMessageProps) {
           }
           return <li>{children}</li>;
         },
-        a: ({ href, children }) => (
-          <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline underline-offset-2">{children}</a>
-        ),
+        a: ({ href, children }) => {
+          if (href && isInternalFileLink(href)) {
+            const { path, line } = parseFileHref(href);
+            return (
+              <button
+                type="button"
+                onClick={(e) => { e.preventDefault(); openFile({ path, line }); }}
+                className="text-blue-400 hover:text-blue-300 underline underline-offset-2 cursor-pointer bg-transparent border-0 p-0 font-inherit"
+              >
+                {children}
+              </button>
+            );
+          }
+          return (
+            <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline underline-offset-2">{children}</a>
+          );
+        },
         blockquote: ({ children }) => (
           <blockquote className="border-l-2 border-blue-500 pl-3 my-2 text-slate-400 italic">{children}</blockquote>
         ),

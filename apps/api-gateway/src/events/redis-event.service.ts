@@ -4,6 +4,12 @@ import { v4 as uuidv4 } from 'uuid';
 
 const STREAM_KEY = 'oasis:events';
 const MAX_BACKLOG_EVENTS = 200;
+/** Hash key: sessionId → ISO timestamp when the current interaction started.
+ *  Powers the cross-tab "🟢 working now" indicator on the History list. */
+const ACTIVE_SESSIONS_KEY = 'oasis:active_sessions';
+/** Anything older than this is treated as a leaked entry (interaction crashed without
+ *  emitting ResponseGenerated). 30 min is generous enough for very long tool loops. */
+const ACTIVE_SESSION_STALE_AFTER_MS = 30 * 60 * 1000;
 
 export interface OasisEvent {
   event_id: string;
@@ -62,6 +68,21 @@ export class RedisEventService implements OnModuleDestroy {
 
     this.logger.debug(`Event: ${eventType} (session=${sessionId})`);
 
+    // Track per-session active state so other tabs can show a "🟢 working" dot.
+    // Boundary events only — InteractionReceived starts, ResponseGenerated /
+    // ResponseFailed / InteractionAborted finish. Tool-call events in between
+    // don't change the state (the session is "working" the whole time).
+    if (eventType === 'InteractionReceived') {
+      void this.markSessionActive(sessionId).catch(() => undefined);
+    } else if (
+      eventType === 'ResponseGenerated' ||
+      eventType === 'ResponseFailed' ||
+      eventType === 'InteractionAborted' ||
+      eventType === 'InteractionFailed'
+    ) {
+      void this.markSessionIdle(sessionId).catch(() => undefined);
+    }
+
     const r = this.redis;
     if (r && (await this.ensureRedisReady())) {
       try {
@@ -83,6 +104,61 @@ export class RedisEventService implements OnModuleDestroy {
 
   isReady(): boolean {
     return Boolean(this.redis && this.connected && this.reader);
+  }
+
+  // ── Active-session tracker ─────────────────────────────────────────
+  // The hash stores `session_id → ISO timestamp of InteractionReceived`. Read
+  // sites filter out anything older than ACTIVE_SESSION_STALE_AFTER_MS as a
+  // safety net for crashed interactions that never emitted a terminal event.
+
+  private async markSessionActive(sessionId: string): Promise<void> {
+    if (!sessionId) return;
+    const r = this.redis;
+    if (!r || !(await this.ensureRedisReady())) return;
+    try {
+      await r.hset(ACTIVE_SESSIONS_KEY, sessionId, new Date().toISOString());
+    } catch (err) {
+      this.logger.warn(`markSessionActive failed: ${err}`);
+    }
+  }
+
+  private async markSessionIdle(sessionId: string): Promise<void> {
+    if (!sessionId) return;
+    const r = this.redis;
+    if (!r || !(await this.ensureRedisReady())) return;
+    try {
+      await r.hdel(ACTIVE_SESSIONS_KEY, sessionId);
+    } catch (err) {
+      this.logger.warn(`markSessionIdle failed: ${err}`);
+    }
+  }
+
+  /** Snapshot of every session currently mid-interaction. Stale entries are pruned on read. */
+  async getActiveSessions(): Promise<Array<{ session_id: string; started_at: string }>> {
+    const r = this.redis;
+    if (!r || !(await this.ensureRedisReady())) return [];
+    try {
+      const all = await r.hgetall(ACTIVE_SESSIONS_KEY);
+      const cutoff = Date.now() - ACTIVE_SESSION_STALE_AFTER_MS;
+      const fresh: Array<{ session_id: string; started_at: string }> = [];
+      const stale: string[] = [];
+      for (const [sid, ts] of Object.entries(all)) {
+        const t = Date.parse(ts);
+        if (Number.isFinite(t) && t >= cutoff) {
+          fresh.push({ session_id: sid, started_at: ts });
+        } else {
+          stale.push(sid);
+        }
+      }
+      // Best-effort GC of leaked entries; fire and forget.
+      if (stale.length > 0) {
+        void r.hdel(ACTIVE_SESSIONS_KEY, ...stale).catch(() => undefined);
+      }
+      return fresh;
+    } catch (err) {
+      this.logger.warn(`getActiveSessions failed: ${err}`);
+      return [];
+    }
   }
 
   async getBacklog(sessionId: string, limit: number = 50): Promise<OasisEvent[]> {

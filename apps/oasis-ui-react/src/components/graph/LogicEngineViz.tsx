@@ -1,6 +1,7 @@
 import { useMemo } from 'react';
 import { Scale, Trash2 } from 'lucide-react';
 import type { GraphData } from '@/lib/types';
+import { InteractiveSvgViewport } from './InteractiveSvgViewport';
 
 interface RuleNode {
   id: string;
@@ -137,64 +138,80 @@ export function LogicEngineViz({ memoryRules, rulesGraph, selectedData, onDelete
         </span>
 
         {nodes.length > 0 && (
-          <div className="rounded-lg border border-slate-800 bg-slate-950 overflow-auto" style={{ minHeight: 200 }}>
-            <svg width={width} height={svgHeight} className="overflow-visible">
-              <defs>
-                <marker id="rule-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-                  <polygon points="0 0, 10 3.5, 0 7" fill="rgba(100, 116, 139, 0.6)" />
-                </marker>
-                <marker id="rule-arrowhead-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-                  <polygon points="0 0, 10 3.5, 0 7" fill="rgba(59, 130, 246, 0.6)" />
-                </marker>
-              </defs>
-              {edges.map((e, i) => {
-                const src = nodePositions[e.source];
-                const tgt = nodePositions[e.target];
-                if (!src || !tgt) return null;
-                const midY = (src.y + tgt.y) / 2;
-                const edgeColor = getEdgeColor(e.edge_type || '');
-                const markerId = e.edge_type === 'DEPENDS_ON' ? 'rule-arrowhead-blue' : 'rule-arrowhead';
-                return (
-                  <g key={i}>
-                    <path
-                      d={`M ${src.x} ${src.y + nodeH / 2} C ${src.x} ${midY}, ${tgt.x} ${midY}, ${tgt.x} ${tgt.y - nodeH / 2}`}
-                      fill="none"
-                      stroke={edgeColor}
-                      strokeWidth={1.5}
-                      markerEnd={`url(#${markerId})`}
-                    />
-                    {e.edge_type && (
-                      <text x={(src.x + tgt.x) / 2} y={midY - 6} textAnchor="middle" className="fill-slate-600 text-[8px]" style={{ dominantBaseline: 'middle' }}>
-                        {e.edge_type.replace('_', ' ').toLowerCase()}
-                      </text>
-                    )}
-                  </g>
-                );
-              })}
-              {nodes.map((n) => {
-                const pos = nodePositions[n.id] || { x: 0, y: 0 };
-                const fill = getRuleColor(n.confidence ?? 0.5);
-                const condFull = n.condition || '—';
-                const conclFull = n.conclusion || '—';
-                const condText = condFull.length > 35 ? condFull.slice(0, 33) + '…' : condFull;
-                const conclText = conclFull.length > 35 ? conclFull.slice(0, 33) + '…' : conclFull;
-                return (
-                  <g key={n.id} transform={`translate(${pos.x - nodeW / 2}, ${pos.y - nodeH / 2})`}>
-                    <title>{`IF ${condFull}\nTHEN ${conclFull}\nConfidence: ${((n.confidence ?? 0.5) * 100).toFixed(0)}%`}</title>
-                    <rect width={nodeW} height={nodeH} rx={8} fill={fill} fillOpacity={0.15} stroke={fill} strokeWidth={1.5} className="cursor-pointer hover:fill-opacity-25 transition-all" />
-                    <text x={8} y={20} className="fill-amber-400/80 text-[9px] font-medium" style={{ pointerEvents: 'none' }}>
-                      IF {condText}
-                    </text>
-                    <text x={8} y={38} className="fill-emerald-400/80 text-[9px] font-medium" style={{ pointerEvents: 'none' }}>
-                      THEN {conclText}
-                    </text>
-                    <text x={nodeW - 8} y={58} textAnchor="end" className="fill-slate-500 text-[8px]" style={{ pointerEvents: 'none' }}>
-                      {((n.confidence ?? 0.5) * 100).toFixed(0)}%
-                    </text>
-                  </g>
-                );
-              })}
-            </svg>
+          <div>
+            <InteractiveSvgViewport contentWidth={width} contentHeight={svgHeight} height={Math.min(380, Math.max(220, svgHeight))}>
+              {(api) => (
+                <>
+                  <defs>
+                    <marker id="rule-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                      <polygon points="0 0, 10 3.5, 0 7" fill="rgba(100, 116, 139, 0.6)" />
+                    </marker>
+                    <marker id="rule-arrowhead-blue" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                      <polygon points="0 0, 10 3.5, 0 7" fill="rgba(59, 130, 246, 0.6)" />
+                    </marker>
+                  </defs>
+                  {edges.map((e, i) => {
+                    const src = nodePositions[e.source];
+                    const tgt = nodePositions[e.target];
+                    if (!src || !tgt) return null;
+                    const so = api.offsetOf(e.source);
+                    const to = api.offsetOf(e.target);
+                    const sx = src.x + so.dx;
+                    const sy = src.y + so.dy;
+                    const tx = tgt.x + to.dx;
+                    const ty = tgt.y + to.dy;
+                    const midY = (sy + ty) / 2;
+                    const edgeColor = getEdgeColor(e.edge_type || '');
+                    const markerId = e.edge_type === 'DEPENDS_ON' ? 'rule-arrowhead-blue' : 'rule-arrowhead';
+                    return (
+                      <g key={i}>
+                        <path
+                          d={`M ${sx} ${sy + nodeH / 2} C ${sx} ${midY}, ${tx} ${midY}, ${tx} ${ty - nodeH / 2}`}
+                          fill="none"
+                          stroke={edgeColor}
+                          strokeWidth={1.5}
+                          markerEnd={`url(#${markerId})`}
+                        />
+                        {e.edge_type && (
+                          <text x={(sx + tx) / 2} y={midY - 6} textAnchor="middle" className="fill-slate-600 text-[8px]" style={{ dominantBaseline: 'middle' }}>
+                            {e.edge_type.replace('_', ' ').toLowerCase()}
+                          </text>
+                        )}
+                      </g>
+                    );
+                  })}
+                  {nodes.map((n) => {
+                    const pos = nodePositions[n.id] || { x: 0, y: 0 };
+                    const off = api.offsetOf(n.id);
+                    const fill = getRuleColor(n.confidence ?? 0.5);
+                    const condFull = n.condition || '—';
+                    const conclFull = n.conclusion || '—';
+                    const condText = condFull.length > 35 ? condFull.slice(0, 33) + '…' : condFull;
+                    const conclText = conclFull.length > 35 ? conclFull.slice(0, 33) + '…' : conclFull;
+                    return (
+                      <g
+                        key={n.id}
+                        transform={`translate(${pos.x - nodeW / 2 + off.dx}, ${pos.y - nodeH / 2 + off.dy})`}
+                        onMouseDown={api.startDrag(n.id)}
+                        style={{ cursor: 'move' }}
+                      >
+                        <title>{`IF ${condFull}\nTHEN ${conclFull}\nConfidence: ${((n.confidence ?? 0.5) * 100).toFixed(0)}%`}</title>
+                        <rect width={nodeW} height={nodeH} rx={8} fill={fill} fillOpacity={0.15} stroke={fill} strokeWidth={1.5} />
+                        <text x={8} y={20} className="fill-amber-400/80 text-[9px] font-medium" style={{ pointerEvents: 'none' }}>
+                          IF {condText}
+                        </text>
+                        <text x={8} y={38} className="fill-emerald-400/80 text-[9px] font-medium" style={{ pointerEvents: 'none' }}>
+                          THEN {conclText}
+                        </text>
+                        <text x={nodeW - 8} y={58} textAnchor="end" className="fill-slate-500 text-[8px]" style={{ pointerEvents: 'none' }}>
+                          {((n.confidence ?? 0.5) * 100).toFixed(0)}%
+                        </text>
+                      </g>
+                    );
+                  })}
+                </>
+              )}
+            </InteractiveSvgViewport>
             <div className="flex flex-wrap gap-1 mt-1 px-1 pb-1">
               <span className="px-1.5 py-0.5 rounded text-[9px]" style={{ backgroundColor: '#22c55e33', color: '#22c55e' }}>High (80%+)</span>
               <span className="px-1.5 py-0.5 rounded text-[9px]" style={{ backgroundColor: '#f59e0b33', color: '#f59e0b' }}>Medium (60%+)</span>

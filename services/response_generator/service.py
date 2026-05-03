@@ -224,6 +224,15 @@ TOOL_PLAN_ALLOWED_TOOLS: tuple[str, ...] = (
     "workflow_add_node",
     "workflow_add_edge",
     "workflow_remove_node",
+    # Mission tools — recurring background tasks the agent owns on the user's behalf.
+    "mission_create",
+    "mission_list",
+    "mission_get",
+    "mission_update",
+    "mission_delete",
+    "mission_pause",
+    "mission_resume",
+    "mission_run",
 )
 
 
@@ -1094,6 +1103,7 @@ READ-ONLY (sandboxed container, source at /workspace):
 5. grep: Recursive regex search. Requires: pattern, path. Use this FIRST when looking for specific code or text in the CODEBASE (not user documents — use search_artifacts for those).
 6. find_files: Find files by name/glob. Requires: pattern, path.
 7. browse_url: Headless browser. Requires: url.
+7a. web_search: General-purpose web search (DuckDuckGo-backed). Requires: PARAM_QUERY. Optional: PARAM_LIMIT (default 5). **Use this whenever the user asks about anything outside the codebase — current events, package docs you don't already know, error message lookups, "what is X", "latest version of Y", etc. — instead of guessing or saying you don't know.** For specific URLs you already have, use `browse_url`; for "what should I search to find this", use `web_search` first then `browse_url` on a result.
 
 CODE EDITING (git worktrees):
 8. create_worktree: Create workspace. Returns `worktree_id`. REQUIRED before editing. Use PARAM_NAME: short ASCII id (hyphens ok), no spaces or path characters — not `/workspace`.
@@ -1126,6 +1136,36 @@ When the user asks to "create a workflow that …", "schedule X", "automate Y ev
 25. trigger_list — list triggers on a workflow. PARAM_WORKFLOW_ID.
 26. trigger_update — toggle enabled or reconfigure. PARAM_TRIGGER_ID. Optional: PARAM_ENABLED, PARAM_TRIGGER_CONFIG.
 27. trigger_delete — PARAM_TRIGGER_ID.
+
+MISSIONS (recurring background tasks the agent owns on the user's behalf):
+A **mission** is a higher-level abstraction than a workflow trigger: a goal you've agreed to keep an eye on, expressed in plain English, that fires on a cron schedule and reports a digest card back to the chat. Use missions when the user says things like "every 10 minutes check X", "watch my Y and tell me when Z", "every weekday at 9am do …", or asks "what are you watching for me?".
+
+Prefer a mission over a workflow when the work fits in a single agent prompt (no multi-node DAG). Prefer a workflow when there's a real pipeline (HTTP fan-out, branching on results, etc.).
+
+28. mission_create — start a recurring mission. **PARAM_GOAL** (required, plain-English description) and **PARAM_SCHEDULE** (required, 5-field cron). Optional: PARAM_PROMPT (the exact text sent to the agent on each tick — defaults to the goal), PARAM_ROLE_ID, PARAM_PROFILE_ID, PARAM_CONNECTOR_ID, PARAM_ENABLED (default true). The chat session that issued the create receives the digest card on every successful run.
+29. mission_list — list all missions (no params). Use this to answer "what are you watching for me?".
+30. mission_get — inspect one mission. PARAM_MISSION_ID.
+31. mission_update — change schedule, goal, prompt, or bindings. PARAM_MISSION_ID (required); optional PARAM_GOAL / PARAM_PROMPT / PARAM_SCHEDULE / PARAM_ROLE_ID / PARAM_PROFILE_ID / PARAM_CONNECTOR_ID / PARAM_ENABLED.
+32. mission_delete — remove a mission permanently. PARAM_MISSION_ID.
+33. mission_pause — disable a mission without deleting it. PARAM_MISSION_ID.
+34. mission_resume — re-enable a paused mission. PARAM_MISSION_ID.
+35. mission_run — fire a mission immediately, on top of its normal schedule. PARAM_MISSION_ID. The result surfaces as a digest card just like a scheduled run.
+
+🪄 mission_id is inherited automatically: after a successful mission_create earlier in the same turn, you may OMIT PARAM_MISSION_ID on subsequent mission_update / mission_pause / mission_resume / mission_run / mission_delete calls — the tool pipeline auto-fills it from the last mission_create's result.
+
+Cron quick reference for missions:
+- `*/10 * * * *`     — every 10 minutes
+- `0 * * * *`        — top of every hour
+- `0 9 * * 1-5`      — weekdays at 9am
+- `0 0 * * *`        — daily at midnight
+- `*/5 9-18 * * 1-5` — every 5 minutes during business hours, weekdays
+
+Example (mission_create — watch a folder for new TODOs every 30 minutes):
+```
+ACTION: mission_create
+PARAM_GOAL: scan apps/**/*.ts for new TODO comments and report any added since the last run
+PARAM_SCHEDULE: */30 * * * *
+```
 
 Node shape (for PARAM_WORKFLOW_JSON):
 ```

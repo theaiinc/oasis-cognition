@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Oasis quick prompt</title>
+<style>
+  :root { color-scheme: dark; }
+  html, body {
+    margin: 0; padding: 0;
+    background: rgba(15, 23, 42, 0.92);
+    color: #e2e8f0;
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Inter, system-ui, sans-serif;
+    -webkit-app-region: drag;
+  }
+  body { padding: 16px; }
+  #wrap { display: flex; flex-direction: column; gap: 8px; }
+  #row {
+    display: flex; gap: 8px; align-items: center;
+    background: #0a0f1a; border: 1px solid #334155; border-radius: 12px;
+    padding: 10px 14px; -webkit-app-region: no-drag;
+  }
+  #row svg { flex-shrink: 0; opacity: 0.7; }
+  #q {
+    flex: 1; border: 0; outline: 0; background: transparent;
+    color: inherit; font-size: 16px; line-height: 1.4;
+  }
+  #q::placeholder { color: #64748b; }
+  #send {
+    border: 0; outline: 0; cursor: pointer;
+    background: linear-gradient(135deg, #3b82f6 0%, #10b981 100%);
+    color: white; font-weight: 600; font-size: 12px;
+    padding: 6px 12px; border-radius: 8px;
+  }
+  #send:disabled { opacity: 0.5; cursor: default; }
+  #out {
+    -webkit-app-region: no-drag;
+    background: #0a0f1a; border: 1px solid #1e293b; border-radius: 10px;
+    padding: 10px 14px; max-height: 320px; overflow-y: auto;
+    font-size: 13px; line-height: 1.55; white-space: pre-wrap;
+    color: #cbd5e1; display: none;
+  }
+  #hint {
+    color: #64748b; font-size: 11px; padding: 0 4px;
+    -webkit-app-region: no-drag; user-select: none;
+  }
+  #out.show { display: block; }
+  .err { color: #fda4af; }
+</style>
+</head>
+<body>
+  <div id="wrap">
+    <div id="row">
+      <svg width="20" height="20" viewBox="0 0 64 64" fill="none">
+        <defs>
+          <linearGradient id="g" x1="0" y1="0" x2="64" y2="64" gradientUnits="userSpaceOnUse">
+            <stop offset="0%" stop-color="#60a5fa"/>
+            <stop offset="55%" stop-color="#22d3ee"/>
+            <stop offset="100%" stop-color="#10b981"/>
+          </linearGradient>
+        </defs>
+        <path d="M 6 38 A 26 26 0 1 1 58 38" stroke="url(#g)" stroke-width="3" stroke-linecap="round" stroke-opacity="0.55" fill="none"/>
+        <path d="M 14 38 A 18 18 0 1 1 50 38" stroke="url(#g)" stroke-width="3" stroke-linecap="round" stroke-opacity="0.8" fill="none"/>
+        <path d="M 22 38 A 10 10 0 1 1 42 38" stroke="url(#g)" stroke-width="3" stroke-linecap="round" fill="none"/>
+        <circle cx="32" cy="38" r="4.5" fill="#10b981"/>
+      </svg>
+      <input id="q" type="text" autofocus placeholder="Ask Oasis anything…" />
+      <button id="send">Send</button>
+    </div>
+    <div id="out"></div>
+    <div id="hint">⏎ to send · Esc to hide · ⌘K to open the main window with this answer</div>
+  </div>
+<script>
+  // Communicates with main process via the preload (window.oasisQuick).
+  const q = document.getElementById('q');
+  const send = document.getElementById('send');
+  const out = document.getElementById('out');
+  let busy = false;
+  let lastSessionId = (window.localStorage && localStorage.getItem('oasis-quick-session')) || `quick-${Math.random().toString(36).slice(2, 10)}`;
+  try { localStorage.setItem('oasis-quick-session', lastSessionId); } catch {}
+
+  async function submit() {
+    const text = q.value.trim();
+    if (!text || busy) return;
+    busy = true;
+    send.disabled = true;
+    out.classList.add('show');
+    out.classList.remove('err');
+    out.textContent = '…thinking';
+    try {
+      const r = await window.oasisQuick.ask({ user_message: text, session_id: lastSessionId });
+      if (r?.ok) {
+        out.textContent = (r.response || '').trim() || '(no text response)';
+      } else {
+        out.classList.add('err');
+        out.textContent = 'Error: ' + (r?.error || 'unknown');
+      }
+    } catch (e) {
+      out.classList.add('err');
+      out.textContent = 'Error: ' + (e?.message || e);
+    } finally {
+      busy = false;
+      send.disabled = false;
+    }
+  }
+
+  q.addEventListener('keydown', (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); submit(); }
+    else if (e.key === 'Escape') window.oasisQuick.hide();
+    else if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
+      e.preventDefault();
+      window.oasisQuick.escalate({ session_id: lastSessionId });
+    }
+  });
+  send.addEventListener('click', submit);
+
+  // Refocus the input every time the window is shown again.
+  window.oasisQuick.onShow(() => { q.value = ''; out.textContent = ''; out.classList.remove('show'); q.focus(); });
+</script>
+</body>
+</html>

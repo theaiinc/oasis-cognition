@@ -1,4 +1,4 @@
-import type { GraphData } from '@/lib/types';
+import { InteractiveSvgViewport } from './InteractiveSvgViewport';
 
 // ── Tier definitions ─────────────────────────────────────────────────────
 type Tier = 'foundational' | 'active';
@@ -94,9 +94,9 @@ export function KnowledgeGraphViz({
   const nodeW = Math.min(140, Math.max(80, containerWidth / 6));
   const nodeH = 44;
   const width = containerWidth;
-  const sectionGap = 40; // gap between foundational and active sections
-  const sectionPad = 30; // top padding inside each section
-  const labelH = 20; // space for section label
+  const sectionGap = 40;
+  const sectionPad = 30;
+  const labelH = 20;
 
   function layoutSection(
     sectionNodes: typeof nodes,
@@ -137,7 +137,8 @@ export function KnowledgeGraphViz({
     ? layoutSection(activeNodes, ACTIVE_LAYER, yPos)
     : 0;
 
-  const totalHeight = containerHeight ?? Math.max(320, yPos + activeH + 30);
+  const totalHeight = Math.max(320, yPos + activeH + 30);
+  const viewportHeight = containerHeight ?? Math.min(380, totalHeight);
 
   // ── Section background rects ────────────────────────────────────────
   const sections: Array<{ tier: Tier; y: number; h: number; count: number }> = [];
@@ -145,78 +146,94 @@ export function KnowledgeGraphViz({
   if (activeNodes.length > 0) sections.push({ tier: 'active', y: activeY, h: activeH, count: activeNodes.length });
 
   return (
-    <div className="rounded-lg border border-slate-800 bg-slate-950 overflow-auto" style={{ minHeight: 280 }}>
-      <svg width={width} height={totalHeight} className="overflow-visible">
-        <defs>
-          <marker id="kg-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
-            <polygon points="0 0, 10 3.5, 0 7" fill="rgba(100, 116, 139, 0.6)" />
-          </marker>
-        </defs>
+    <div>
+      <InteractiveSvgViewport contentWidth={width} contentHeight={totalHeight} height={viewportHeight}>
+        {(api) => (
+          <>
+            <defs>
+              <marker id="kg-arrowhead" markerWidth="10" markerHeight="7" refX="9" refY="3.5" orient="auto">
+                <polygon points="0 0, 10 3.5, 0 7" fill="rgba(100, 116, 139, 0.6)" />
+              </marker>
+            </defs>
 
-        {/* Section backgrounds */}
-        {sections.map(s => {
-          const cfg = TIER_CONFIG[s.tier];
-          return (
-            <g key={`section-${s.tier}`}>
-              <rect
-                x={4} y={s.y} width={width - 8} height={s.h}
-                rx={8} fill={cfg.bg} stroke={cfg.border}
-                strokeWidth={1} strokeDasharray={s.tier === 'active' ? '4 3' : undefined}
-              />
-              <text x={12} y={s.y + 14} className="text-[10px] font-semibold" fill={cfg.text}>
-                {cfg.label} ({s.count})
-              </text>
-            </g>
-          );
-        })}
+            {/* Section backgrounds */}
+            {sections.map(s => {
+              const cfg = TIER_CONFIG[s.tier];
+              return (
+                <g key={`section-${s.tier}`}>
+                  <rect
+                    x={4} y={s.y} width={width - 8} height={s.h}
+                    rx={8} fill={cfg.bg} stroke={cfg.border}
+                    strokeWidth={1} strokeDasharray={s.tier === 'active' ? '4 3' : undefined}
+                  />
+                  <text x={12} y={s.y + 14} className="text-[10px] font-semibold" fill={cfg.text}>
+                    {cfg.label} ({s.count})
+                  </text>
+                </g>
+              );
+            })}
 
-        {/* Edges */}
-        {edges.map((e, i) => {
-          const src = nodePositions[e.source_node];
-          const tgt = nodePositions[e.target_node];
-          if (!src || !tgt) return null;
-          const midY = (src.y + tgt.y) / 2;
-          return (
-            <g key={i}>
-              <path
-                d={`M ${src.x} ${src.y + nodeH / 2} C ${src.x} ${midY}, ${tgt.x} ${midY}, ${tgt.x} ${tgt.y - nodeH / 2}`}
-                fill="none"
-                stroke="rgba(100, 116, 139, 0.5)"
-                strokeWidth={1.5}
-                markerEnd="url(#kg-arrowhead)"
-              />
-              {e.edge_type && (
-                <text x={(src.x + tgt.x) / 2} y={midY - 4} textAnchor="middle" className="fill-slate-500 text-[9px]" style={{ dominantBaseline: 'middle' }}>
-                  {e.edge_type}
-                </text>
-              )}
-            </g>
-          );
-        })}
+            {/* Edges */}
+            {edges.map((e, i) => {
+              const src = nodePositions[e.source_node];
+              const tgt = nodePositions[e.target_node];
+              if (!src || !tgt) return null;
+              const so = api.offsetOf(e.source_node);
+              const to = api.offsetOf(e.target_node);
+              const sx = src.x + so.dx;
+              const sy = src.y + so.dy;
+              const tx = tgt.x + to.dx;
+              const ty = tgt.y + to.dy;
+              const midY = (sy + ty) / 2;
+              return (
+                <g key={i}>
+                  <path
+                    d={`M ${sx} ${sy + nodeH / 2} C ${sx} ${midY}, ${tx} ${midY}, ${tx} ${ty - nodeH / 2}`}
+                    fill="none"
+                    stroke="rgba(100, 116, 139, 0.5)"
+                    strokeWidth={1.5}
+                    markerEnd="url(#kg-arrowhead)"
+                  />
+                  {e.edge_type && (
+                    <text x={(sx + tx) / 2} y={midY - 4} textAnchor="middle" className="fill-slate-500 text-[9px]" style={{ dominantBaseline: 'middle' }}>
+                      {e.edge_type}
+                    </text>
+                  )}
+                </g>
+              );
+            })}
 
-        {/* Nodes */}
-        {nodes.map(n => {
-          const pos = nodePositions[n.id] || { x: 0, y: 0 };
-          const fill = getNodeColor(n.node_type || '');
-          const tier = inferTier(n);
-          return (
-            <g key={n.id} transform={`translate(${pos.x - nodeW / 2}, ${pos.y - nodeH / 2})`}>
-              <rect
-                width={nodeW} height={nodeH} rx={8}
-                fill={fill} fillOpacity={0.2}
-                stroke={fill} strokeWidth={1.5}
-                strokeDasharray={tier === 'active' ? '5 3' : undefined}
-              />
-              <text x={nodeW / 2} y={nodeH / 2} textAnchor="middle" className="fill-slate-200 text-[10px] font-medium" style={{ dominantBaseline: 'middle' }}>
-                {(n.title || n.node_type || 'Node').slice(0, Math.max(14, Math.floor(nodeW / 8)))}
-              </text>
-            </g>
-          );
-        })}
-      </svg>
+            {/* Nodes */}
+            {nodes.map(n => {
+              const pos = nodePositions[n.id] || { x: 0, y: 0 };
+              const off = api.offsetOf(n.id);
+              const fill = getNodeColor(n.node_type || '');
+              const tier = inferTier(n);
+              return (
+                <g
+                  key={n.id}
+                  transform={`translate(${pos.x - nodeW / 2 + off.dx}, ${pos.y - nodeH / 2 + off.dy})`}
+                  onMouseDown={api.startDrag(n.id)}
+                  style={{ cursor: 'move' }}
+                >
+                  <rect
+                    width={nodeW} height={nodeH} rx={8}
+                    fill={fill} fillOpacity={0.2}
+                    stroke={fill} strokeWidth={1.5}
+                    strokeDasharray={tier === 'active' ? '5 3' : undefined}
+                  />
+                  <text x={nodeW / 2} y={nodeH / 2} textAnchor="middle" className="fill-slate-200 text-[10px] font-medium pointer-events-none" style={{ dominantBaseline: 'middle' }}>
+                    {(n.title || n.node_type || 'Node').slice(0, Math.max(14, Math.floor(nodeW / 8)))}
+                  </text>
+                </g>
+              );
+            })}
+          </>
+        )}
+      </InteractiveSvgViewport>
 
       {/* Legend: tiers + node types */}
-      <div className="px-2 py-1.5 border-t border-slate-800/50">
+      <div className="px-2 py-1.5 mt-1 rounded-md border border-slate-800/50 bg-slate-950">
         <div className="flex gap-3 mb-1">
           {sections.map(s => {
             const cfg = TIER_CONFIG[s.tier];

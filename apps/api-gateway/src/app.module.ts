@@ -18,6 +18,8 @@ import { WorkflowsModule } from './workflows/workflows.module';
 import { WebSearchModule } from './web-search/web-search.module';
 import { AgentProfilesModule } from './agent-profiles/agent-profiles.module';
 import { ProjectRolesModule } from './project-roles/project-roles.module';
+import { FilesModule } from './files/files.module';
+import { MissionsModule } from './missions/missions.module';
 
 @Module({
   imports: [
@@ -40,6 +42,8 @@ import { ProjectRolesModule } from './project-roles/project-roles.module';
     WebSearchModule,
     AgentProfilesModule,
     ProjectRolesModule,
+    FilesModule,
+    MissionsModule,
   ],
 })
 export class AppModule {}

@@ -1,5 +1,6 @@
 import { Controller, Post, Get, Delete, Body, Param, Query, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import axios from 'axios';
+import { SessionWorktreeService } from '../session/session-worktree.service';
 
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
 const MOBILE_RELAY_URL = process.env.MOBILE_RELAY_URL || 'http://localhost:8015';
@@ -7,6 +8,8 @@ const MOBILE_RELAY_URL = process.env.MOBILE_RELAY_URL || 'http://localhost:8015'
 @Controller('dev-agent')
 export class DevAgentController {
   private readonly logger = new Logger(DevAgentController.name);
+
+  constructor(private readonly sessionWorktree: SessionWorktreeService) {}
 
   @Get('worktrees')
   async listWorktrees() {
@@ -40,6 +43,8 @@ export class DevAgentController {
     this.logger.log(`Applying changes from worktree: ${body.worktree_id}`);
     try {
       const res = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/apply`, body, { timeout: 30000 });
+      // Free the worktree binding so the next session can claim a fresh one.
+      if (body.worktree_id) await this.sessionWorktree.releaseWorktree(body.worktree_id);
       return res.data;
     } catch (err: any) {
       throw new HttpException(
@@ -54,6 +59,7 @@ export class DevAgentController {
     this.logger.log(`Discarding worktree: ${worktreeId}`);
     try {
       const res = await axios.delete(`${DEV_AGENT_URL}/internal/dev-agent/worktree/${worktreeId}`, { timeout: 15000 });
+      await this.sessionWorktree.releaseWorktree(worktreeId);
       return res.data;
     } catch (err: any) {
       throw new HttpException(

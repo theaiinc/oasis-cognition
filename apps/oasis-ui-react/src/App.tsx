@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Activity, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog } from 'lucide-react';
+import { Terminal, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Toaster } from "@/components/ui/toaster";
@@ -26,6 +26,8 @@ import {
   VoiceBubbles,
 } from '@/components/chat';
 import { VirtualizedChatMessages } from '@/components/chat/VirtualizedChatMessages';
+import { ActiveMissionsBar, type MissionRow } from '@/components/chat/ActiveMissionsBar';
+import { EmptyChatHints } from '@/components/chat/EmptyChatHints';
 import { GraphPanel } from '@/components/graph';
 import { SettingsPanel, HistoryPanel, ArtifactsPanel } from '@/components/panels';
 import { AgentsPanel } from '@/components/agents/AgentsPanel';
@@ -78,6 +80,13 @@ export default function App() {
   const [showWorkflowsPanel, setShowWorkflowsPanel] = useState(false);
   const [showMobilePairingPanel, setShowMobilePairingPanel] = useState(false);
   const [showArtifactsPanel, setShowArtifactsPanel] = useState(false);
+  // Missions visible inline in the chat — not in a separate panel. The map is the source of
+  // truth; the SSE handlers below mutate it as Mission* events arrive.
+  const [missionsById, setMissionsById] = useState<Record<string, MissionRow>>({});
+  // Set of session_ids that are currently mid-interaction. Polled from
+  // /api/v1/sessions/active every 5s; drives the green pulse on HistoryPanel
+  // rows + the sidebar History-icon badge so cross-tab activity is visible.
+  const [activeSessionIds, setActiveSessionIds] = useState<Set<string>>(() => new Set());
   // Active project role for routing chat → agent profile (model + preamble).
   // Persisted per project by <RolePicker> via localStorage.
   const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
@@ -268,6 +277,47 @@ export default function App() {
       const res = await axios.get(`${OASIS_BASE_URL}/api/v1/history/sessions`);
       setHistorySessions(res.data.sessions || []);
     } catch { /* silent */ }
+  }, []);
+
+  /**
+   * Reload missions from the gateway. Cheap (single hash read in Redis) so we
+   * call this on mount + after any mutation rather than maintaining a perfect
+   * incremental view from SSE — events tell us *when* something changed; the
+   * source of truth is always the canonical /api/v1/missions list.
+   */
+  const reloadMissions = useCallback(async () => {
+    try {
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/missions`);
+      const list: MissionRow[] = (res.data?.missions || []) as MissionRow[];
+      const next: Record<string, MissionRow> = {};
+      for (const m of list) next[m.mission_id] = m;
+      setMissionsById(next);
+    } catch { /* silent */ }
+  }, []);
+
+  // Initial load — populate the active-missions bar as soon as the app mounts.
+  useEffect(() => { void reloadMissions(); }, [reloadMissions]);
+
+  // Poll the cross-tab active-sessions list. 5s is fine — this drives the green
+  // pulse on history rows + the sidebar History-icon badge; users won't notice
+  // a 5s delay before another tab's activity shows up.
+  useEffect(() => {
+    let cancelled = false;
+    const tick = async () => {
+      try {
+        const res = await axios.get(`${OASIS_BASE_URL}/api/v1/sessions/active`, { timeout: 4000 });
+        if (cancelled) return;
+        const ids: string[] = (res.data?.active || []).map((x: { session_id: string }) => x.session_id);
+        setActiveSessionIds((prev) => {
+          // Cheap equality check so we don't trigger re-renders on identical sets.
+          if (prev.size === ids.length && ids.every((id) => prev.has(id))) return prev;
+          return new Set(ids);
+        });
+      } catch { /* silent — endpoint optional */ }
+    };
+    void tick();
+    const interval = setInterval(tick, 5000);
+    return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
   const loadSession = useCallback(async (sessionId: string) => {
@@ -582,6 +632,104 @@ export default function App() {
     es.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data) as TimelineEvent;
+
+        // ── Mission lifecycle events (created / updated / deleted / paused / resumed):
+        //    refresh the active-missions bar from the canonical list. Optimistic
+        //    state nudges (running ↔ idle) avoid the flash where the run completes
+        //    before our reload returns.
+        if (data.event_type === 'MissionCreated' || data.event_type === 'MissionUpdated' || data.event_type === 'MissionDeleted') {
+          void reloadMissions();
+          return;
+        }
+        if (data.event_type === 'MissionRunStarted') {
+          const p = data.payload as Record<string, any>;
+          const mid = p?.mission_id;
+          if (!mid) return;
+          // Optimistic state nudge so the active-missions bar pulses immediately.
+          setMissionsById((prev) => prev[mid] ? ({ ...prev, [mid]: { ...prev[mid], state: 'running' } }) : prev);
+          // Append a "running…" digest card so the user sees the work happening,
+          // not just a silent gap before the result lands. Use a per-mission row id
+          // so the completion handler can replace it in place.
+          const runningRowId = `mission-running-${mid}`;
+          setMessages((prev) => {
+            if (prev.some((m) => m.id === runningRowId)) return prev;
+            return [...prev, {
+              id: runningRowId,
+              text: '',
+              sender: 'mission',
+              timestamp: new Date(p.started_at || data.timestamp || Date.now()),
+              missionDigest: {
+                mission_id: mid,
+                goal: p.goal || '',
+                run_count: 0, // unknown until completion
+                finished_at: p.started_at || data.timestamp || new Date().toISOString(),
+                started_at: p.started_at,
+                triggered_by: p.triggered_by,
+                running: true,
+              },
+            }];
+          });
+          return;
+        }
+
+        // ── Mission digests don't have client_message_id; surface them as their
+        //    own chat row (sender='mission') so they render inline next to the
+        //    conversation that asked for the mission. Also fire a native
+        //    notification when running in the Electron desktop shell so the
+        //    user sees results without having Oasis in the foreground.
+        if (data.event_type === 'MissionRunCompleted') {
+          const p = data.payload as Record<string, any>;
+          if (!p?.mission_id) return;
+          const rowId = `mission-${p.mission_id}-${p.run_count ?? Date.now()}`;
+          const runningRowId = `mission-running-${p.mission_id}`;
+          const finalDigest: Message['missionDigest'] = {
+            mission_id: p.mission_id,
+            goal: p.goal || '',
+            result: p.result,
+            error: p.error,
+            run_count: p.run_count ?? 0,
+            finished_at: p.finished_at || data.timestamp || new Date().toISOString(),
+            started_at: p.started_at,
+            triggered_by: p.triggered_by,
+          };
+          setMessages((prev) => {
+            // If a "running…" row is already in place for this mission, replace it
+            // (preserves the in-place feel — the same card transitions from running → done).
+            const runIdx = prev.findIndex((m) => m.id === runningRowId);
+            if (runIdx >= 0) {
+              const next = [...prev];
+              next[runIdx] = {
+                ...prev[runIdx],
+                id: rowId,
+                timestamp: new Date(finalDigest.finished_at),
+                missionDigest: finalDigest,
+              };
+              return next;
+            }
+            // Manual run with no preceding RunStarted, or backlog replay — just append.
+            if (prev.some((m) => m.id === rowId)) return prev;
+            return [...prev, {
+              id: rowId,
+              text: '',
+              sender: 'mission',
+              timestamp: new Date(finalDigest.finished_at),
+              missionDigest: finalDigest,
+            }];
+          });
+          // Refresh the active-missions bar so state/last_run/next_run reflect this completion.
+          void reloadMissions();
+          // Native notification (no-op in the browser; Electron preload exposes window.oasis.notify).
+          const w = window as unknown as { oasis?: { isDesktop?: boolean; notify?: (o: { title: string; body: string; silent?: boolean }) => void } };
+          if (w.oasis?.isDesktop && w.oasis.notify) {
+            const title = p.error ? `Mission failed: ${p.goal || 'untitled'}` : `Mission digest: ${p.goal || 'untitled'}`;
+            const bodyText = p.error
+              ? String(p.error).slice(0, 200)
+              : (p.result ? String(p.result).replace(/\s+/g, ' ').slice(0, 200) : 'Run completed.');
+            try { w.oasis.notify({ title, body: bodyText }); } catch { /* notifications not supported */ }
+          }
+          return;
+        }
+
         const clientId = data?.payload?.client_message_id;
         if (typeof clientId !== 'string' || !clientId) return;
 
@@ -795,12 +943,14 @@ export default function App() {
     <div className="flex h-screen w-full bg-[#030712] text-slate-100 overflow-hidden">
       {showSidebar && <div className="md:hidden fixed inset-0 bg-black/60 z-20" onClick={() => setShowSidebar(false)} aria-hidden="true" />}
       <div className={cn("w-16 min-w-[64px] flex-shrink-0 flex flex-col items-center py-6 border-r border-slate-800 bg-[#0a0f1a] gap-8 z-30", !showSidebar && "max-md:hidden", showSidebar && "max-md:fixed max-md:left-0 max-md:top-0 max-md:h-screen max-md:shadow-xl")}>
-        <div className="w-10 h-10 rounded-xl bg-blue-600 flex items-center justify-center shadow-lg shadow-blue-900/20"><Activity className="w-6 h-6 text-white" /></div>
+        <div className="w-10 h-10 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center shadow-lg shadow-blue-900/10">
+          <img src="/favicon.svg" alt="Oasis" className="w-7 h-7 select-none" draggable={false} />
+        </div>
         <div className="flex-1 flex flex-col gap-6">
           <Button
             variant="ghost"
             size="icon"
-            className={cn("text-slate-400 hover:text-white", showHistoryPanel && "text-blue-400")}
+            className={cn("text-slate-400 hover:text-white relative", showHistoryPanel && "text-blue-400")}
             onClick={() => {
               setShowHistoryPanel(v => !v);
               if (!showHistoryPanel) {
@@ -815,9 +965,16 @@ export default function App() {
                 setShowArtifactsPanel(false);
               }
             }}
-            title="Chat history"
+            title={
+              activeSessionIds.size > (activeSessionIds.has(textSessionId) ? 1 : 0)
+                ? `Chat history — ${activeSessionIds.size - (activeSessionIds.has(textSessionId) ? 1 : 0)} other session(s) working`
+                : 'Chat history'
+            }
           >
             <History className="w-5 h-5" />
+            {activeSessionIds.size > (activeSessionIds.has(textSessionId) ? 1 : 0) && (
+              <span className="absolute top-1 right-1 w-2 h-2 rounded-full bg-emerald-400 ring-1 ring-[#0a0f1a] animate-pulse" />
+            )}
           </Button>
           <Button
             variant="ghost"
@@ -991,7 +1148,7 @@ export default function App() {
       </div>
 
       <AnimatePresence>
-        {showHistoryPanel && <HistoryPanel sessions={historySessions} currentSessionId={textSessionId} onNewChat={handleNewChat} onLoadSession={(id) => { loadSession(id); setGraphsBySessionId({}); }} onDeleteSession={deleteSession} />}
+        {showHistoryPanel && <HistoryPanel sessions={historySessions} currentSessionId={textSessionId} activeSessionIds={activeSessionIds} onNewChat={handleNewChat} onLoadSession={(id) => { loadSession(id); setGraphsBySessionId({}); }} onDeleteSession={deleteSession} />}
       </AnimatePresence>
       <AnimatePresence>
       </AnimatePresence>
@@ -1075,19 +1232,22 @@ export default function App() {
         // Full-canvas panels replace the chat area entirely.
         (showWorkflowsPanel || showAgentsPanel) && "hidden",
       )}>
-        <ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} />
+<ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} />
 
         <div className="flex-1 overflow-hidden flex flex-col p-6 max-w-5xl mx-auto w-full">
+          <ActiveMissionsBar
+            missions={Object.values(missionsById).sort((a, b) => a.goal.localeCompare(b.goal))}
+            onMutated={reloadMissions}
+          />
           <ScrollArea className="flex-1 pr-4" ref={scrollRef}>
             <div className="flex flex-col gap-6 py-4">
-              {messages.length === 0 && !voice.micEnabled && (
-                <div className="flex flex-col items-center justify-center h-64 text-center space-y-4">
-                  <div className="w-16 h-16 rounded-full bg-slate-900 animate-pulse flex items-center justify-center"><Bot className="w-8 h-8 text-slate-700" /></div>
-                  <div className="space-y-1">
-                    <h3 className="text-lg font-medium text-slate-400">Ready to think.</h3>
-                    <p className="text-sm text-slate-500 max-w-xs leading-relaxed">Connect to the reasoning engine and speak or type to begin your session.</p>
-                  </div>
-                </div>
+              {/* Show suggestions until the user actually engages. The "Connected to Oasis"
+                  system message gets inserted on session start, so we can't gate on length===0. */}
+              {messages.filter((m) => m.sender === 'user' || m.sender === 'assistant').length === 0 && !voice.micEnabled && (
+                <EmptyChatHints
+                  hasMissions={Object.keys(missionsById).length > 0}
+                  onPick={(prompt) => { setInputText(prompt); inputRef.current?.focus(); }}
+                />
               )}
 
               {messages.length <= 20

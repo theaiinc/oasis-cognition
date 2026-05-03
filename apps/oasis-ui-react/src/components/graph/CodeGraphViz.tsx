@@ -1,5 +1,6 @@
 import { useState, useMemo } from 'react';
 import type { CodeGraphData } from '@/lib/types';
+import { InteractiveSvgViewport } from './InteractiveSvgViewport';
 
 const NODE_LAYER: Record<string, number> = {
   CodeFile: 0,
@@ -107,53 +108,67 @@ export function CodeGraphViz({ data }: CodeGraphVizProps) {
         placeholder="Search symbols..."
         className="w-full px-2.5 py-1.5 rounded-md bg-slate-900 border border-slate-700 text-xs text-slate-200 placeholder:text-slate-500 focus:outline-none focus:border-slate-500"
       />
-      <div className="rounded-lg border border-slate-800 bg-slate-950 overflow-auto" style={{ minHeight: 200 }}>
-        <svg width={svgWidth} height={svgHeight} className="overflow-visible">
-          <defs>
-            <marker id="cg-arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-              <polygon points="0 0, 8 3, 0 6" fill="rgba(100,116,139,0.6)" />
-            </marker>
-            {Object.entries(EDGE_COLORS).map(([rel, color]) => (
-              <marker key={rel} id={`cg-arrow-${rel}`} markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
-                <polygon points="0 0, 8 3, 0 6" fill={color} />
+      <InteractiveSvgViewport contentWidth={svgWidth} contentHeight={svgHeight} height={Math.min(360, Math.max(220, svgHeight))}>
+        {(api) => (
+          <>
+            <defs>
+              <marker id="cg-arrowhead" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                <polygon points="0 0, 8 3, 0 6" fill="rgba(100,116,139,0.6)" />
               </marker>
-            ))}
-          </defs>
-          {edges.map((e, i) => {
-            const src = nodePositions[e.source];
-            const tgt = nodePositions[e.target];
-            if (!src || !tgt) return null;
-            const midY = (src.y + tgt.y) / 2;
-            const color = EDGE_COLORS[e.rel] || 'rgba(100,116,139,0.5)';
-            const markerId = EDGE_COLORS[e.rel] ? `cg-arrow-${e.rel}` : 'cg-arrowhead';
-            return (
-              <g key={i}>
-                <path
-                  d={`M ${src.x} ${src.y + nodeH / 2} C ${src.x} ${midY}, ${tgt.x} ${midY}, ${tgt.x} ${tgt.y - nodeH / 2}`}
-                  fill="none"
-                  stroke={color}
-                  strokeWidth={1.2}
-                  markerEnd={`url(#${markerId})`}
-                />
-              </g>
-            );
-          })}
-          {nodes.map((n) => {
-            const pos = nodePositions[n.id];
-            if (!pos) return null;
-            const fill = getNodeColor(n.node_type);
-            return (
-              <g key={n.id} transform={`translate(${pos.x - nodeW / 2}, ${pos.y - nodeH / 2})`}>
-                <title>{`${n.node_type}: ${n.label}${n.file_path ? `\n${n.file_path}` : ''}${n.line ? `:${n.line}` : ''}`}</title>
-                <rect width={nodeW} height={nodeH} rx={6} fill={fill} fillOpacity={0.15} stroke={fill} strokeWidth={1.2} />
-                <text x={nodeW / 2} y={nodeH / 2} textAnchor="middle" className="fill-slate-200 text-[9px] font-medium" style={{ dominantBaseline: 'middle' }}>
-                  {n.label.length > 16 ? n.label.slice(0, 15) + '…' : n.label}
-                </text>
-              </g>
-            );
-          })}
-        </svg>
-      </div>
+              {Object.entries(EDGE_COLORS).map(([rel, color]) => (
+                <marker key={rel} id={`cg-arrow-${rel}`} markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+                  <polygon points="0 0, 8 3, 0 6" fill={color} />
+                </marker>
+              ))}
+            </defs>
+            {edges.map((e, i) => {
+              const src = nodePositions[e.source];
+              const tgt = nodePositions[e.target];
+              if (!src || !tgt) return null;
+              const so = api.offsetOf(e.source);
+              const to = api.offsetOf(e.target);
+              const sx = src.x + so.dx;
+              const sy = src.y + so.dy;
+              const tx = tgt.x + to.dx;
+              const ty = tgt.y + to.dy;
+              const midY = (sy + ty) / 2;
+              const color = EDGE_COLORS[e.rel] || 'rgba(100,116,139,0.5)';
+              const markerId = EDGE_COLORS[e.rel] ? `cg-arrow-${e.rel}` : 'cg-arrowhead';
+              return (
+                <g key={i}>
+                  <path
+                    d={`M ${sx} ${sy + nodeH / 2} C ${sx} ${midY}, ${tx} ${midY}, ${tx} ${ty - nodeH / 2}`}
+                    fill="none"
+                    stroke={color}
+                    strokeWidth={1.2}
+                    markerEnd={`url(#${markerId})`}
+                  />
+                </g>
+              );
+            })}
+            {nodes.map((n) => {
+              const pos = nodePositions[n.id];
+              if (!pos) return null;
+              const off = api.offsetOf(n.id);
+              const fill = getNodeColor(n.node_type);
+              return (
+                <g
+                  key={n.id}
+                  transform={`translate(${pos.x - nodeW / 2 + off.dx}, ${pos.y - nodeH / 2 + off.dy})`}
+                  onMouseDown={api.startDrag(n.id)}
+                  style={{ cursor: 'move' }}
+                >
+                  <title>{`${n.node_type}: ${n.label}${n.file_path ? `\n${n.file_path}` : ''}${n.line ? `:${n.line}` : ''}`}</title>
+                  <rect width={nodeW} height={nodeH} rx={6} fill={fill} fillOpacity={0.15} stroke={fill} strokeWidth={1.2} />
+                  <text x={nodeW / 2} y={nodeH / 2} textAnchor="middle" className="fill-slate-200 text-[9px] font-medium pointer-events-none" style={{ dominantBaseline: 'middle' }}>
+                    {n.label.length > 16 ? n.label.slice(0, 15) + '…' : n.label}
+                  </text>
+                </g>
+              );
+            })}
+          </>
+        )}
+      </InteractiveSvgViewport>
       {/* Legend */}
       <div className="flex flex-wrap gap-1.5">
         {Object.entries(EDGE_COLORS).map(([rel, color]) => (

@@ -79,6 +79,15 @@ export function RolePicker({ activeProjectId, value, onChange }: RolePickerProps
 
   if (!activeProjectId) return null;
 
+  // Closed-state copy: "No role" is the persisted-selection placeholder, but it
+  // reads as "no roles available" when the project actually has presets. Show
+  // a count instead so the user knows the picker has options without opening it.
+  const closedLabel = active
+    ? active.name
+    : roles.length > 0
+      ? `Pick role · ${roles.length}`
+      : 'No role';
+
   return (
     <div className="relative inline-block">
       <button
@@ -88,14 +97,20 @@ export function RolePicker({ activeProjectId, value, onChange }: RolePickerProps
           'inline-flex items-center gap-1.5 px-2 py-1 rounded-full text-[11px] border transition-colors',
           active
             ? 'bg-emerald-900/30 border-emerald-800/50 text-emerald-300 hover:bg-emerald-900/40'
-            : 'bg-slate-800/60 border-slate-700/50 text-slate-400 hover:bg-slate-800',
+            : roles.length > 0
+              ? 'bg-blue-900/20 border-blue-800/40 text-blue-300 hover:bg-blue-900/30'
+              : 'bg-slate-800/60 border-slate-700/50 text-slate-400 hover:bg-slate-800',
         )}
-        title={active ? `Role: ${active.name}${activeProfile ? ` · ${activeProfile.name}` : ''}` : 'No role selected'}
+        title={
+          active
+            ? `Role: ${active.name}${activeProfile ? ` · ${activeProfile.name}` : ''}`
+            : roles.length > 0
+              ? `${roles.length} role${roles.length === 1 ? '' : 's'} available — click to pick`
+              : 'No roles in this project'
+        }
       >
         <UserCircle className="w-3 h-3" />
-        <span className="truncate max-w-[140px]">
-          {active ? active.name : 'No role'}
-        </span>
+        <span className="truncate max-w-[140px]">{closedLabel}</span>
         {activeProfile?.config?.model && (
           <span className="text-[9px] font-mono text-emerald-400/70">
             {activeProfile.config.model}

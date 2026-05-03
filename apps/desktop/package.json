@@ -1,0 +1,40 @@
+{
+  "name": "oasis-desktop",
+  "version": "0.1.0",
+  "description": "Oasis Cognition desktop wrapper (Electron)",
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "OASIS_DESKTOP_DEV=1 electron .",
+    "build:web": "cd ../oasis-ui-react && VITE_BASE_PATH=./ npm run build",
+    "copy:web": "rm -rf web && mkdir -p web && cp -R ../oasis-ui-react/dist/. web/",
+    "package:mac": "npm run build:web && npm run copy:web && electron-builder --mac",
+    "package:mac:dir": "npm run build:web && npm run copy:web && electron-builder --mac --dir"
+  },
+  "devDependencies": {
+    "electron": "^33.0.0",
+    "electron-builder": "^25.1.8"
+  },
+  "build": {
+    "appId": "com.oasis-cognition.desktop",
+    "productName": "Oasis Cognition",
+    "directories": {
+      "output": "dist-electron"
+    },
+    "files": [
+      "main.js",
+      "preload.js",
+      "web/**/*"
+    ],
+    "mac": {
+      "category": "public.app-category.developer-tools",
+      "target": [
+        { "target": "dmg", "arch": ["arm64", "x64"] },
+        { "target": "zip", "arch": ["arm64", "x64"] }
+      ],
+      "hardenedRuntime": false,
+      "gatekeeperAssess": false
+    }
+  }
+}

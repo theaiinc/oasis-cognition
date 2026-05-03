@@ -1,13 +1,26 @@
 export interface Message {
   id: string;
   text: string;
-  sender: 'user' | 'assistant' | 'system';
+  sender: 'user' | 'assistant' | 'system' | 'mission';
   confidence?: string;
   timestamp: Date;
   isTranscript?: boolean;
   isQueued?: boolean;
   replyToMessageId?: string;
   replyToPreview?: string;
+  /** When sender === 'mission', the structured payload for the digest card. */
+  missionDigest?: {
+    mission_id: string;
+    goal: string;
+    result?: string;
+    error?: string;
+    run_count: number;
+    finished_at: string;
+    started_at?: string;
+    triggered_by?: 'schedule' | 'manual';
+    /** True while the run is still in flight; the card swaps to the final digest on completion. */
+    running?: boolean;
+  };
 }
 
 export interface TimelineEvent {

@@ -11,6 +11,7 @@ import { DiffViewer } from './DiffViewer';
 import { ActivityStream } from './ActivityStream';
 import { ToolCallsScrollContainer } from './ToolCallsScrollContainer';
 import { ThinkingCard } from '@/components/timeline';
+import { MissionDigestCard } from './MissionDigestCard';
 
 interface ChatMessageProps {
   message: Message;
@@ -40,6 +41,22 @@ export function ChatMessage({
   const thoughtLayers = timelineEvents.filter(e => e.event_type === 'ThoughtLayerGenerated');
   const hasStreamActivity = toolStarts.length > 0 || thoughts.length > 0 || thoughtLayers.length > 0;
   const diffEvent = timelineEvents.find(e => e.event_type === 'ToolCallCompleted' && (e.payload as Record<string, unknown>).diff);
+
+  // Mission digest cards have their own visual lane (full-width, no avatar/bubble) —
+  // render an early return so the rest of the assistant/user/system layout stays simple.
+  if (m.sender === 'mission' && m.missionDigest) {
+    return (
+      <motion.div
+        key={m.id}
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.25 }}
+        className="w-full max-w-[95%] mx-auto"
+      >
+        <MissionDigestCard payload={m.missionDigest} />
+      </motion.div>
+    );
+  }
 
   return (
     <motion.div

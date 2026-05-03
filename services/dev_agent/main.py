@@ -357,6 +357,75 @@ async def cu_file_list_sessions():
 
 # ── Serve CU overlay HTML ──────────────────────────────────────────────────────
 from fastapi.responses import FileResponse
+from fastapi import HTTPException
+import mimetypes
+
+# 10 MiB cap per read — keeps the chat file viewer responsive and avoids OOM on huge logs.
+_MAX_FILE_READ_BYTES = 10 * 1024 * 1024
+
+
+def _resolve_project_file(path: str, worktree_id: str | None) -> str:
+    """Resolve `path` against a worktree (if given) or PROJECT_ROOT, blocking traversal.
+
+    Returns the absolute filesystem path. Raises HTTPException on any safety check fail.
+    """
+    from services.dev_agent.service import _get_worktree_dir, _validate_worktree_name, PROJECT_ROOT as SVC_PROJECT_ROOT  # noqa: PLC0415
+
+    if worktree_id:
+        ok, msg = _validate_worktree_name(worktree_id)
+        if not ok:
+            raise HTTPException(status_code=400, detail=f"Invalid worktree_id: {msg}")
+        base = os.path.join(_get_worktree_dir(), worktree_id)
+        if not os.path.isdir(base):
+            raise HTTPException(status_code=404, detail="Worktree not found")
+    else:
+        base = SVC_PROJECT_ROOT or PROJECT_ROOT
+
+    base_real = os.path.realpath(base)
+    rel = path.lstrip("/")  # treat absolute-looking paths as repo-relative
+    candidate = os.path.realpath(os.path.join(base_real, rel))
+    if candidate != base_real and not candidate.startswith(base_real + os.sep):
+        raise HTTPException(status_code=400, detail="Path is outside the project root")
+    if not os.path.isfile(candidate):
+        raise HTTPException(status_code=404, detail="File not found")
+    return candidate
+
+
+@app.get("/internal/dev-agent/file/read")
+async def project_file_read(path: str, worktree_id: str | None = None):
+    """Return text content of a project file as JSON.
+
+    For binary files (cannot decode UTF-8), returns success=False with mime/size.
+    The caller can then fall back to the binary endpoint via <img>/<iframe>.
+    """
+    resolved = _resolve_project_file(path, worktree_id)
+    size = os.path.getsize(resolved)
+    if size > _MAX_FILE_READ_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large ({size} bytes; max {_MAX_FILE_READ_BYTES})")
+    mime, _ = mimetypes.guess_type(resolved)
+    mime = mime or "application/octet-stream"
+    try:
+        with open(resolved, "rb") as f:
+            raw = f.read()
+        try:
+            content = raw.decode("utf-8")
+            return {"success": True, "content": content, "mime": mime, "size": size, "path": path}
+        except UnicodeDecodeError:
+            return {"success": False, "error": "binary", "mime": mime, "size": size, "path": path}
+    except Exception as e:
+        return {"success": False, "error": str(e)}
+
+
+@app.get("/internal/dev-agent/file/binary")
+async def project_file_binary(path: str, worktree_id: str | None = None):
+    """Stream the raw file. Used by the chat file viewer for images and PDFs."""
+    resolved = _resolve_project_file(path, worktree_id)
+    size = os.path.getsize(resolved)
+    if size > _MAX_FILE_READ_BYTES:
+        raise HTTPException(status_code=413, detail=f"File too large ({size} bytes; max {_MAX_FILE_READ_BYTES})")
+    mime, _ = mimetypes.guess_type(resolved)
+    return FileResponse(resolved, media_type=mime or "application/octet-stream", filename=os.path.basename(resolved))
+
 
 @app.get("/cu-overlay")
 async def serve_cu_overlay():
@@ -1008,20 +1077,35 @@ async def get_project_config():
 
     cfg = result["config"]
 
-    # Merge per-project settings on top (they take priority)
+    # Merge per-project settings on top (they take priority).
+    # `project_name` is included so renaming or switching active project doesn't
+    # leave the UI showing the stale legacy name alongside a fresh path/index.
     active = dev_agent.get_active_project_settings()
     pid = active.get("project_id")
     if pid and active.get("settings"):
         s = active["settings"]
-        for key in ("project_path", "project_type", "git_url", "last_indexed",
+        for key in ("project_path", "project_name", "project_type", "git_url", "last_indexed",
                      "context_summary", "tech_stack", "frameworks"):
             if key in s and s[key] not in (None, "", []):
                 cfg[key] = s[key]
 
-    # Use the resolved active project path as the authoritative project_path
+    # Use the resolved active project path as the authoritative project_path.
+    # If the resolved path's basename disagrees with cfg.project_name (typical
+    # symptom: legacy config was written for a different project before the path
+    # was switched), prefer the basename — that's what the indexer would derive
+    # on a fresh re-index, and matches what the user expects to see in the UI.
     resolved = _resolve_active_project_path()
     if resolved:
         cfg["project_path"] = resolved
+        from pathlib import Path as _P  # noqa: PLC0415
+        derived_name = _P(resolved).name
+        cur_name = cfg.get("project_name") or ""
+        if derived_name and cur_name != derived_name:
+            logger.info(
+                "project_name override: legacy=%r → derived=%r (path=%r)",
+                cur_name, derived_name, resolved,
+            )
+            cfg["project_name"] = derived_name
     return {"success": True, "config": cfg}
 
 

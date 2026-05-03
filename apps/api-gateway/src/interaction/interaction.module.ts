@@ -9,5 +9,6 @@ import { ProjectRolesModule } from '../project-roles/project-roles.module';
   imports: [SessionModule, AgentProfilesModule, ProjectRolesModule],
   controllers: [InteractionController],
   providers: [InteractionService],
+  exports: [InteractionService],
 })
 export class InteractionModule {}

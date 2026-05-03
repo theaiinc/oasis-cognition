@@ -4,7 +4,9 @@ import { v4 as uuidv4 } from 'uuid';
 import { RedisEventService } from '../events/redis-event.service';
 import { LangfuseService } from '../events/langfuse.service';
 import { SessionConfigService } from '../session/session.service';
+import { SessionWorktreeService } from '../session/session-worktree.service';
 import { NATIVE_WORKFLOW_TOOLS, dispatchNativeWorkflowTool } from './native-workflow-tools';
+import { NATIVE_MISSION_TOOLS, dispatchNativeMissionTool } from './native-mission-tools';
 import { AgentProfilesService } from '../agent-profiles/agent-profiles.service';
 import { ProjectRolesService } from '../project-roles/project-roles.service';
 
@@ -1265,13 +1267,16 @@ async function resolveArtifactMentions(
 @Injectable()
 export class InteractionService {
   private readonly logger = new Logger(InteractionService.name);
-  // Track worktree_id per session for auto-routing read_file to read_worktree_file
+  // Hot cache of session→worktree to keep all the legacy synchronous call sites unchanged.
+  // The authoritative store is SessionWorktreeService (Redis-backed); this map is repopulated
+  // on each `_setSessionWorktreeId` and on first lookup that misses (see _refreshSessionWorktree).
   private sessionWorktrees: Map<string, string> = new Map();
 
   constructor(
     private readonly events: RedisEventService,
     private readonly langfuse: LangfuseService,
     private readonly sessionConfig: SessionConfigService,
+    private readonly sessionWorktree: SessionWorktreeService,
     private readonly agentProfiles: AgentProfilesService,
     private readonly projectRoles: ProjectRolesService,
   ) {}
@@ -1324,8 +1329,27 @@ export class InteractionService {
     return this.sessionWorktrees.get(sessionId);
   }
 
+  /**
+   * Persist the binding via SessionWorktreeService AND update the hot cache.
+   * Throws (logged) if the worktree is owned by another session — the caller
+   * should react by creating a new worktree instead of stealing.
+   */
   private _setSessionWorktreeId(sessionId: string, worktreeId: string): void {
     this.sessionWorktrees.set(sessionId, worktreeId);
+    void this.sessionWorktree.claim(sessionId, worktreeId).catch((err) => {
+      // Roll back the in-memory cache so we don't pretend the claim succeeded.
+      const cached = this.sessionWorktrees.get(sessionId);
+      if (cached === worktreeId) this.sessionWorktrees.delete(sessionId);
+      this.logger.warn(`Could not claim worktree ${worktreeId} for session ${sessionId}: ${err?.message || err}`);
+    });
+  }
+
+  /** Hydrate the hot cache for a session from Redis (no-op if already cached). */
+  private async _refreshSessionWorktree(sessionId: string): Promise<string | undefined> {
+    if (this.sessionWorktrees.has(sessionId)) return this.sessionWorktrees.get(sessionId);
+    const wt = await this.sessionWorktree.get(sessionId);
+    if (wt) this.sessionWorktrees.set(sessionId, wt);
+    return wt;
   }
 
   async execute(req: InteractionRequest, isAborted: () => boolean = () => false): Promise<InteractionResponse> {
@@ -1813,18 +1837,26 @@ export class InteractionService {
     const maxIterations = autonomousMode ? 10000 : MAX_TOOL_ITERATIONS;
     const loopStartTime = Date.now();
 
-    // ── Auto-discover existing worktree for this session ─────────────
-    // If the session doesn't have a worktree set (e.g. follow-up message after restart),
-    // query the dev-agent for active worktrees and pick one up automatically.
+    // ── Restore (or auto-claim) the session's worktree ──────────────
+    // First, hydrate from the persistent SessionWorktreeService — this survives
+    // gateway restarts and is the source of truth for "which session owns which worktree".
+    await this._refreshSessionWorktree(sessionId);
+
+    // If still no worktree for this session, look for an UNCLAIMED active worktree on disk.
+    // Critically, we no longer pick "the most recent" blindly — that would let two concurrent
+    // sessions both steal the same worktree. Only worktrees with no current owner are eligible.
     if (!this._getSessionWorktreeId(sessionId)) {
       try {
         const wtRes = await axios.get(`${DEV_AGENT_URL}/internal/dev-agent/worktrees`, { timeout: 5000 });
         const worktrees: Array<{ id: string; branch?: string }> = wtRes.data?.worktrees || [];
-        if (worktrees.length > 0) {
-          // Use the most recent worktree (last in list)
-          const wt = worktrees[worktrees.length - 1];
-          this._setSessionWorktreeId(sessionId, wt.id);
-          this.logger.log(`Auto-discovered existing worktree for session ${sessionId}: ${wt.id}`);
+        for (let i = worktrees.length - 1; i >= 0; i--) {
+          const wt = worktrees[i];
+          const owner = await this.sessionWorktree.ownerOf(wt.id);
+          if (!owner) {
+            this._setSessionWorktreeId(sessionId, wt.id);
+            this.logger.log(`Adopted unclaimed worktree for session ${sessionId}: ${wt.id}`);
+            break;
+          }
         }
       } catch (err: any) {
         this.logger.warn(`Failed to query existing worktrees: ${err.message}`);
@@ -3543,6 +3575,46 @@ export class InteractionService {
             node_type: plan.node_type,
             from_node: plan.from_node,
             to_node: plan.to_node,
+          } as any);
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── Native mission tools (Phase 0 plug-and-play layer) ──────────
+        // mission_create / list / get / update / delete / pause / resume / run.
+        // These let the agent itself spin up recurring background tasks from chat,
+        // which is the whole point of the Mission abstraction.
+        if (NATIVE_MISSION_TOOLS.has(toolName)) {
+          // Auto-resolve mission_id from the most recent successful mission_create
+          // earlier in this run (same trick used for workflow_id above).
+          let resolvedMissionId: string | undefined = (plan as any).mission_id;
+          if (!resolvedMissionId) {
+            for (let i = toolResults.length - 1; i >= 0; i--) {
+              const r = toolResults[i];
+              if (r.tool === 'mission_create' && r.success && typeof r.output === 'string') {
+                const m = r.output.match(/Mission created:\s*([0-9a-f-]{36})/i);
+                if (m) { resolvedMissionId = m[1]; break; }
+              }
+            }
+          }
+          const res = await dispatchNativeMissionTool({
+            tool: toolName,
+            mission_id: resolvedMissionId,
+            goal: (plan as any).goal,
+            prompt: (plan as any).prompt,
+            schedule: (plan as any).schedule,
+            connector_id: (plan as any).connector_id,
+            role_id: (plan as any).role_id,
+            profile_id: (plan as any).profile_id,
+            enabled: (plan as any).enabled,
+          }, sessionId);
+          toolResults.push({
+            tool: toolName,
+            success: res.success,
+            output: res.output,
+            blocked: false,
+            reasoning: plan.reasoning || '',
+            mission_id: resolvedMissionId,
           } as any);
           updateThoughtsOnlyStreak();
           continue;

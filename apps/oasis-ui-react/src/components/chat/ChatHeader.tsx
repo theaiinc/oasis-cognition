@@ -1,6 +1,6 @@
 import {
   Menu, Wifi, WifiOff, Mic, MicOff, ScreenShare, ScreenShareOff,
-  Fingerprint, FolderOpen, Zap,
+  Fingerprint, FolderOpen, Zap, Scale, Sparkles, Loader2,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
@@ -9,6 +9,7 @@ import type { ProjectConfig } from '@/lib/types';
 import { TokenUsageDonut } from './TokenUsageDonut';
 import type { ContextBudget } from '@/lib/types';
 import { MobilePairingStatus } from '../mobile/MobilePairingStatus';
+import oasisLogo from '@/assets/oasis-logo.svg';
 
 interface ChatHeaderProps {
   statusText: string;
@@ -31,6 +32,16 @@ interface ChatHeaderProps {
   onVoiceIdClick: () => void;
   onOpenSettings: () => void;
   activeProjectName?: string;
+  /** Number of project rules currently in scope (Logic engine memory rules). */
+  ruleCount?: number;
+  /** Click handler to open the Logic / Rules tab so the user can audit them. */
+  onOpenRules?: () => void;
+  /** Total count of *enabled* missions (paused/idle). Drives the "watching N" pill. */
+  missionCount?: number;
+  /** Count of missions currently mid-tick — drives the pulse. */
+  runningMissionCount?: number;
+  /** Click handler — typically scrolls to top of chat so the inline ActiveMissionsBar is visible. */
+  onOpenMissions?: () => void;
 }
 
 export function ChatHeader({
@@ -52,6 +63,11 @@ export function ChatHeader({
   onVoiceIdClick,
   onOpenSettings,
   activeProjectName,
+  ruleCount,
+  onOpenRules,
+  missionCount,
+  runningMissionCount,
+  onOpenMissions,
 }: ChatHeaderProps) {
   // Vision button reflects native screen sharing (ComputerUsePanel) OR voice sharing
   const visionActive = cuScreenSharing || isSharing;
@@ -61,7 +77,10 @@ export function ChatHeader({
         <Button variant="ghost" size="icon" className="md:hidden text-slate-400 hover:text-white" onClick={onToggleSidebar} title="Toggle navigation">
           <Menu className="w-5 h-5" />
         </Button>
-        <h1 className="text-xl font-bold tracking-tight">Oasis <span className="text-blue-500">Cognition</span> <span className="text-[10px] text-slate-600 font-mono">v2 ({__BUILD_NUMBER__})</span></h1>
+        <h1 className="flex items-center gap-2">
+          <img src={oasisLogo} alt="Oasis Cognition" className="h-11 w-auto select-none" draggable={false} />
+          <span className="text-[10px] text-slate-600 font-mono">v2 ({__BUILD_NUMBER__})</span>
+        </h1>
         <Badge variant="outline" className={cn(
           "ml-2 flex items-center gap-1.5 border-slate-700 font-medium py-0.5",
           isConnected ? "text-emerald-400 border-emerald-900/50 bg-emerald-950/20" : "text-amber-400 border-amber-900/50 bg-amber-950/20"
@@ -92,6 +111,39 @@ export function ChatHeader({
             </button>
             {contextBudget && contextBudget.input_budget > 0 && (
               <TokenUsageDonut budget={contextBudget} size={32} />
+            )}
+            {typeof ruleCount === 'number' && ruleCount > 0 && (
+              <button
+                type="button"
+                onClick={onOpenRules}
+                className="flex items-center gap-1.5 px-2 py-1 rounded-lg bg-emerald-950/30 border border-emerald-800/40 hover:border-emerald-600 transition-colors"
+                title={`${ruleCount} project rule${ruleCount === 1 ? '' : 's'} active — the agent applies these every turn. Click to inspect.`}
+              >
+                <Scale className="w-3 h-3 text-emerald-400" />
+                <span className="text-[11px] text-emerald-300 font-medium">{ruleCount} rule{ruleCount === 1 ? '' : 's'}</span>
+              </button>
+            )}
+            {typeof missionCount === 'number' && missionCount > 0 && (
+              <button
+                type="button"
+                onClick={onOpenMissions}
+                className={cn(
+                  'flex items-center gap-1.5 px-2 py-1 rounded-lg border transition-colors',
+                  (runningMissionCount ?? 0) > 0
+                    ? 'bg-violet-900/30 border-violet-700/60 text-violet-200 animate-pulse'
+                    : 'bg-violet-950/30 border-violet-800/40 hover:border-violet-600 text-violet-300',
+                )}
+                title={
+                  (runningMissionCount ?? 0) > 0
+                    ? `${missionCount} mission${missionCount === 1 ? '' : 's'} watching — ${runningMissionCount} running right now`
+                    : `Watching ${missionCount} thing${missionCount === 1 ? '' : 's'} for you. Click to see them.`
+                }
+              >
+                {(runningMissionCount ?? 0) > 0
+                  ? <Loader2 className="w-3 h-3 animate-spin" />
+                  : <Sparkles className="w-3 h-3" />}
+                <span className="text-[11px] font-medium">Watching {missionCount}</span>
+              </button>
             )}
           </div>
         )}

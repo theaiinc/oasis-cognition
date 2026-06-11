@@ -76,6 +76,10 @@ export interface ExternalAgentSession {
   created_at: string;
   updated_at: string;
   error?: string;
+  /** When this child was spawned by a coordinator job, the parent job id. */
+  parent_job_id?: string;
+  /** The task id within the parent job that this child fulfils. */
+  task_id?: string;
 }
 
 /** Serialisable shape of what a caller is allowed to set when creating a session. */

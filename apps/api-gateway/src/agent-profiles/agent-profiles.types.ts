@@ -12,7 +12,8 @@ export interface AgentProfileConfig {
   /** For internal profiles: the LLM model. For external CLIs: the value
    *  passed as `--model` on the command line. */
   model?: string;
-  /** For internal profiles only — which LLM provider to use. */
+  /** For internal profiles only — which LLM provider to use.
+   *  'openai' → any OpenAI-compatible API (OpenAI, DeepSeek, LLM API, vLLM, etc.) */
   provider?: 'ollama' | 'openai' | 'anthropic';
   /** External-only. Default `acceptEdits`. */
   permission_mode?: PermissionMode;
@@ -25,6 +26,11 @@ export interface AgentProfileConfig {
   system_prompt_preamble?: string;
   /** Optional passthrough CLI args for external adapters. */
   extra_args?: string[];
+  /** Billing class for cost estimation and approval gating.
+   *  Inferred from provider/model if not set. */
+  billing_class?: 'free_local' | 'paid_api' | 'subscription_external' | 'uncertain';
+  /** Rough resource footprint for capacity planning. */
+  resource_class?: 'light' | 'standard' | 'gpu';
 }
 
 export interface AgentProfile {

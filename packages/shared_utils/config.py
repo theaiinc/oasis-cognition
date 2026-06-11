@@ -51,30 +51,29 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: str = "INFO"
 
-    # LLM provider: "anthropic", "openai", or "ollama"
-    llm_provider: str = "ollama"
-    llm_model: str = "qwen3:8b"
-    llm_max_tokens: int = 40000
+    # LLM provider: "anthropic", "openai" (also works with any OpenAI-compatible
+    # endpoint like DeepSeek / LLM API / vLLM / LM Studio), or "ollama"
+    llm_provider: str = "openai"
+    llm_model: str = "google/gemma-4-26b-a4b-qat"
+    llm_max_tokens: int = 8192
 
     # Anthropic
     anthropic_api_key: str = ""
 
-    # OpenAI (also works with any OpenAI-compatible endpoint)
-    openai_api_key: str = ""
-    openai_base_url: str = ""
+    # OpenAI (also works with any OpenAI-compatible endpoint, including LM Studio)
+    openai_api_key: str = "lm-studio"
+    openai_base_url: str = "http://localhost:1234/v1"
 
-    # Ollama
+    # Ollama (legacy, replaced by LM Studio)
     ollama_host: str = "http://localhost:11434"
 
     # Response model (separate from interpreter model)
-    response_llm_provider: str = "ollama"
-    response_llm_model: str = "qwen3:8b"
+    response_llm_provider: str = "openai"
+    response_llm_model: str = "google/gemma-4-26b-a4b-qat"
 
     # Tool-plan model (separate for prompt-following / JSON reliability)
-    # Used by response_generator to decide the next tool call and generate
-    # the exact JSON params (including edit_file strings).
-    tool_plan_llm_provider: str = "ollama"
-    tool_plan_llm_model: str = "qwen3:8b"
+    tool_plan_llm_provider: str = "openai"
+    tool_plan_llm_model: str = "google/gemma-4-26b-a4b-qat"
 
     # Vision (screen-share / multimodal). OpenAI-compatible APIs: same base_url + key as text.
     # Empty: Ollama falls back to llava:13b in response-generator; OpenAI-compatible uses llm_model.

@@ -12,6 +12,7 @@ import { ActivityStream } from './ActivityStream';
 import { ToolCallsScrollContainer } from './ToolCallsScrollContainer';
 import { ThinkingCard } from '@/components/timeline';
 import { MissionDigestCard } from './MissionDigestCard';
+import { JobApprovalCard } from './JobApprovalCard';
 
 interface ChatMessageProps {
   message: Message;
@@ -54,6 +55,21 @@ export function ChatMessage({
         className="w-full max-w-[95%] mx-auto"
       >
         <MissionDigestCard payload={m.missionDigest} />
+      </motion.div>
+    );
+  }
+
+  // Job approval / subagent report cards render full-width like mission cards.
+  if (m.sender === 'coordinator' && m.jobApproval) {
+    return (
+      <motion.div
+        key={m.id}
+        initial={{ opacity: 0, y: 8 }}
+        animate={{ opacity: 1, y: 0 }}
+        transition={{ duration: 0.25 }}
+        className="w-full max-w-[95%] mx-auto"
+      >
+        <JobApprovalCard payload={m.jobApproval} />
       </motion.div>
     );
   }

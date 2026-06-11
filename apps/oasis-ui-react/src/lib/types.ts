@@ -1,7 +1,7 @@
 export interface Message {
   id: string;
   text: string;
-  sender: 'user' | 'assistant' | 'system' | 'mission';
+  sender: 'user' | 'assistant' | 'system' | 'mission' | 'coordinator';
   confidence?: string;
   timestamp: Date;
   isTranscript?: boolean;
@@ -21,6 +21,8 @@ export interface Message {
     /** True while the run is still in flight; the card swaps to the final digest on completion. */
     running?: boolean;
   };
+  /** When sender === 'coordinator', the structured payload for the job approval card. */
+  jobApproval?: import('@/components/chat/JobApprovalCard').JobApprovalPayload;
 }
 
 export interface TimelineEvent {

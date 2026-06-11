@@ -20,6 +20,8 @@ import { AgentProfilesModule } from './agent-profiles/agent-profiles.module';
 import { ProjectRolesModule } from './project-roles/project-roles.module';
 import { FilesModule } from './files/files.module';
 import { MissionsModule } from './missions/missions.module';
+import { CoordinatorModule } from './coordinator/coordinator.module';
+import { ModelsModule } from './models/models.module';
 
 @Module({
   imports: [
@@ -44,6 +46,8 @@ import { MissionsModule } from './missions/missions.module';
     ProjectRolesModule,
     FilesModule,
     MissionsModule,
+    CoordinatorModule,
+    ModelsModule,
   ],
 })
 export class AppModule {}

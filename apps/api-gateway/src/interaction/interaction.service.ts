@@ -5,10 +5,13 @@ import { RedisEventService } from '../events/redis-event.service';
 import { LangfuseService } from '../events/langfuse.service';
 import { SessionConfigService } from '../session/session.service';
 import { SessionWorktreeService } from '../session/session-worktree.service';
+import { SessionUsageService } from '../session/session-usage.service';
 import { NATIVE_WORKFLOW_TOOLS, dispatchNativeWorkflowTool } from './native-workflow-tools';
 import { NATIVE_MISSION_TOOLS, dispatchNativeMissionTool } from './native-mission-tools';
+import { NATIVE_COORDINATOR_TOOLS, dispatchNativeCoordinatorTool } from './native-coordinator-tools';
 import { AgentProfilesService } from '../agent-profiles/agent-profiles.service';
 import { ProjectRolesService } from '../project-roles/project-roles.service';
+import { lookupVariant } from '../models/model-variants';
 
 export interface InteractionRequest {
   user_message: string;
@@ -59,7 +62,6 @@ const MAX_TOOL_ITERATIONS = parseInt(process.env.MAX_TOOL_ITERATIONS || '50', 10
 const OASIS_DEBUG_TOOL_PLAN_PAYLOAD =
   process.env.OASIS_DEBUG_TOOL_PLAN_PAYLOAD === 'true' || process.env.OASIS_DEBUG_TOOL_PLAN_PAYLOAD === '1';
 const OASIS_DEBUG_TOOL_PLAN_MAX_CHARS = parseInt(process.env.OASIS_DEBUG_TOOL_PLAN_MAX_CHARS || '16000', 10);
-const CONTEXT_WINDOW = parseInt(process.env.OASIS_CONTEXT_WINDOW || '8192', 10);
 const KEEP_RECENT_MESSAGES = 12;
 
 /** Rough token estimate: ~4 chars per token for English. */
@@ -67,9 +69,16 @@ function estimateTokens(text: string): number {
   return Math.ceil((text || '').length / 4);
 }
 
-/** If chat history exceeds 25% of context window (or 8192 tokens), condense older messages.
- *  We keep the threshold moderate because most of the context budget goes to tool results and system prompts. */
-const HISTORY_TOKEN_CAP = Math.min(Math.floor(CONTEXT_WINDOW * 0.25), 8192);
+/**
+ * Resolve the effective context window for a given (provider, model) pair.
+ * Falls back to the OASIS_CONTEXT_WINDOW env var, then 8192.
+ */
+function resolveContextWindow(provider?: string | null, model?: string | null): number {
+  // Only trust the registry if it actually had a match
+  const variant = lookupVariant(provider, model);
+  if (variant) return variant.context_length;
+  return parseInt(process.env.OASIS_CONTEXT_WINDOW || '8192', 10);
+}
 
 /** Interpreter context: always keep `Conversation summary` system rows plus recent turns. Plain `slice(-6)` can drop the summary when the condensed window grows. */
 function buildInterpreterChatHistory(
@@ -84,12 +93,21 @@ function buildInterpreterChatHistory(
   return summaries.length > 0 ? [summaries[summaries.length - 1]!, ...recentRest] : recentRest;
 }
 
+/**
+ * If chat history exceeds 25% of the model-aware context window, condense older
+ * messages into a summary. model/provider are optional — when omitted, falls back
+ * to the FALLBACK_CONTEXT_WINDOW env var.
+ */
 async function condenseChatHistoryIfNeeded(
   messages: Array<{ role: string; content: string }>,
+  provider?: string | null,
+  model?: string | null,
 ): Promise<Array<{ role: string; content: string }>> {
+  const cw = resolveContextWindow(provider, model);
+  const cap = Math.min(Math.floor(cw * 0.25), 8192);
   const fullText = messages.map(m => `${m.role}: ${m.content}`).join('\n');
   const estimatedTokens = estimateTokens(fullText);
-  if (estimatedTokens <= HISTORY_TOKEN_CAP) return messages;
+  if (estimatedTokens <= cap) return messages;
 
   const toSummarize = messages.slice(0, -KEEP_RECENT_MESSAGES);
   const recent = messages.slice(-KEEP_RECENT_MESSAGES);
@@ -1277,6 +1295,7 @@ export class InteractionService {
     private readonly langfuse: LangfuseService,
     private readonly sessionConfig: SessionConfigService,
     private readonly sessionWorktree: SessionWorktreeService,
+    private readonly sessionUsage: SessionUsageService,
     private readonly agentProfiles: AgentProfilesService,
     private readonly projectRoles: ProjectRolesService,
   ) {}
@@ -1357,6 +1376,30 @@ export class InteractionService {
     const interactionId = uuidv4();
     const clientMessageId = req.context?.client_message_id;
 
+    // ── Budget enforcement ──────────────────────────────────────────
+    // Refuse the interaction up-front if the session has already hit its
+    // per-session token / USD cap. Returning a structured response (rather
+    // than throwing) lets the UI render the refusal as a chat message with
+    // a "raise the cap" button instead of a generic error toast.
+    const budgetCheck = await this.sessionUsage.checkBudget(sessionId);
+    if (budgetCheck.over) {
+      this.logger.warn(`Session ${sessionId} blocked by budget cap: ${budgetCheck.reason}`);
+      await this.events.publish('SessionBudgetExceeded', sessionId, {
+        usage: budgetCheck.usage,
+        budget: budgetCheck.budget,
+        pct: budgetCheck.pct,
+        client_message_id: clientMessageId,
+      });
+      return {
+        session_id: sessionId,
+        response: budgetCheck.reason || 'Session budget exceeded.',
+        reasoning_graph: {},
+        confidence: 0,
+        reasoning_trace: ['Refused: session budget cap reached.'],
+        route: 'budget_exceeded',
+      };
+    }
+
     // Resolve role/profile hints and merge into context BEFORE anything else.
     // Every downstream RESPONSE_URL call spreads req.context, so this wires the
     // chosen model + preamble through the entire pipeline in one place.
@@ -1383,8 +1426,10 @@ export class InteractionService {
     const recentMessages = await this.events.getRecentMessages(sessionId, 20);
     // Exclude the current message (last one) — it'll be passed separately
     let chatHistory = recentMessages.slice(0, -1);
-    // Condense if over 50% of context window
-    chatHistory = await condenseChatHistoryIfNeeded(chatHistory);
+    // Condense if over 50% of context window (model-aware)
+    const curModel = ((req.context as Record<string, unknown> | undefined)?.model_override as string | undefined) ?? null;
+    const curProvider = ((req.context as Record<string, unknown> | undefined)?.provider_override as string | undefined) ?? null;
+    chatHistory = await condenseChatHistoryIfNeeded(chatHistory, curProvider, curModel);
     if (chatHistory.length > 0) {
       this.logger.log(`LLM context: ${chatHistory.length} prior chat turn(s) for session ${sessionId}`);
     }
@@ -1482,6 +1527,30 @@ export class InteractionService {
       // Store assistant response in conversation history
       if (result.response) {
         await this.events.pushMessage(sessionId, 'assistant', result.response);
+      }
+
+      // ── Cumulative session usage accounting ──────────────────────────
+      // One accumulation per turn, regardless of route. Try the precise
+      // budget endpoint first; on miss (e.g. casual route, or response-
+      // generator restart), fall back to a length-based estimate. Crude
+      // chars/4 maps to roughly 1 token; conservative enough for caps.
+      try {
+        const model = ((req.context as Record<string, unknown> | undefined)?.model_override as string | undefined) ?? null;
+        const provider = ((req.context as Record<string, unknown> | undefined)?.provider_override as string | undefined) ?? null;
+        let inputTokens = 0;
+        try {
+          const b = await axios.get(`${RESPONSE_URL}/internal/response/context-budget`, { timeout: 1500 });
+          const used = Number(b.data?.input_used);
+          if (Number.isFinite(used) && used > 0) inputTokens = used;
+        } catch { /* fall through to estimate */ }
+        if (inputTokens === 0) {
+          const histChars = chatHistory.reduce((n, m) => n + (m.content?.length || 0), 0);
+          inputTokens = Math.ceil(((req.user_message || '').length + histChars) / 4);
+        }
+        const outputTokens = Math.ceil((result.response || '').length / 4);
+        await this.sessionUsage.addTurn(sessionId, model, provider, inputTokens, outputTokens);
+      } catch (err) {
+        this.logger.warn(`session usage accounting failed: ${err}`);
       }
 
       return result;
@@ -2672,7 +2741,9 @@ export class InteractionService {
         trace,
       );
 
-      // Fetch and publish context budget for UI donut chart
+      // Fetch and publish context budget for UI donut chart. (Cumulative
+      // session usage is accumulated once per turn in execute() below — not
+      // here — so the casual/teaching routes are also counted.)
       try {
         const budgetRes = await axios.get(
           `${RESPONSE_URL}/internal/response/context-budget`,
@@ -3617,6 +3688,43 @@ export class InteractionService {
             mission_id: resolvedMissionId,
           } as any);
           updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── Native coordinator tools (delegate_tasks / status / cancel) ──
+        // These let the agent decompose a complex goal into parallel subtasks
+        // with automatic capacity + cost preflight.
+        if (NATIVE_COORDINATOR_TOOLS.has(toolName)) {
+          try {
+            const res = await dispatchNativeCoordinatorTool({
+              tool: toolName,
+              goal: (plan as any).goal,
+              steps: (plan as any).steps,
+              success_criteria: (plan as any).success_criteria,
+              parallel_groups: (plan as any).parallel_groups,
+              tasks: (plan as any).tasks,
+              parent_session_id: sessionId,
+              auto_approve_free: (plan as any).auto_approve_free !== false,
+              ...(plan as any),
+            }, sessionId);
+            toolResults.push({
+              tool: toolName,
+              success: res.success,
+              output: res.output,
+              blocked: false,
+              reasoning: plan.reasoning || '',
+            } as any);
+            updateThoughtsOnlyStreak();
+          } catch (err: any) {
+            toolResults.push({
+              tool: toolName,
+              success: false,
+              output: `Coordinator tool failed: ${err.message}`,
+              blocked: false,
+              reasoning: plan.reasoning || '',
+            } as any);
+            updateThoughtsOnlyStreak();
+          }
           continue;
         }
 

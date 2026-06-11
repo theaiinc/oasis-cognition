@@ -1381,6 +1381,56 @@ async def set_panic_key(body: dict):
     return {"hotkey": pynput_key, "ui_format": ui_key}
 
 
+# ── Host capacity probe ──────────────────────────────────────────────────────
+# Returns current resource snapshot so the gateway's coordinator can compute
+# max parallel agents. Cached by the gateway for 30s, so heavy syscalls are OK.
+
+import shutil as _shutil
+
+
+@app.get("/internal/dev-agent/host-capacity")
+async def host_capacity():
+    """Return RAM, disk, CPU, and GPU (if available) resource snapshot."""
+    import psutil as _psutil
+
+    mem = _psutil.virtual_memory()
+    disk = _psutil.disk_usage(os.path.expanduser("~/.oasis") if os.path.isdir(os.path.expanduser("~/.oasis")) else "/")
+
+    result = {
+        "ram_total_mb": round(mem.total / 1024 / 1024),
+        "ram_free_mb": round(mem.available / 1024 / 1024),
+        "disk_free_gb": round(disk.free / 1024 / 1024 / 1024, 1),
+        "cpu_cores": _psutil.cpu_count(logical=True) or 1,
+        "gpu_vram_mb": None,
+        "npu_available": False,
+        "fetched_at": _asyncio.get_event_loop().time() if hasattr(_asyncio, "get_event_loop") else _time.time(),
+    }
+
+    # Attempt GPU detection (best-effort — swallow errors)
+    try:
+        import subprocess as _sp
+        r = _sp.run(
+            ["nvidia-smi", "--query-gpu=memory.total", "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if r.returncode == 0 and r.stdout.strip():
+            lines = [l.strip() for l in r.stdout.strip().split("\n") if l.strip().isdigit()]
+            if lines:
+                result["gpu_vram_mb"] = sum(int(l) for l in lines)
+    except Exception:
+        pass  # no nvidia-smi
+
+    # Apple Silicon NPU (ANE) detection
+    try:
+        import platform as _platform
+        if _platform.system() == "Darwin" and _platform.machine() == "arm64":
+            result["npu_available"] = True
+    except Exception:
+        pass
+
+    return result
+
+
 # ── External-agent subprocess runner ─────────────────────────────────────────
 # Generic spawn/tail/cancel endpoints used by the api-gateway external-agents
 # module. Each subprocess is tagged with an Oasis session_id; stdout is written

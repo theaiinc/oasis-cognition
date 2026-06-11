@@ -28,6 +28,7 @@ import {
 import { VirtualizedChatMessages } from '@/components/chat/VirtualizedChatMessages';
 import { ActiveMissionsBar, type MissionRow } from '@/components/chat/ActiveMissionsBar';
 import { EmptyChatHints } from '@/components/chat/EmptyChatHints';
+import type { SessionUsage as BudgetUsage, SessionBudget } from '@/components/chat/SessionBudgetPill';
 import { GraphPanel } from '@/components/graph';
 import { SettingsPanel, HistoryPanel, ArtifactsPanel } from '@/components/panels';
 import { AgentsPanel } from '@/components/agents/AgentsPanel';
@@ -87,6 +88,10 @@ export default function App() {
   // /api/v1/sessions/active every 5s; drives the green pulse on HistoryPanel
   // rows + the sidebar History-icon badge so cross-tab activity is visible.
   const [activeSessionIds, setActiveSessionIds] = useState<Set<string>>(() => new Set());
+  // Per-session token / USD usage + budget cap. Polled alongside the active-session list.
+  const [sessionUsage, setSessionUsage] = useState<BudgetUsage | null>(null);
+  const [sessionBudget, setSessionBudget] = useState<SessionBudget | null>(null);
+  const [sessionBudgetPct, setSessionBudgetPct] = useState<number>(0);
   // Active project role for routing chat → agent profile (model + preamble).
   // Persisted per project by <RolePicker> via localStorage.
   const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
@@ -319,6 +324,32 @@ export default function App() {
     const interval = setInterval(tick, 5000);
     return () => { cancelled = true; clearInterval(interval); };
   }, []);
+
+  // Poll the current session's usage + budget. Cheap (one Redis hash lookup
+  // server-side); kept on a separate interval so changes to the cap don't
+  // wait the full 5s of the active-sessions poll.
+  const reloadBudget = useCallback(async (sid: string) => {
+    if (!sid) return;
+    try {
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/session/usage`, {
+        params: { session_id: sid },
+        timeout: 4000,
+      });
+      const d = res.data || {};
+      setSessionUsage(d.usage || null);
+      setSessionBudget(d.budget || null);
+      setSessionBudgetPct(typeof d.pct === 'number' ? d.pct : 0);
+    } catch {
+      // endpoint optional — fail silent
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!textSessionId) return;
+    void reloadBudget(textSessionId);
+    const interval = setInterval(() => reloadBudget(textSessionId), 6000);
+    return () => clearInterval(interval);
+  }, [textSessionId, reloadBudget]);
 
   const loadSession = useCallback(async (sessionId: string) => {
     try {
@@ -641,6 +672,14 @@ export default function App() {
           void reloadMissions();
           return;
         }
+
+        // Snap the budget pill into sync as soon as a turn completes or the cap
+        // is hit, instead of waiting for the next 6s poll.
+        if (data.event_type === 'ResponseGenerated' || data.event_type === 'SessionBudgetExceeded') {
+          if (data.session_id === textSessionId || (data.payload as Record<string, unknown>)?.session_id === textSessionId) {
+            void reloadBudget(textSessionId);
+          }
+        }
         if (data.event_type === 'MissionRunStarted') {
           const p = data.payload as Record<string, any>;
           const mid = p?.mission_id;
@@ -727,6 +766,61 @@ export default function App() {
               : (p.result ? String(p.result).replace(/\s+/g, ' ').slice(0, 200) : 'Run completed.');
             try { w.oasis.notify({ title, body: bodyText }); } catch { /* notifications not supported */ }
           }
+          return;
+        }
+
+        // ── Coordinator (parallel subagent) events ──────────────────────
+        // These surface as their own chat rows (sender='coordinator') for
+        // preflight approval cards and child report digests.
+        if (data.event_type === 'CoordinatorPreflightReady') {
+          const p = data.payload as Record<string, any>;
+          if (!p?.job_id) return;
+          const rowId = `job-${p.job_id}`;
+          const cardPayload = {
+            job_id: p.job_id,
+            status: 'awaiting_approval' as const,
+            task_count: p.task_count ?? 0,
+            parallel_allowed: p.parallel_allowed ?? 1,
+            degraded_mode: (p.degraded_mode ?? 'full') as 'full' | 'sequential' | 'reduced',
+            degraded_reason: p.degraded_reason,
+            est_usd_low: p.est_usd_low ?? 0,
+            est_usd_high: p.est_usd_high ?? 0,
+            host_ram_mb: p.host_ram_mb ?? 0,
+            child_reports: [],
+          };
+          setMessages(prev => prev.some(m => m.id === rowId) ? prev : [...prev, {
+            id: rowId,
+            text: '',
+            sender: 'coordinator',
+            timestamp: new Date(),
+            jobApproval: cardPayload,
+          }]);
+          return;
+        }
+
+        if (data.event_type === 'SubagentStarted' || data.event_type === 'SubagentReport' || data.event_type === 'JobCompleted') {
+          const p = data.payload as Record<string, any>;
+          const jobId = p?.job_id;
+          if (!jobId) return;
+          const rowId = `job-${jobId}`;
+          setMessages(prev => prev.map(m => {
+            if (m.id !== rowId || !m.jobApproval) return m;
+            const j = { ...m.jobApproval };
+            if (data.event_type === 'SubagentStarted') {
+              j.status = 'running';
+            } else if (data.event_type === 'SubagentReport') {
+              j.child_reports = [...(j.child_reports || []), {
+                task_id: p.task_id,
+                status: p.status,
+                cost_usd: p.cost_usd,
+                final_message: p.final_message,
+              }];
+            } else if (data.event_type === 'JobCompleted') {
+              j.status = p.status === 'completed' ? 'completed' : p.status === 'failed' ? 'failed' : 'cancelled';
+              if (p.error) j.error = p.error;
+            }
+            return { ...m, jobApproval: j };
+          }));
           return;
         }
 
@@ -1232,7 +1326,7 @@ export default function App() {
         // Full-canvas panels replace the chat area entirely.
         (showWorkflowsPanel || showAgentsPanel) && "hidden",
       )}>
-<ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} />
+<ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} sessionUsage={sessionUsage} sessionBudget={sessionBudget} sessionBudgetPct={sessionBudgetPct} onOpenBudget={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} />
 
         <div className="flex-1 overflow-hidden flex flex-col p-6 max-w-5xl mx-auto w-full">
           <ActiveMissionsBar

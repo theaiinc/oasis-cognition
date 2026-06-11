@@ -1,14 +1,118 @@
 ## AGENT_GUIDELINES (devlog + conventions)
 
-This file is a running devlog/compass for Oasis Cognition agent work. Keep it updated with “aha” moments, interface contracts, and any conventions that are easy to forget.
+This file is a running devlog/compass for Oasis Cognition agent work. Keep it updated with "aha" moments, interface contracts, and any conventions that are easy to forget.
+
+### 2026-06-10 — Yggdrasil Agent Pool (combined controller + built-in runner)
+
+- **Core insight**: Yggdrasil IS the agent pool. The orchestration controller starts a built-in Ratatoskr runner in the same process. One container, one port, zero external dependencies.
+- **New file**: `apps/agent-runner/src/yggdrasil-pool.ts` — combined Express app that:
+  - Implements the full orchestration API (`/runners/register`, `/heartbeat`, `/runners/:id/tasks`, etc.)
+  - Self-registers a built-in runner with capabilities `['agent', 'llm', 'shell']`
+  - Polls its own runners Map for tasks assigned to the built-in runner
+  - Executes tasks in-process via a sub-agent think-act-execute loop with shell/file/web tools
+- **Architecture**:
+  ```
+  ┌─────────────┐   HTTP (dispatchTask, admission state)
+  │ api-gateway │◄──────────────────────────────────┐
+  │ (bridge)    │  GET /api/runners, POST /runners/ │
+  └─────────────┘  :id/tasks, PATCH /:id/tasks/:tid │
+       │                                              │
+       └──────────────────────────────────────────────┘
+                             │
+                    ┌────────▼────────────────┐
+                    │     yggdrasil-pool      │
+                    │  ┌──────────────────┐   │
+                    │  │ Orchestration    │   │
+                    │  │ controller       │   │
+                    │  └────────┬─────────┘   │
+                    │           │ self-register│
+                    │  ┌────────▼─────────┐   │
+                    │  │ Built-in         │   │
+                    │  │ Ratatoskr runner │   │
+                    │  │ (LLM sub-agent)  │   │
+                    │  └──────────────────┘   │
+                    └─────────────────────────┘
+  ```
+- **Flow**:
+  1. Gateway calls `YggdrasilBridgeService.dispatchTask()` → `POST /runners/:runnerId/tasks` on Yggdrasil
+  2. Yggdrasil stores the task in its runners Map with status `running`
+  3. The built-in runner's poll loop picks up the new task (if within `MAX_CONCURRENT_TASKS`)
+  4. Executes it in-process via sub-agent loop (LLM + tools)
+  5. Updates task status to `completed`/`failed` directly in the Map
+  6. Gateway's `waitForTask()` polls `GET /runners/:runnerId/tasks` until terminal
+- **Capability Presets** (`apps/agent-runner/src/presets/`): Each capability has a JSON preset describing OS deps, npm deps, env vars, task handler modules, and Dockerfile preparation steps. Built-in presets: `llm`, `web_search`, `shell`, `agent`, `code`. Capabilities ARE presets — `CAPABILITIES=agent` resolves to `agent` + `llm` + `shell` + `web_search` (transitive `dependsOn`). Unknown capability names pass through as raw strings. Presets also generate Dockerfiles via `generateDockerfile(combinePresets(...))`.
+  - `apps/agent-runner/src/presets/schema.ts` — types, combinePresets(), generateDockerfile()
+  - `apps/agent-runner/src/presets/builtins.ts` — 5 built-in presets
+  - When RATATOSKR_PRESETS is set, the runner registers with the union of all resolved preset names as its capabilities.
+- **Additional external runners**: `registry.ts` still works as a standalone Ratatoskr runner for external hosts. They register via `POST /runners/register` to the Yggdrasil controller, and the built-in poll loop in yggdrasil-pool.ts only picks up tasks for `BUILTIN_RUNNER_ID`.
+- **Key files**:
+  - `apps/agent-runner/src/yggdrasil-pool.ts` — combined controller + built-in runner (NEW)
+  - `apps/agent-runner/src/registry.ts` — external Ratatoskr runner (unchanged)
+  - `apps/api-gateway/src/coordinator/yggdrasil-bridge.service.ts` — HTTP client only, no built-in runner
+  - `apps/agent-runner/yggdrasil.Dockerfile` — updated for yggdrasil-pool.ts
+
+### 2026-06-04 — Parallel subagent coordinator (design + first phases)
+
+- **New feature**: Parallel subagent coordinator using `@theaiinc/yggdrasil` embedded in api-gateway for capacity/admission.
+- **Design doc**: `docs/design/parallel-subagent-coordinator.md` — covers admission formula, billing classes, approval policy, Yggdrasil env, and phased rollout.
+- **Phase 0**: Design doc published.
+- **Phase 1a**: Dev-agent `GET /internal/dev-agent/host-capacity` endpoint returns RAM, disk, CPU, GPU (nvidia-smi), NPU (Apple Silicon) snapshot. Added `psutil>=6.0.0` to dev-agent requirements.
+- **Phase 1b**: New `apps/api-gateway/src/coordinator/` module with `CoordinatorTypes` (CoordinatorJob, JobBudget, BillingClass, WorkerBackend), `HostCapacityService`, `JobUsageService`, `JobBudgetService`.
+- **Key contracts**:
+  - Admission formula (design doc): `parallel_allowed = min(plan.parallel_count, ygg.available_slots, floor(ram_free / ram_per_child), floor(disk_free / disk_per_child), gpu_slots, floor(budget_remaining / est_per_child))`
+  - Billing classes: `free_local`, `paid_api`, `subscription_external`, `uncertain`
+  - Approval policy: auto-approve only when `billing_class === free_local AND auto_approve_free_jobs === true`
+  - Yggdrasil embedded library (not separate compose service) in v1
+- **Phase 1b-c**: Extended `AgentProfileConfig` with `billing_class`/`resource_class`. Created `JobUsageService`, `JobBudgetService`, `HostCliBackend`. Extended `ExternalAgentSession` with `parent_job_id`/`task_id`.
+- **Phase 1d**: Added job auto-approve toggles (`auto_approve_free_jobs`, `auto_approve_paid_jobs`) and default USD cap to SettingsPanel (Budget tab).
+- **Phase 2**: Added `@theaiinc/yggdrasil@0.0.1` dependency. Created `YggdrasilBridgeService` wrapping AgentManager + LoadBalancer + OrchestrationConfig. `HostCliBackend` implements `WorkerBackend` interface (HostCliBackend first).
+- **Phase 3a-b**: `CoordinatorPreflightService` — admission formula, cost estimation via `pricing.ts`, approval decision. Planner contract extended via native coordinator tools (`delegate_tasks` accepts `parallel_groups` + `tasks`).
+- **Phase 3c**: `JobApprovalCard` (UI) — editable budget, approve/reject actions. REST endpoints: `POST /api/v1/coordinator/jobs`, `GET /:id`, `POST /:id/approve`, `POST /:id/cancel`, `GET /host-capacity`. `JobBudgetPill` component for header display.
+- **Phase 4**: `CoordinatorService` — `createJob` → preflight → persisting to Redis; `approveJob` → dispatch; `cancelJob` → kill children. Publish events: `CoordinatorPreflightReady`, `SubagentStarted`, `SubagentReport`, `JobCompleted`. `NATIVE_COORDINATOR_TOOLS` wired into interaction service tool loop (`delegate_tasks`, `delegate_job_status`, `delegate_job_cancel`).
+- **Key files**:
+  - `apps/api-gateway/src/coordinator/coordinator.module.ts` (registered in AppModule)
+  - `apps/api-gateway/src/interaction/native-coordinator-tools.ts`
+  - `apps/oasis-ui-react/src/components/chat/JobApprovalCard.tsx`
+  - `apps/oasis-ui-react/src/components/chat/JobBudgetPill.tsx`
+  - `apps/oasis-ui-react/src/components/panels/SettingsPanel.tsx` (auto-approve toggles)
+  - `apps/oasis-ui-react/src/App.tsx` (coordinator event handlers)
+  - `services/dev_agent/main.py` (host-capacity endpoint)
+
+### 2026-06-04 — Phase 5: Docker agent pool + workflow parallelism
+
+- **ContainerBackend**: New `WorkerBackend` implementation (`container-backend.ts`) that spawns each subagent in an ephemeral Docker container via dockerode. Uses dynamic import with stub fallback when Docker is unavailable. Supports `spawn`, `checkStatus`, `kill`, `estimateCost`. Configurable via env vars: `AGENT_POOL_IMAGE`, `AGENT_RAM_MB`, `AGENT_CPU_SHARES`, `DOCKER_SOCKET`, `COMPOSE_NETWORK`, `AGENT_CONTAINER_STARTUP_TIMEOUT_MS`.
+- **Compose profile**: `docker-compose.agent-pool.yml` — activates with `docker compose -f docker-compose.yml -f docker-compose.agent-pool.yml up -d`. Adds `agent-registry` (lightweight HTTP service that registers N Yggdrasil worker slots and spawns containers on demand) and `agent-runner` (build-only image anchor).
+- **Agent runner app**: `apps/agent-runner/` — Node/TS project with:
+  - `src/registry.ts` — Express server (port 8025) exposing `/health`, `/slots/register`, `/worker/:id/spawn`, `/worker/:id/kill`, `/containers`. Self-registers with gateway on startup.
+  - `src/runner.ts` — Container entrypoint that reads `OASIS_AGENT_GOAL`, executes the task, reports back via `POST /coordinator/jobs/:id/child-started` and `POST /coordinator/jobs/:id/child-report`.
+  - `Dockerfile` — Node 20 Alpine + Docker CLI.
+- **Dynamic backend switching**: `CoordinatorModule` exposes `WORKER_BACKEND` injection token. When `AGENT_POOL_ENABLED=true`, `ContainerBackend` is used; otherwise falls back to `HostCliBackend`. `CoordinatorService` injects `@Inject(WORKER_BACKEND)` for polymorphic dispatch.
+- **Gateway internal endpoints**: `POST /coordinator/jobs/:id/child-started` (called by container runner on launch), `POST /coordinator/jobs/:id/child-report` (called on completion), `POST /coordinator/internal/worker` (register one slot), `POST /coordinator/internal/worker/slots` (register N slots).
+- **Workflow engine parallel execution**: Rewrote `engine.ts` from sequential topo sort to round-based parallel execution. Each round discovers all ready nodes (dependencies satisfied), dispatches them via `Promise.allSettled`, re-evaluates the DAG after each round, and propagates `skipped` status downstream. Supports `maxConcurrency` option to cap parallelism. Compatible with existing callers (`workflows.service.ts` uses same `executeRun` signature).
+- **Key files**:
+  - `apps/api-gateway/src/coordinator/container-backend.ts`
+  - `apps/api-gateway/src/coordinator/coordinator.module.ts` (WORKER_BACKEND token)
+  - `docker-compose.agent-pool.yml`
+  - `apps/agent-runner/` (package.json, tsconfig.json, Dockerfile, src/registry.ts, src/runner.ts, .dockerignore)
+  - `apps/api-gateway/src/coordinator/coordinator.controller.ts` (internal endpoints)
+  - `apps/api-gateway/src/workflows/engine.ts` (parallel round-based execution)
+
+### 2026-06-04 — DeepSeek model support / provider-aware pricing
+
+- **Refactored pricing** (`pricing.ts`) to use composite `<provider>:<model>` keys. `pricingFor(model, provider)` and `estimateUsd(..., provider)` now accept an optional `provider` parameter. Resolution order: composite exact → composite prefix → bare exact → bare prefix → null.
+- **Added provider-aware pricing rows**: `deepseek:deepseek-v4-flash`, `llmapi:deepseek-v4-flash`, `anthropic:claude-sonnet-4-7`, `openai:gpt-4o`, `ollama:qwen3`, etc. Bare model names kept as fallbacks for backward compat.
+- **Added `last_provider`** to `SessionUsage` and `JobUsage` types, tracked alongside `last_model` and threaded through `recomputeUsd` so session costing uses the correct (provider, model) pricing.
+- **Threaded provider** from `interaction.service.ts` (reads `req.context.provider_override`, set by role resolution from `AgentProfileConfig.provider`) → `sessionUsage.addTurn(sessionId, model, provider, ...)`.
+- **Usage**: set `OASIS_OPENAI_BASE_URL=https://api.deepseek.com/v1` (or `https://api.llmapi.ai/v1`), `OASIS_OPENAI_API_KEY=sk-...`, and the model name `deepseek-v4-flash`. Pricing resolves to `deepseek:deepseek-v4-flash`. For LLM API markups, the key `llmapi:deepseek-v4-flash` is available via OASIS_MODEL_PRICING_JSON override.
+- **PricingService** (`pricing.service.ts`) replaces direct `pricing.ts` calls. It merges built-in defaults → `OASIS_MODEL_PRICING_JSON` env override → optional remote pricing API (`OASIS_PRICING_API_URL`) with periodic refresh (default 1h). `SessionUsageService` and `JobUsageService` inject it via DI. REST endpoint at `GET /api/v1/pricing` for inspection and `POST /api/v1/pricing/refresh` for manual re-fetch. `pricing.ts` retains only the type interfaces (`ModelPricing`, `UsdEstimate`).
 
 ### 2026-04-08 — Chrome Bridge extension for computer-use
 
-- **Problem**: CU page text extraction relied on AppleScript JS injection into Chrome, which requires the hidden “Allow JavaScript from Apple Events” setting. Without it, `get_page_text` returned empty and CU fell back to macOS OCR (garbled, unreliable).
-- **Solution**: Manifest V3 Chrome extension (`extensions/oasis-chrome-bridge/`) connects to dev-agent via WebSocket (`ws://localhost:8008/ws/chrome-bridge`). Content script extracts DOM text, meta tags (e.g. GitHub `user-login`), element bounds. Background service worker routes commands. Falls back to AppleScript when extension isn’t connected.
+- **Problem**: CU page text extraction relied on AppleScript JS injection into Chrome, which requires the hidden "Allow JavaScript from Apple Events" setting. Without it, `get_page_text` returned empty and CU fell back to macOS OCR (garbled, unreliable).
+- **Solution**: Manifest V3 Chrome extension (`extensions/oasis-chrome-bridge/`) connects to dev-agent via WebSocket (`ws://localhost:8008/ws/chrome-bridge`). Content script extracts DOM text, meta tags (e.g. GitHub `user-login`), element bounds. Background service worker routes commands. Falls back to AppleScript when extension isn't connected.
 - **Key files**: `services/dev_agent/chrome_bridge.py` (WS bridge singleton), `services/dev_agent/main.py` (`/ws/chrome-bridge` endpoint), `services/dev_agent/computer_use.py` (extension-first routing for `get_page_text`, `chrome_navigate`, `chrome_set_url`).
-- **Install**: Chrome → `chrome://extensions` → Developer mode → Load unpacked → `extensions/oasis-chrome-bridge`. Green “ON” badge = connected.
-- **UI**: Computer Use panel shows “Chrome Bridge connected” (green) or install instructions (amber warning).
+- **Install**: Chrome → `chrome://extensions` → Developer mode → Load unpacked → `extensions/oasis-chrome-bridge`. Green "ON" badge = connected.
+- **UI**: Computer Use panel shows "Chrome Bridge connected" (green) or install instructions (amber warning).
 
 ### 2026-04-08 — CU discovery token resolution
 
@@ -18,7 +122,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 ### 2026-04-08 — CU 2FA / verification detection
 
 - **Problem**: When sites redirect through 2FA (e.g. Facebook `two_step_verification`), the agent captured the transient auth URL and panicked into a revision loop.
-- **Fix**: (1) `read_screen` retries up to 3 times with 3s waits when it detects transient auth/redirect URLs (2FA, checkpoint, OAuth, SSO). (2) After any step completes, if the output matches verification patterns, the session **pauses** with a user-facing message (“Please complete verification in the browser, then resume”). User handles 2FA, clicks Resume, agent continues.
+- **Fix**: (1) `read_screen` retries up to 3 times with 3s waits when it detects transient auth/redirect URLs (2FA, checkpoint, OAuth, SSO). (2) After any step completes, if the output matches verification patterns, the session **pauses** with a user-facing message ("Please complete verification in the browser, then resume"). User handles 2FA, clicks Resume, agent continues.
 
 ### 2026-04-08 — Global emergency stop hotkey
 
@@ -45,28 +149,28 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - `services/response_generator/service.py` creates a separate `LLMClient` for CU calls when `OASIS_COMPUTER_USE_LLM_MODEL` and `OASIS_COMPUTER_USE_LLM_BASE_URL` are set. Allows using a fast remote vision model (e.g. `qwen3-vl-flash` via llmapi.ai) for CU while keeping other LLM calls on the default provider.
 - `.env` vars: `OASIS_COMPUTER_USE_LLM_MODEL`, `OASIS_COMPUTER_USE_LLM_BASE_URL`. Docker-compose passes them to response-generator.
 
-### 2026-03-29 — Teaching-service Docker image goes stale (fixes “don’t apply”)
+### 2026-03-29 — Teaching-service Docker image goes stale (fixes "don't apply")
 
 - **Symptom**: Repo `services/teaching-service/service.py` is updated but behavior in Compose is unchanged; `docker logs` still show old validation patterns.
-- **Cause**: `docker-compose.yml` **does not mount** the service source into `teaching-service` — code is **baked at build time**. `docker compose ps` can show the container “Up 3 days” while `api-gateway` was recreated recently; only rebuilt images pick up Python changes.
+- **Cause**: `docker-compose.yml` **does not mount** the service source into `teaching-service` — code is **baked at build time**. `docker compose ps` can show the container "Up 3 days" while `api-gateway` was recreated recently; only rebuilt images pick up Python changes.
 - **Fix**: After editing teaching-service: `docker compose build teaching-service && docker compose up -d teaching-service` (or `docker compose up -d --build teaching-service`).
 
 ### 2026-03-29 — Teaching follow-ups ignored by validator (repeat clarifying questions)
 
-- **Symptom**: After the user answered “I meant X not Y,” the teaching flow kept asking the same clarification (e.g. “never use mocks” read as universal testing advice vs scoped to product implementation).
+- **Symptom**: After the user answered "I meant X not Y," the teaching flow kept asking the same clarification (e.g. "never use mocks" read as universal testing advice vs scoped to product implementation).
 - **Cause (1)**: `continue_from_clarification()` merged the reply into `TeachingAssertion.supporting_context`, but `validate()` originally omitted it from the LLM prompt.
-- **Cause (2)**: Follow-up still re-ran **the same extracted assertion and search query**, so web hits stayed on “mocks in unit tests.” `/internal/teaching/continue` also returned the **stale** assertion object, not a refined one.
-- **Cause (3)**: API gateway only wrote `teaching/pending` when `clarifying_questions.length > 0`. If the model cleared questions but left `contradictions` / low confidence, **pending was deleted** while the assistant still refused to store — the user’s next message no longer hit `handleTeachingFollowup`.
+- **Cause (2)**: Follow-up still re-ran **the same extracted assertion and search query**, so web hits stayed on "mocks in unit tests." `/internal/teaching/continue` also returned the **stale** assertion object, not a refined one.
+- **Cause (3)**: API gateway only wrote `teaching/pending` when `clarifying_questions.length > 0`. If the model cleared questions but left `contradictions` / low confidence, **pending was deleted** while the assistant still refused to store — the user's next message no longer hit `handleTeachingFollowup`.
 - **Fix**: `continue_from_clarification` re-**extracts** assertion + `search_query` from original + clarification; optional `_accept_after_scope_clarification` when the user clearly separates tests vs implementation; validator prompt heuristics for scoped claims and `preference`; gateway persists pending whenever **not** `readyToStore` (`validated`, `confidence ≥ 0.6`, **zero contradictions**).
 
 ### 2026-03-29 — Interpreter history + second-person replies
 
-- **Problem**: Vague follow-ups (“pls fix”) were easy to mis-route or answer without thread context; `chat_history.slice(-6)` could drop the gateway’s `Conversation summary:` system row when the condensed window had more than six messages. Models also mirrored “User asked …” / “the user” in user-visible text.
-- **Fix**: `buildInterpreterChatHistory()` in `interaction.service.ts` keeps the latest summary system message plus up to six other turns. Interpreter uses `_merge_interpreter_chat_history()` with the same rule and an explicit prompt line about summaries. Response-generator `SYSTEM_PROMPT`, `CASUAL_SYSTEM_PROMPT`, and complex `format_response` / stream labels use **Message:** + instructions to reply in **second person** (“you”) and to use the thread for vague messages.
+- **Problem**: Vague follow-ups ("pls fix") were easy to mis-route or answer without thread context; `chat_history.slice(-6)` could drop the gateway's `Conversation summary:` system row when the condensed window had more than six messages. Models also mirrored "User asked …" / "the user" in user-visible text.
+- **Fix**: `buildInterpreterChatHistory()` in `interaction.service.ts` keeps the latest summary system message plus up to six other turns. Interpreter uses `_merge_interpreter_chat_history()` with the same rule and an explicit prompt line about summaries. Response-generator `SYSTEM_PROMPT`, `CASUAL_SYSTEM_PROMPT`, and complex `format_response` / stream labels use **Message:** + instructions to reply in **second person** ("you") and to use the thread for vague messages.
 
 ### 2026-03-22 — README + docs hub (architecture / guides)
 
-- **Root README** now summarizes architecture (Mermaid), ports, quick start (`make up`, Ollama, dev-agent, optional code-indexer), API entry `POST /api/v1/interaction`, and “what stands out.”
+- **Root README** now summarizes architecture (Mermaid), ports, quick start (`make up`, Ollama, dev-agent, optional code-indexer), API entry `POST /api/v1/interaction`, and "what stands out."
 - **`docs/README.md`** indexes curated docs; **`docs/architecture/overview.md`** = operational architecture + port table; **`docs/guides/getting-started.md`** = setup; **`docs/guides/what-makes-oasis-different.md`** = product/technical differentiators. Cross-links to **SAD.md** and **code-indexing-service-design.md**. **Makefile** primary targets are `make up` / `make down` (not `dev-up`).
 
 ### 2026-03-22 — Code knowledge graph (Tree-sitter + Neo4j)
@@ -89,19 +193,19 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Forgiving paths**: dev-agent **write_file**, **edit_file**, **read_worktree_file** normalize repo-relative paths (strip `/workspace/`, `./`, leading `/`, trailing lone `.`).
 - **Aliases**: `patch`, `unified_diff` → **apply_patch** (no longer folded into **edit_file**). Planner prompt prefers **apply_patch** over **edit_file** for non-trivial edits.
 
-### 2026-03-21 — edit_file / write_file “fails on last iteration” (empty string dropped)
+### 2026-03-21 — edit_file / write_file "fails on last iteration" (empty string dropped)
 
-- **Symptom**: Final cleanup edits (e.g. removing a line) failed with missing params or dev-agent “Missing … new_string”.
+- **Symptom**: Final cleanup edits (e.g. removing a line) failed with missing params or dev-agent "Missing … new_string".
 - **Cause**: Gateway used `plan.new_string || undefined` (same for `content` / `old_string`). Falsy **`""`** was omitted from the JSON body → FastAPI saw `new_string=None`. Response-generator used `not plan.get("new_string")`, so **`""`** was treated as missing.
 - **Fix**: Gateway `??` for `content` / `old_string` / `new_string`. Response-generator: require `new_string` with **`is None`** only; `write_file` content same. Dev-agent `edit_file`: normalize CRLF/LF on `old_string` / `new_string` before matching.
 
 ### 2026-03-21 — Plan + free-thought churn during exploration
 
 - **Symptom**: Upfront plan and free-thought layer revised almost every tool hop even when exploration was healthy.
-- **Causes**: (1) Logic engine set `revise_plan` after **2** read-only actions on implementation-shaped goals (`only_read_tools && total_actions >= 2`), and again at **6** without code changes — observer replan fired often. (2) Gateway treated **any** non-empty `observer_feedback` as a reason to rerun **thought/generate**, **generateStreamingThoughts**, and **decision**; routine feedback always includes long “goal not met” + step-progress text.
+- **Causes**: (1) Logic engine set `revise_plan` after **2** read-only actions on implementation-shaped goals (`only_read_tools && total_actions >= 2`), and again at **6** without code changes — observer replan fired often. (2) Gateway treated **any** non-empty `observer_feedback` as a reason to rerun **thought/generate**, **generateStreamingThoughts**, and **decision**; routine feedback always includes long "goal not met" + step-progress text.
 - **Fix**: Logic engine — single threshold **`total_actions >= 12`** with **`not has_code_changes`** (plus `advisory_blocked`). Gateway — `feedbackWarrantsReasoningRefresh()` gates mid-loop refresh; thought graph nodes only when `iteration === 0` or that gate is true.
 
-### 2026-03-21 — “edit_file failed” from duplicate detection (path-only signature)
+### 2026-03-21 — "edit_file failed" from duplicate detection (path-only signature)
 
 - **Symptom**: Logs showed `Duplicate tool call detected: edit_file …path… — injecting redirect` on the **second and later** edits to the **same file** in one session.
 - **Cause**: Duplicate-call detection compared `tool + path + command + …` but **not** `old_string` / `new_string`, so every new patch to `CodeBlock.tsx` matched the first `edit_file` and was blocked with `success: false` before dev-agent ran.
@@ -118,9 +222,9 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Symptom**: Thought layer pinned at the bottom of the activity stream; duplicate `ThoughtLayerGenerated` events rescrolled even when text unchanged; tall prose hid tool cards above.
 - **Fix** (`apps/oasis-ui-react`): `computeThoughtStreamRevision()` (`lib/thoughtStreamRevision.ts`) bumps only on chunk growth or **last** layer body length/hash — not raw layer event count. `ToolCallsScrollContainer` thought `useLayoutEffect` respects **`userScrolledUp`**. `ActivityStream` thought-layer + long validated quotes use **~3-line** `max-h-[3.4rem]` with **Show full / Show less** (`LayerExpandToggle`).
 
-### 2026-03-21 — Plan checkboxes vs “Install library” steps
+### 2026-03-21 — Plan checkboxes vs "Install library" steps
 
-- **Symptom**: Step “Install the chosen syntax highlighting library” showed checked even though no `npm`/`pip`/`edit_file` on `package.json` ran.
+- **Symptom**: Step "Install the chosen syntax highlighting library" showed checked even though no `npm`/`pip`/`edit_file` on `package.json` ran.
 - **UI cause**: `PlanCard` treated step *i* as done when `successfulCount > i` (any N successful tools), so three `grep`/`read_file` calls checked off the first three plan lines regardless of meaning.
 - **Fix (UI)**: Prefer `step_statuses` from the latest `TaskGraphUpdated` → `task_graph` → last `CompletionNode.attributes.step_statuses`. Else match `ToolCallCompleted` rows by **`step_index === i`**. Legacy `successfulCount` fallback only if completions lack `step_index`.
 - **Fix (logic engine)**: `_INSTALL_STEP_RE` + require **`bash` / `edit_file` / `write_file`** for install/dependency/package.json wording; if the plan wrongly assigns `read_file` to such a step, **do not** treat read-only tools as satisfying it.
@@ -131,7 +235,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Cause**: `updateExplorationStateFromToolResult` treated every **expanding** `read_file` as success that **reset** `explorationState.stagnation` to 0, so `buildExplorationEscalationGuidance` almost never hit `[IMPLEMENTATION: STOP EXPLORING]`.
 - **Fix** (`apps/api-gateway/src/interaction/interaction.service.ts`): For `toolUseNeedsImplementationEscalation` (intent `fix` / `implement`), expanding results from `read_file`, `grep`, `list_dir`, `find_files`, `browse_url` **increment** stagnation instead of resetting. **Autonomous** extras: observer line after **5+** successful explore-only tools; **override plan** to `create_worktree` after **12+** if the model still chose an exploration tool.
 
-- **Follow-up (“same” behavior)**: (1) Interpreter often labels autonomous goals **`explore`**, not `fix`/`implement`, so escalation never ran. **Autonomous** now escalates unless intent is `greet` or `teach`. (2) `hasSuccessfulImplementationProgress` became true after **`create_worktree`**, so autonomous nudges and `buildExplorationEscalationGuidance` stopped — the model could read forever **after** a worktree. Escalation and stagnation now treat **success** as **`edit_file` / `write_file`**; separate nudge **`[AUTONOMOUS — EDIT NOW]`** after **2+** read-only tools following the last successful worktree. Thresholds: nudge from **3** explores, force worktree from **7**.
+- **Follow-up ("same" behavior)**: (1) Interpreter often labels autonomous goals **`explore`**, not `fix`/`implement`, so escalation never ran. **Autonomous** now escalates unless intent is `greet` or `teach`. (2) `hasSuccessfulImplementationProgress` became true after **`create_worktree`**, so autonomous nudges and `buildExplorationEscalationGuidance` stopped — the model could read forever **after** a worktree. Escalation and stagnation now treat **success** as **`edit_file` / `write_file`**; separate nudge **`[AUTONOMOUS — EDIT NOW]`** after **2+** read-only tools following the last successful worktree. Thresholds: nudge from **3** explores, force worktree from **7**.
 
 ### 2026-03-21 — Thought layer UI: pin streaming card + collapsed validated thought
 
@@ -173,15 +277,15 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-17 — Aha: hallucinated vision without screen_image
 
-- **Symptom**: In some chats, the model confidently described “the image you provided” (e.g., a Discord screen) even though the user had not shared any image or enabled screen sharing.
-- **Likely cause**: The casual system prompt advertised “you can see the user's screen when they enable screen sharing (Vision button)” but did not explicitly forbid visual descriptions when no `screen_image` was attached, so the model generalized and hallucinated screenshots based on text alone.
+- **Symptom**: In some chats, the model confidently described "the image you provided" (e.g., a Discord screen) even though the user had not shared any image or enabled screen sharing.
+- **Likely cause**: The casual system prompt advertised "you can see the user's screen when they enable screen sharing (Vision button)" but did not explicitly forbid visual descriptions when no `screen_image` was attached, so the model generalized and hallucinated screenshots based on text alone.
 - **Fix**: Tightened `CASUAL_SYSTEM_PROMPT` in `services/response-generator/service.py` to:
   - Make visual access conditional on an explicit `screen_image` attachment.
   - Instruct the model to say clearly that it **cannot** see the screen when no image is present and only then suggest using the Vision button.
   - Explicitly forbid inventing or describing images / UIs unless an actual image is attached.
 - **Contract**: Any future prompts that mention vision/screen-reading must:
-  - Tie visual abilities to concrete context fields (e.g. `screen_image`, `screen_content`) rather than generic “you can see the screen” statements.
-  - Include a negative rule: when no such field is present, the model must treat the situation as **no vision available** and avoid “the image you provided…” style hallucinations.
+  - Tie visual abilities to concrete context fields (e.g. `screen_image`, `screen_content`) rather than generic "you can see the screen" statements.
+  - Include a negative rule: when no such field is present, the model must treat the situation as **no vision available** and avoid "the image you provided…" style hallucinations.
 
 ### 2026-03-18 — Aha: teaching validation clarifying_questions schema
 
@@ -412,7 +516,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - Removed duplicated `services/dev-agent` (kept `services/dev_agent`).
 - Option A: removed `services/teaching_service` (kept `services/teaching-service`).
 
-### 2026-03-20 — “Stopped after plan” / RulesSnapshot: abort false positives
+### 2026-03-20 — "Stopped after plan" / RulesSnapshot: abort false positives
 
 - **Symptom**: Pipeline died at the **first tool-loop iteration** right after **ToolPlanReady** or **RulesSnapshotCreated** while the user did not stop.
 - **Causes tried**:
@@ -422,20 +526,20 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-20 — Long POST keepalive (NDJSON stream)
 
-- **Problem**: Single JSON response meant **no bytes on the wire** during long LLM/tool gaps → proxies or stacks closed the TCP leg; gateway logged “connection closed before response”.
+- **Problem**: Single JSON response meant **no bytes on the wire** during long LLM/tool gaps → proxies or stacks closed the TCP leg; gateway logged "connection closed before response".
 - **Fix**: `POST /api/v1/interaction` returns **`Content-Type: application/x-ndjson`**: immediate line + `OASIS_INTERACTION_KEEPALIVE_MS` (default 12s) lines `{"_oasis_keepalive":true}`, then final line is the usual `InteractionResponse` JSON. Errors: `{"_oasis_error":true,"status", "body"}`.
-- **Clients updated**: `oasis-ui-react` (`postInteractionNdjson`), `openai-adapter`, `voice_agent`, `web-client` + `voice_agent/client` HTML, `scripts/test-interaction.sh`. Abort detection (default): `socket.destroyed` only; see **“Stopped after plan”** note for `OASIS_STRICT_STREAM_CLOSE_ABORT`.
+- **Clients updated**: `oasis-ui-react` (`postInteractionNdjson`), `openai-adapter`, `voice_agent`, `web-client` + `voice_agent/client` HTML, `scripts/test-interaction.sh`. Abort detection (default): `socket.destroyed` only; see **"Stopped after plan"** note for `OASIS_STRICT_STREAM_CLOSE_ABORT`.
 
 ### 2026-03-20 — False "Client aborted" on long tool_use POSTs
 
 - **Symptom**: Pipeline logs `Client aborted request` / `Pipeline stopped by client` even though the user did not click Stop.
 - **Causes**: (1) **Bug**: `isAborted` treated `!req.socket` as abort — can false-positive; removed. (2) **Real closes**: `req.socket.destroyed` after **proxy/load balancer idle timeout** while the server is busy between tool iterations (no bytes on the client↔proxy TCP leg during long LLM gaps).
 - **Fix**: `interaction.controller.ts` — subscribe to `req.on('close')` only when `!res.headersSent`, and abort only on that + `req.destroyed` + `socket.destroyed` when `socket` is present. Clearer WARN in `interaction.service.ts` listing causes.
-- **If idle timeout persists**: Raise proxy `read_timeout` / `send_timeout` (or equivalent), or move long runs to chunked/streaming responses / SSE so the connection isn’t silent for minutes.
+- **If idle timeout persists**: Raise proxy `read_timeout` / `send_timeout` (or equivalent), or move long runs to chunked/streaming responses / SSE so the connection isn't silent for minutes.
 
 ### 2026-03-20 — Compass: self-teaching for better tool use (beyond prompt text)
 
-- **Reality check**: In-loop “the model teaches itself” only sticks if **something durable** changes: injected context (rules, playbooks, walls), structured tool feedback, or offline weight updates (SFT/LoRA). Prompts alone plateau.
+- **Reality check**: In-loop "the model teaches itself" only sticks if **something durable** changes: injected context (rules, playbooks, walls), structured tool feedback, or offline weight updates (SFT/LoRA). Prompts alone plateau.
 - **Already in repo**: `teach_rule` / rules in Neo4j (`memory_service.store_rule`, fingerprint dedupe), `walls_hit`, multi-agent tool_use (Planner / Executor / Observer), logic-engine pressure for implementation tasks.
 - **High-ROI next steps** (when prioritizing):
   1. **Structured tool outcomes** — Stable `error_class` + machine-generated recovery hints in every tool result (clearer gradient than free-form stderr).
@@ -450,11 +554,11 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-20 — UI: suppress horizontal swipe → browser back/forward
 
-- **Change**: `apps/oasis-ui-react/src/index.css` — `overscroll-behavior-x: none` on `html` and `body` so macOS trackpad (and similar) horizontal overscroll doesn’t trigger history navigation.
+- **Change**: `apps/oasis-ui-react/src/index.css` — `overscroll-behavior-x: none` on `html` and `body` so macOS trackpad (and similar) horizontal overscroll doesn't trigger history navigation.
 
 ### 2026-03-20 — Tool_use loop: fix validate-goal crash + narrow plan context
 
-- **Problem**: Tool_use “overthinking loop” for simple tasks.
+- **Problem**: Tool_use "overthinking loop" for simple tasks.
 - **Root cause #1**: `services/logic_engine/service.py` `validate_goal()` referenced an undefined `user_goal` variable, causing logic-engine `/internal/validate-goal` to 500; observer defaulted to `goal_met=false`, so the loop never stopped.
 - **Root cause #2**: Tool-plan prompt/context was too broad, so the planner often retried parsing invalid tool-plan JSON and kept exploring.
 - **Fix**:
@@ -465,12 +569,12 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 ### 2026-03-20 — Current struggles: tool-plan JSON + tool-use stalls
 
 - **Symptoms seen in logs**:
-  - `response-generator` tool planning retries with `Tool plan attempt ... failed (bad JSON)` and messages like `Could not extract valid JSON from text: plaintext` or the model producing non-tool-plan text (e.g. “request incomplete...” / apology text).
+  - `response-generator` tool planning retries with `Tool plan attempt ... failed (bad JSON)` and messages like `Could not extract valid JSON from text: plaintext` or the model producing non-tool-plan text (e.g. "request incomplete..." / apology text).
   - Sometimes the parsed object is missing required fields (observed: `Invalid action: None`), which forces retries and can make the overall interaction feel stuck/slow.
   - End-to-end smoke tests for tool_use can take a long time when the model keeps emitting non-JSON/tool-incompatible outputs.
 - **Root causes (suspected / observed)**:
   - The tool-plan model is not consistently producing a JSON object that our extractor can parse, even with prompt constraints.
-  - JSON extraction needs to be tolerant of common “near JSON” mistakes (code fences, trailing commas, unquoted keys/values, etc.).
+  - JSON extraction needs to be tolerant of common "near JSON" mistakes (code fences, trailing commas, unquoted keys/values, etc.).
   - Even when parsing improves, the model can still output plain text refusals or meta-responses instead of a tool-plan JSON object.
 - **Mitigations implemented in code**:
   - **Near-JSON repair**: `packages/shared-utils/json_utils.py` now repairs common tool-plan JSON issues (unquoted keys, single-quoted strings, bareword string values, trailing commas).
@@ -485,17 +589,17 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-20 — UI: stream thoughts before plan ready + plan progress fixes
 
-- **Symptom**: On tool_use, the chat overlay showed `ToolPlanReady` first, while the “Agent Thoughts” card rendered the full content only after completion (no incremental streaming).
+- **Symptom**: On tool_use, the chat overlay showed `ToolPlanReady` first, while the "Agent Thoughts" card rendered the full content only after completion (no incremental streaming).
 - **Root cause**: `ThinkingOverlay` decided whether to render `ActivityStream` based only on `ThoughtsValidated`; it ignored `ThoughtChunkGenerated` / `ThoughtLayerGenerated`, so the streaming thought UI was gated until a later event.
-- **Fix**: `ThinkingOverlay` now treats `ThoughtChunkGenerated` / `ThoughtLayerGenerated` as “thought present” so the overlay renders early and streams incrementally.
+- **Fix**: `ThinkingOverlay` now treats `ThoughtChunkGenerated` / `ThoughtLayerGenerated` as "thought present" so the overlay renders early and streams incrementally.
 
 - **Symptom**: `PlanCard` highlighting/progress appeared stuck across iterations.
-- **Root cause**: `interaction.service.ts` published `step_index` with an off-by-one error (`Math.min(iteration, planSteps) - 1`), so UI step highlighting didn’t advance correctly.
+- **Root cause**: `interaction.service.ts` published `step_index` with an off-by-one error (`Math.min(iteration, planSteps) - 1`), so UI step highlighting didn't advance correctly.
 - **Fix**: `step_index` is now `max(0, min(iteration, planSteps - 1))`, and `PlanCard` uses the latest `ToolPlanReady` event.
 
 ### 2026-03-20 — Self Teaching: UI + 2-agent flow
 
-- Implemented a dedicated “Self Teaching” sidebar panel (`apps/oasis-ui-react/src/components/self-teaching/SelfTeachingPanel.tsx`) that runs:
+- Implemented a dedicated "Self Teaching" sidebar panel (`apps/oasis-ui-react/src/components/self-teaching/SelfTeachingPanel.tsx`) that runs:
   - LLM candidate thoughts (`POST /internal/thought/generate` + logic validation)
   - Logic-engine solution (`POST /internal/reason` via graph-builder)
   - Teaching plan proposal (`POST /internal/self-teaching/plan`)
@@ -507,7 +611,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - New pending workflow storage in memory-service:
   - `GET|POST|DELETE /internal/memory/self-teaching/pending`
 
-- Added “almost agree” adjustment loop:
+- Added "almost agree" adjustment loop:
   - UI now lets you enter a user comment during `awaiting_approval` and click `Update plan`.
   - api-gateway exposes `POST /api/v1/self-teaching/adjust`, overwriting the pending `teaching_plan` with an LLM-regenerated one.
   - response-generator `/internal/self-teaching/plan` now accepts `user_comment` and instructs the model to incorporate it into both `teaching_material` and `rule_actions` with minimal changes.
@@ -533,7 +637,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-21 — Chat history missing on LLM / tool-plan requests
 
-- **Symptom**: Multi-turn chats didn’t get `chat_history` on response-generator (tool-plan, chat, etc.).
+- **Symptom**: Multi-turn chats didn't get `chat_history` on response-generator (tool-plan, chat, etc.).
 - **Root cause**: `RedisEventService.pushMessage` / `getRecentMessages` returned immediately when `this.connected` was false. `connected` flips true only in the `.then()` of `redis.connect()`, so the first requests (and any request before connect finished) **skipped** storing the user message and **returned []** for history.
 - **Fix**: `ensureRedisReady()` awaits `redis.connect()` before chat list ops (and reuse for `publish` / `getBacklog`). `InteractionService` logs prior-turn count when non-zero.
 
@@ -543,7 +647,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Causes**:
   - **`onRefreshRules` was never passed** from `App.tsx` into `GraphPanel`, so switching to the Logic tab did not refetch.
   - **Silent axios failures** in a single `try/catch` cleared both list and graph; graph used `.catch(() => null)` so failures were invisible.
-  - **Memory-service on Neo4j fallback** at startup: rules live in Neo4j but API reads empty in-process `_fallback_rules` — looks like “no rules”.
+  - **Memory-service on Neo4j fallback** at startup: rules live in Neo4j but API reads empty in-process `_fallback_rules` — looks like "no rules".
   - **Neo4j `Rule` nodes**: `dict(record["r"])` can yield non–JSON-safe values; list endpoint may error or return unusable payloads — now normalized via `_rule_node_to_dict`.
 - **Fixes**:
   - `services/memory_service/service.py`: `_rule_node_to_dict` + `storage_backend`; `GET /internal/memory/rules` returns `"storage": "neo4j"|"fallback"`.
@@ -552,8 +656,8 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-21 — UI: streaming reply overwrote user bubble
 
-- **Symptom**: While the assistant streamed, the **user’s** message text was replaced by the assistant output.
-- **Cause**: `ResponseChunkGenerated` keyed updates by `client_message_id`, which is the **same** as the user row’s `id`. `prev.map(m => m.id === clientId ? { ...m, text: fullText } : m)` updated the user message. User and assistant rows also reused that id.
+- **Symptom**: While the assistant streamed, the **user's** message text was replaced by the assistant output.
+- **Cause**: `ResponseChunkGenerated` keyed updates by `client_message_id`, which is the **same** as the user row's `id`. `prev.map(m => m.id === clientId ? { ...m, text: fullText } : m)` updated the user message. User and assistant rows also reused that id.
 - **Fix** (`apps/oasis-ui-react`): assistant rows use `assistantMessageId(clientId)` = `` `${clientId}-assistant` ``; streaming and final `upsertAssistantMessage` only touch that id. Timeline/SSE stay keyed by raw `client_message_id` via `timelineClientKeyForMessage()`. Voice `oasis-response` uses the same upsert.
 
 ### 2026-03-20 — Tool-plan: flat line output + `parse-raw` (streaming 2A, contract 1A)
@@ -563,7 +667,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Non-stream**: `plan_tool_calls` builds context via `_build_tool_plan_combined_message`, then `parse_tool_plan_raw` (flat first, then JSON + `repair_json` if the buffer looks like `{...}`).
 - **2A (streaming UX)**: `stream_tool_plan` uses the **same** combined message (including `knowledge_summary` on `ToolPlanRequest`). Gateway publishes incremental **ToolReasoningChunk** from the last `REASONING:` line (with legacy fallback to partial `"reasoning"` JSON). On stream end it calls **`POST /internal/response/tool-plan/parse-raw`** first, then falls back to `/internal/json/repair` + `extractAndParseJson`.
 
-### 2026-03-20 — UI “Connecting…” forever (voice / whole gateway wedged)
+### 2026-03-20 — UI "Connecting…" forever (voice / whole gateway wedged)
 
 - **Symptom**: Header stuck on **Connecting…** (LiveKit auto-connect in `App.tsx`); other API calls can hang.
 - **Root cause**: Timeline SSE (`TimelineController`) loop calls `readNextBatch` → when `this.reader` was missing or `this.connected` false, it returned `[]` **immediately**. The handler did `if (batch.length === 0) continue` with **no await** → **tight busy-loop on the Node event loop**, starving I/O (including `voice-proxy` join/token).
@@ -580,7 +684,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Causes**: Default **30s** per outbound hop is tight for large `task_graph` / slow Docker CPU; **api-gateway** also used **30s** for `POST /internal/observer/validate` while observer does **two sequential** HTTP calls (up to 30s each) → gateway could abort before observer finishes.
 - **Fix**: Observer `httpx.Timeout` from env — **`OBSERVER_HTTP_TIMEOUT_SECONDS`** (default **120**), **`OBSERVER_HTTP_CONNECT_TIMEOUT_SECONDS`** (default **15**). Gateway **`OBSERVER_VALIDATE_TIMEOUT_MS`** (default **180000**). Wired in `docker-compose.yml`.
 
-### 2026-03-21 — Redis `ensureRedisReady`: “already connecting/connected”
+### 2026-03-21 — Redis `ensureRedisReady`: "already connecting/connected"
 
 - **Symptom**: Log spam `Redis ensureRedisReady failed: Error: Redis is already connecting/connected`.
 - **Cause**: Constructor calls `redis.connect()` while concurrent requests call `ensureRedisReady()` → second `connect()` throws in ioredis.
@@ -588,14 +692,14 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-21 — Thought-only loops: force action after 3
 
-- **Symptom**: Agent sometimes kept generating thoughts but didn’t produce new tool-results for multiple iterations (appearing “thoughts only”).
-- **Fix** (`apps/api-gateway/src/interaction/interaction.service.ts`): added a `thoughtsOnlyStreak` counter for consecutive iterations where `toolResults` didn’t grow. When the streak reaches 3, the next iteration injects a `[FORCE ACTION]` directive and also deterministically overrides a `final_answer` plan into a `call_tool` (grep) if the model still tries to finalize.
+- **Symptom**: Agent sometimes kept generating thoughts but didn't produce new tool-results for multiple iterations (appearing "thoughts only").
+- **Fix** (`apps/api-gateway/src/interaction/interaction.service.ts`): added a `thoughtsOnlyStreak` counter for consecutive iterations where `toolResults` didn't grow. When the streak reaches 3, the next iteration injects a `[FORCE ACTION]` directive and also deterministically overrides a `final_answer` plan into a `call_tool` (grep) if the model still tries to finalize.
 - **Follow-up fix**: ensured the streak increments even when the model proposes `final_answer` and the Observer rejects it (no tool_results produced in that branch), so the max-3 enforcement actually triggers.
 
-### 2026-03-21 — Tool-plan parse-raw: Docker logs don’t show model output (until preview)
+### 2026-03-21 — Tool-plan parse-raw: Docker logs don't show model output (until preview)
 
-- **Aha**: Grepping `docker logs oasis-cognition-response-generator-1` for `parse-raw rejected` only showed the **error + repair char count** — the streamed tool-plan body was **never logged**, so you couldn’t see what the model actually returned for a given 422.
-- **Fix**: `services/response_generator/main.py` `tool_plan_parse_raw` now logs `raw_len` and a **single-line `preview`** (~400 chars, whitespace-collapsed) on `ValueError` so `docker logs … | grep preview` surfaces the shape of bad output. **Not** a redaction layer — don’t log if prompts could contain secrets.
+- **Aha**: Grepping `docker logs oasis-cognition-response-generator-1` for `parse-raw rejected` only showed the **error + repair char count** — the streamed tool-plan body was **never logged**, so you couldn't see what the model actually returned for a given 422.
+- **Fix**: `services/response_generator/main.py` `tool_plan_parse_raw` now logs `raw_len` and a **single-line `preview`** (~400 chars, whitespace-collapsed) on `ValueError` so `docker logs … | grep preview` surfaces the shape of bad output. **Not** a redaction layer — don't log if prompts could contain secrets.
 
 ### 2026-03-21 — `npm install` failures (Node engines / multi-app)
 
@@ -604,7 +708,7 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-21 — `bash` / `npm install` on host via dev-agent
 
-- **Aha**: `bash` is in **`DEV_AGENT_TOOLS`**, so the gateway posts to **`DEV_AGENT_URL/internal/dev-agent/execute`**, but the dev-agent only handled worktree/file tools — **`command` was never sent** in the dev-agent branch (only tool-executor got `execPayload.command`) → “Unknown dev-agent tool” or empty command.
+- **Aha**: `bash` is in **`DEV_AGENT_TOOLS`**, so the gateway posts to **`DEV_AGENT_URL/internal/dev-agent/execute`**, but the dev-agent only handled worktree/file tools — **`command` was never sent** in the dev-agent branch (only tool-executor got `execPayload.command`) → "Unknown dev-agent tool" or empty command.
 - **Fix**: (1) **`services/dev_agent/service.py`** — **`run_bash(command, worktree_id?)`** with cwd = worktree if present else **`PROJECT_ROOT`**, inherits full **`os.environ`** (host Node/npm), timeout **`DEV_AGENT_BASH_TIMEOUT_SECONDS`** (default 600s). (2) **`services/dev_agent/main.py`** — **`ToolRequest.command`** + **`elif req.tool == "bash"`**. (3) **`interaction.service.ts`** — for dev-agent + **`bash`**, set **`execPayload.command`**; use **600s** HTTP timeout for bash (npm install).
 - **Contract**: With **`./scripts/start-dev-agent.sh`** and **`DEV_AGENT_URL`** pointing at that process (e.g. gateway in Docker → **`host.docker.internal:8008`**), agent **`call_tool` bash** runs on the **host** repo, not inside tool-executor.
 
@@ -620,12 +724,12 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-21 — Tool-plan parse failures: model echoes user context (not JSON)
 
-- **Symptom**: `parse-raw` preview showed prose like “Relevant memory entries… User request… Current plan step… Let's start by…” — **no** `REASONING:` / `DECISION:` lines. That text mirrors **injected** `knowledge_summary` + `_build_tool_plan_combined_message` blocks; the model was **narrating the prompt** instead of the flat plan contract.
-- **Mitigations** (`services/response_generator/service.py`): (1) **TOOL_PLAN_PROMPT** — explicit “OUTPUT DISCIPLINE”: first line must be `REASONING:`, never echo user sections. (2) **Footer** on the combined user message — “NOW OUTPUT YOUR TOOL PLAN ONLY”. (3) **`_strip_tool_plan_preamble`** — if the model eventually emits keys after junk, parse from the first `REASONING:`/`DECISION:`/… line. (4) **Always `extract_json(norm)`** after flat parse (embedded `{...}` after prose). (5) Clearer `ValueError` text (flat-first wording). Removed unused `_looks_like_json_object`.
+- **Symptom**: `parse-raw` preview showed prose like "Relevant memory entries… User request… Current plan step… Let's start by…" — **no** `REASONING:` / `DECISION:` lines. That text mirrors **injected** `knowledge_summary` + `_build_tool_plan_combined_message` blocks; the model was **narrating the prompt** instead of the flat plan contract.
+- **Mitigations** (`services/response_generator/service.py`): (1) **TOOL_PLAN_PROMPT** — explicit "OUTPUT DISCIPLINE": first line must be `REASONING:`, never echo user sections. (2) **Footer** on the combined user message — "NOW OUTPUT YOUR TOOL PLAN ONLY". (3) **`_strip_tool_plan_preamble`** — if the model eventually emits keys after junk, parse from the first `REASONING:`/`DECISION:`/… line. (4) **Always `extract_json(norm)`** after flat parse (embedded `{...}` after prose). (5) Clearer `ValueError` text (flat-first wording). Removed unused `_looks_like_json_object`.
 
 ### 2026-03-21 — Persist tool-plan request/output for debugging (Langfuse)
 
-- **Need**: Memory graph doesn’t store raw tool-plan streams; Docker logs alone aren’t enough without preview logging.
+- **Need**: Memory graph doesn't store raw tool-plan streams; Docker logs alone aren't enough without preview logging.
 - **Fix** (`apps/api-gateway/src/interaction/interaction.service.ts`): Each finished `tool-plan-stream` creates a **Langfuse** child span `tool-plan-stream` on the interaction trace with **lightweight input** (iteration, `user_message` preview, counts) and **output** (`parse_path`, `action`, `tool`, `raw_len`, `raw_preview` ~1.2k chars). Optional **`OASIS_DEBUG_TOOL_PLAN_PAYLOAD=true`**: also attach **truncated** JSON of the full request payload + model output (`OASIS_DEBUG_TOOL_PLAN_MAX_CHARS`, default 16k). **PII/size risk** when debug is on — use only in dev or short windows.
 
 ### 2026-03-21 — Exploration vs implementation: stagnation-based guidance (gateway)
@@ -650,9 +754,9 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 
 ### 2026-03-21 — bash / npm vs worktree + thoughts → tool plan
 
-- **Symptom**: Agent “thought” about editing but next tool stayed exploratory; repeated successful grep/npm; **`npm install` appeared to succeed** but **no changes in the git worktree**.
-- **Cause**: **`bash` was routed to the Docker tool-executor**, so installs ran in the **container’s** `/workspace`, not the **host dev-agent git worktree** under `.oasis-worktrees/`. Tool plan text also said npm was “blocked”, so the model’s reasoning and actions diverged. **`worktree_id` was not stored on `tool_results`**, so the planner could not see which worktree was active.
-- **Fix**: (1) Route **`bash` through `DEV_AGENT_TOOLS`** (dev-agent host). (2) For **package-install-shaped** commands, **require** a worktree: gateway resolves **`PARAM_WORKTREE_ID`** from the plan or the last successful **`create_worktree`**; otherwise inject a clear failure **before** `ToolCallStarted`. (3) **dev-agent** `run_bash` refuses package installs **without** `worktree_id`. (4) Persist **`worktree_id`** on tool result records when present. (5) **Duplicate detection** normalizes `/workspace/…` paths and **whitespace** in commands; duplicate-after-success copy tells the model not to redo successful work. (6) **Response generator**: “already succeeded” digest, **last tool SUCCESS** footer, stronger **validated thoughts / latest reasoning** copy and **TOOL_PLAN_PROMPT** priority for concrete next-tool commitments.
+- **Symptom**: Agent "thought" about editing but next tool stayed exploratory; repeated successful grep/npm; **`npm install` appeared to succeed** but **no changes in the git worktree**.
+- **Cause**: **`bash` was routed to the Docker tool-executor**, so installs ran in the **container's** `/workspace`, not the **host dev-agent git worktree** under `.oasis-worktrees/`. Tool plan text also said npm was "blocked", so the model's reasoning and actions diverged. **`worktree_id` was not stored on `tool_results`**, so the planner could not see which worktree was active.
+- **Fix**: (1) Route **`bash` through `DEV_AGENT_TOOLS`** (dev-agent host). (2) For **package-install-shaped** commands, **require** a worktree: gateway resolves **`PARAM_WORKTREE_ID`** from the plan or the last successful **`create_worktree`**; otherwise inject a clear failure **before** `ToolCallStarted`. (3) **dev-agent** `run_bash` refuses package installs **without** `worktree_id`. (4) Persist **`worktree_id`** on tool result records when present. (5) **Duplicate detection** normalizes `/workspace/…` paths and **whitespace** in commands; duplicate-after-success copy tells the model not to redo successful work. (6) **Response generator**: "already succeeded" digest, **last tool SUCCESS** footer, stronger **validated thoughts / latest reasoning** copy and **TOOL_PLAN_PROMPT** priority for concrete next-tool commitments.
 
 ### 2026-03-21 — Observer-triggered plan revision + UI epoch (`plan_revision`)
 
@@ -663,31 +767,182 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Response generator**: `PlanToolUseRequest` + `plan_tool_use()` accept revision fields and inject **REVISION MODE** instructions for the planning LLM.
 - **UI** (`PlanCard.tsx`): Only counts `ToolCallStarted` / `ToolCallCompleted` events whose `plan_revision` matches the latest `ToolPlanReady` (missing `plan_revision` treated as epoch `0`). Shows a **Revised** badge and short copy when `plan_revised`.
 
-### 2026-03-21 — Plan step checkboxes: “Modify…” marked done after only grep
+### 2026-03-21 — Plan step checkboxes: "Modify…" marked done after only grep
 
-- **Symptom**: Upfront plan step like “Modify the identified UI component to use the selected library…” showed as satisfied while the trace was only `grep` / `list_dir` — no `edit_file` / `get_diff`.
+- **Symptom**: Upfront plan step like "Modify the identified UI component to use the selected library…" showed as satisfied while the trace was only `grep` / `list_dir` — no `edit_file` / `get_diff`.
 - **Cause**: Per-step validation used `tool_used = True` when the step had no explicit `tool`, and `verify_matched = 1.0` when `verify` was empty → every step became **done** after any tool call.
-- **Fix** (`services/logic_engine/service.py`): **`_infer_plan_step_tool_used`** — if `tool` is missing, infer from step text (implementation vs explore regex + phrases like “selected library”) and require **`create_worktree` / `write_file` / `edit_file` / `get_diff`** vs **read-only** tools accordingly; on implementation tasks, ambiguous steps default to requiring edit tools.
+- **Fix** (`services/logic_engine/service.py`): **`_infer_plan_step_tool_used`** — if `tool` is missing, infer from step text (implementation vs explore regex + phrases like "selected library") and require **`create_worktree` / `write_file` / `edit_file` / `get_diff`** vs **read-only** tools accordingly; on implementation tasks, ambiguous steps default to requiring edit tools.
 
-### 2026-03-21 — Observer “silent” on tutorial `final_answer` (implementation asks)
+### 2026-03-21 — Observer "silent" on tutorial `final_answer` (implementation asks)
 
 - **Symptom**: User asked to implement (e.g. syntax highlighting); model replied with npm/Prism instructions. **Observer** should set **`goal_met: false`** and strong feedback, but the run looked like validation did nothing.
-- **Causes**: (1) **`proposed_final_answer`** was not passed from **api-gateway** → **observer-service** → **logic-engine**, so the advisory-text safety net in **`validate_goal`** never ran. (2) **Post-tool** observer validation (after each iteration) can **exit the loop** when **`goal_met`** is true — so bugs in **`validate_goal`** that mark exploration-only runs as “done” bypass **`final_answer`** validation entirely. (3) **Path-failure shortcut** (5+ missing-path read failures) returned **`goal_met: true`** **before** implementation classification, which could wrongly complete non-read-only goals.
+- **Causes**: (1) **`proposed_final_answer`** was not passed from **api-gateway** → **observer-service** → **logic-engine**, so the advisory-text safety net in **`validate_goal`** never ran. (2) **Post-tool** observer validation (after each iteration) can **exit the loop** when **`goal_met`** is true — so bugs in **`validate_goal`** that mark exploration-only runs as "done" bypass **`final_answer`** validation entirely. (3) **Path-failure shortcut** (5+ missing-path read failures) returned **`goal_met: true`** **before** implementation classification, which could wrongly complete non-read-only goals.
 - **Fix**: Wire **`proposed_final_answer`** on **`POST /internal/observer/validate`** and **`/internal/validate-goal`**. **`validate_goal`**: move **implementation detection** above the path shortcut and **skip** that shortcut when **`is_implementation_request`**. Tighten **criteria-list + implementation** branch to require **`get_diff`** as last tool; keep advisory markers (e.g. **`npm install`**, **`you should `**) when the proposed answer is user-facing instructions without repo edits.
 
-### 2026-03-21 — Autonomous toggle: “stops responding” / wrong mode (race + empty UI)
+### 2026-03-21 — Autonomous toggle: "stops responding" / wrong mode (race + empty UI)
 
-- **Symptom**: After turning **Autonomous** off in Settings, the next reply can look like the app “hung” or the assistant bubble never appears — often because **backend still used the old `autonomous_mode`** until `POST /session/config` finished, or **`setConfig` spread `undefined`** and corrupted stored hours. Empty `response_text` from decision **ANSWER_DIRECTLY** also skipped the assistant row (`if (data?.response)`).
-- **Fix**: (1) **`App.tsx` `sendToApi`** — always send **`context.autonomous_mode`** and **`context.autonomous_max_duration_hours`** (from React state + `readAutonomousMaxHours()`) on each interaction so **`SessionConfigService.getConfig(sessionId, req.context)`** matches the UI immediately. (2) **`session.service.ts`** — **`setConfig`** only patches defined fields; **`getConfig`** normalizes hours (never NaN) and applies **only** context keys that are explicitly present (don’t reset hours when only `autonomous_mode` is sent). (3) **UI** — if the pipeline returns success but empty text, show a short placeholder assistant message. (4) **Gateway** — **ANSWER_DIRECTLY** path uses a non-empty fallback if `response/chat` returns blank.
+- **Symptom**: After turning **Autonomous** off in Settings, the next reply can look like the app "hung" or the assistant bubble never appears — often because **backend still used the old `autonomous_mode`** until `POST /session/config` finished, or **`setConfig` spread `undefined`** and corrupted stored hours. Empty `response_text` from decision **ANSWER_DIRECTLY** also skipped the assistant row (`if (data?.response)`).
+- **Fix**: (1) **`App.tsx` `sendToApi`** — always send **`context.autonomous_mode`** and **`context.autonomous_max_duration_hours`** (from React state + `readAutonomousMaxHours()`) on each interaction so **`SessionConfigService.getConfig(sessionId, req.context)`** matches the UI immediately. (2) **`session.service.ts`** — **`setConfig`** only patches defined fields; **`getConfig`** normalizes hours (never NaN) and applies **only** context keys that are explicitly present (don't reset hours when only `autonomous_mode` is sent). (3) **UI** — if the pipeline returns success but empty text, show a short placeholder assistant message. (4) **Gateway** — **ANSWER_DIRECTLY** path uses a non-empty fallback if `response/chat` returns blank.
 
 ### 2026-03-21 — LLM API (OpenAI-compatible) + `OASIS_VISION_LLM_MODEL`
 
-- **Integration**: There is no separate “llmapi” provider string — use **`OASIS_*_LLM_PROVIDER=openai`** with **`OASIS_OPENAI_BASE_URL=https://api.llmapi.ai/v1`** and **`OASIS_OPENAI_API_KEY`** (same secret as curl `Authorization: Bearer`).
+- **Integration**: There is no separate "llmapi" provider string — use **`OASIS_*_LLM_PROVIDER=openai`** with **`OASIS_OPENAI_BASE_URL=https://api.llmapi.ai/v1`** and **`OASIS_OPENAI_API_KEY`** (same secret as curl `Authorization: Bearer`).
 - **Vision**: **`LLMClient.chat_with_images`** supports **`openai`** via multimodal `image_url` content (raw base64 JPEG or `data:…` URLs). **`OASIS_VISION_LLM_MODEL`** is read by **response-generator** (`Settings` on `_response_settings`); if unset, Ollama path keeps **`llava:13b`** fallback, OpenAI-compatible path uses the text **`llm_model`**.
 - **Compose**: **`OASIS_VISION_LLM_MODEL`** passed into **response-generator** service.
+
+|  **2026-06-10 — PricingService tests + testability refactor**
+|
+|  - **Test files**: `src/session/pricing.service.spec.ts` (37 tests) and `pricing.controller.spec.ts` (3 tests).
+|  - **Testability**: Added `protected http: AxiosInstance = axios` field so tests can inject a mock `{ get: jest.fn() }` without module-level `jest.mock('axios')` CJS/ESM interop issues.
+|  - **Test coverage**: `pricingFor` (exact/prefix/null/mismatch), `estimateUsd` (all providers, fractions, free models, unknown), `mergeTable` (defaults, env override, malformed JSON, priority layering), `getTable` / `getTableSnapshot`, `fetchFromApi` (no-op, valid/invalid data, network errors, state tracking).
+|  - **Controller tests**: Use `TestingModule` with manual `mergeTable()` call since `onModuleInit` doesn't fire inside `Test.createTestingModule`.
 
 ### 2026-03-29 — File read truncation: `read_metadata` (not guessing from LLM context)
 
 - **Problem**: An agent assumed a source file was truncated mid-string because its own **context** was cut off — not because the repo file was incomplete. Truncation should be decided from **tool/service facts**, not from partial model input.
 - **Fix**: **`read_file`** (tool-executor) and **`read_worktree_file`** (dev-agent) success responses now include **`read_metadata`**: `file_size_bytes`, `returned_bytes`, `total_lines`, `truncated_by_line_cap`, `truncated_by_byte_cap`, `source_line_start` / `source_line_end`, `next_chunk_start_line`, `has_more_lines_above` / `has_more_lines_below`. API gateway attaches this to tool results and drives the post-read **\_system** nudge from metadata (with regex fallback for older executors). **`services/interpreter/service.py`** `SYSTEM_PROMPT` in repo is complete — if a Cursor/agent view looks cut off, re-read the file from disk or use offset reads; do not infer file damage from chat truncation.
 
+### 2026-06-10 — Yggdrasil v0.2.1 integration (standalone orchestration controller)
+
+- **Upgrade**: `@theaiinc/yggdrasil` from v0.0.1 → v0.2.1. The package architecture changed fundamentally: v0.0.1 was a library with in-process `AgentManager` / `LoadBalancer` classes; v0.2.1 is a standalone Express HTTP server (`orchestration-controller.js`) that manages runner registrations, heartbeats, and task tracking over REST.
+- **New YggdrasilBridgeService** (`apps/api-gateway/src/coordinator/yggdrasil-bridge.service.ts`): Replaced in-process AgentManager/LoadBalancer with an axios HTTP client to the Yggdrasil controller. Key methods:
+  - `getAdmissionState()` — async, queries `GET /api/runners` and derives slot availability + circuit breaker from runner health status
+  - `registerRunner()`, `sendHeartbeat()`, `markOffline()` — proxy runner lifecycle operations
+  - `getRunner()`, `listRunners()` — query registered runners
+  - `createRunnerTask()`, `updateRunnerTask()`, `listRunnerTasks()` — manage tasks on runners
+- **Type changes**: Removed `AgentInfo`, `AgentMetrics`, `OrchestrationConfig` types (v0.0.1). New types: `YggRunner`, `YggTask`, `YggHealthResponse`, `AdmissionState` (v0.2.1).
+- **CoordinatorService & PreflightService**: Both now `await` the async `getAdmissionState()`. Removed deprecated `yggdrasil.registerWorker()` calls from `spawnChild()` — runners self-register with Yggdrasil directly.
+- **CoordinatorController**: Removed `POST /internal/worker` and `POST /internal/worker/slots` endpoints (runners self-register). Added:
+  - `GET internal/yggdrasil/runners` — list all Yggdrasil runners
+  - `GET internal/yggdrasil/runners/:runnerId` — get runner details
+  - `GET internal/yggdrasil/admission` — proxy admission state
+  - `GET internal/yggdrasil/health` — proxy Yggdrasil controller health
+- **Agent pool compose** (`docker-compose.agent-pool.yml`): Added `yggdrasil` service (node:20-alpine running `orchestration-controller.js` on port 3100). `agent-registry` now depends on `yggdrasil: condition: service_healthy`. Updated registry.ts to register with Yggdrasil directly + send heartbeats every 15s + graceful offline on shutdown.
+- **New env vars**:
+  - `YGGDRASIL_URL` — where the gateway + runners find the controller (default `http://yggdrasil:3100`)
+  - `YGGDRASIL_API_KEY` — optional API key for Yggdrasil auth
+  - `YGGDRASIL_LEASE_TTL_MS` — how long before offline detection (default 60000ms)
+  - `YGGDRASIL_HEARTBEAT_INTERVAL_MS` — runner heartbeat frequency (default 15000ms)
+- **Running**:
+  ```bash
+  # Build the runner image
+  docker compose -f docker-compose.yml -f docker-compose.agent-pool.yml build agent-runner
+
+  # Start the full agent pool with Yggdrasil
+  docker compose -f docker-compose.yml -f docker-compose.agent-pool.yml up -d
+
+  # Check Yggdrasil health
+  curl http://localhost:3100/health
+
+  # List registered runners
+  curl http://localhost:8000/api/v1/coordinator/internal/yggdrasil/runners
+  ```
+
+### 2026-06-10 — Shared types exported from @theaiinc/yggdrasil npm package
+
+- **What changed**: The `@theaiinc/yggdrasil` npm package now exports its full wire-protocol TypeScript types so consumers can import them instead of duplicating inline definitions.
+- **Exported types** (from `@theaiinc/yggdrasil`):
+  - `RunnerInfo` — runner registration state (`runnerId`, `capabilities`, `status`, `tasks`, `pendingUpdate`, etc.)
+  - `RunnerTask` — task on a runner (`taskId`, `type`, `status`, `correlationId`, `metadata`)
+  - `SystemResources` — CPU/memory snapshot
+  - `PendingUpdate` — deferred update instruction (`version`, `command`, `downloadUrl`, `metadata`)
+  - `HeartbeatPayload`, `HeartbeatResponse` — heartbeat request/response types
+  - `RegisterRunnerPayload`, `RequestUpdatePayload` — API request types
+  - `LogLevel`, `LoggerConfig` — logger config types (pre-existing)
+- **Consumers updated**:
+  - `apps/api-gateway/src/coordinator/yggdrasil-bridge.service.ts` — replaced inline `YggRunner`/`YggTask` with imports from `@theaiinc/yggdrasil`
+  - `apps/agent-runner/src/yggdrasil-pool.ts` — replaced inline `YggRunner`/`YggTask` with `RunnerInfo`/`RunnerTask` from `@theaiinc/yggdrasil`
+  - `apps/agent-runner/src/registry.ts` — replaced inline `PendingUpdate` type with import from `@theaiinc/yggdrasil`
+- **Source of truth**: The types live in the yggdrasil monorepo at `packages/yggdrasil/src/types/index.ts`. The orchestration controller imports them from there too (no longer defines them inline).
+- **Note**: The agent-runner still maintains its own local `presets/` types (`CapabilityPreset`, `CombinedPreset`) — those are build-time concepts, not wire-protocol types, so they stay local.
+
+### 2026-06-10 — Prometheus runner version metrics + Grafana version dashboard
+
+- **New Prometheus metrics** (exposed at `/metrics` by both `@theaiinc/yggdrasil` controller and Oasis `yggdrasil-pool.ts`):
+  - `yggdrasil_runner_version_info{runner, name, version}` — always 1; labels carry the version string for each runner
+  - `yggdrasil_expected_runner_version{version}` — info metric exposed when `EXPECTED_RUNNER_VERSION` env var is set
+  - `yggdrasil_runner_outdated{runner, name, current, expected}` — 1 when runner version != expected version
+  - `yggdrasil_runner_pending_update{runner, name, current_version, target_version}` — 1 when an update has been requested but not yet applied
+- **Grafana dashboard** (`yggdrasil-runners.json`) updated with:
+  - **Outdated** stat panel — red background if any runner is outdated, green if all good
+  - **Pending Updates** stat panel — yellow/red when runners have pending updates
+  - **Runner Versions** table — shows runner name, current version, and pending/target version in a single view
+  - **Expected Version** stat panel — displays the current `EXPECTED_RUNNER_VERSION` value
+- **New env var**: `EXPECTED_RUNNER_VERSION` — set this to the version tag a runner should be at (e.g. `0.2.1`). Runners reporting a different version get `yggdrasil_runner_outdated=1`.
+- **Compose files updated**: Both `yggdrasil/docker-compose.yml` and `oasis/docker-compose.agent-pool.yml` pass through `EXPECTED_RUNNER_VERSION` with a default of `0.1.0`.
+- **How to check in Grafana**:
+  1. Open Grafana at http://localhost:3001 (login: admin/admin)
+  2. Navigate to the "Yggdrasil Runner Status" dashboard
+  3. Top row: see **Outdated** (red=bad, green=good) and **Pending Updates** counts
+  4. **Runner Versions** table shows exact version strings per runner
+  5. **Expected Version** stat shows what all runners should be at
+  6. CPU/Memory panels let you correlate version issues with resource usage
+
+# Coding capability (= code preset)
+
+The `code` preset is **LLM-based code generation** — NOT a sandbox executor.
+- `dependsOn: ['llm']` — it reuses the LLM with a coding-optimised profile (lower temperature, higher max tokens).
+- No `apt` deps (`python3`, `gcc`, etc.) — those were from the old sandbox model.
+- Environment defaults point to LM Studio: `google/gemma-4-26b-a4b-qat` at `http://host.docker.internal:1234/v1`.
+- The handler (`code-handler.ts`) sends a prompt to the LLM and returns the generated code as text.
+- In Oasis Cognition, the code capability is passive: the sub-agent loop already uses the LLM for coding tasks. The `code` preset defines the profile and exposes env vars to tune code generation separately (e.g. `CODE_TEMPERATURE=0.2`).
+- On the host, coding is "activated" by having LM Studio running on port 1234 with the model loaded.
+- **Models available**: `google/gemma-4-26b-a4b-qat` (26B / 4B active params, QAT), `google/gemma-4-12b`, `google/gemma-4-12b-qat`. The 26b QAT variant is the recommended one for sub-agent tasks.
+
+# Model variant registry
+
+A proper model registry now lives at `apps/api-gateway/src/models/model-variants.ts`.
+
+- Defines every known model variant with structured properties: **parameter_size_b**, **active_params_b** (MoE), **quantization**, **context_length**, and **capabilities** (tools, thinking, vision, code, embedding).
+- Automatically infers `billing_class` and `resource_class` from (provider, model) pairs via `inferBillingClass()` / `inferResourceClass()`.
+- Look-up is prefix-based so `google/gemma-4-26b-a4b-qat` matches `google/gemma-4` patterns.
+- Agent profile creation now auto-sets billing_class and resource_class when model/provider are specified.
+- Wired into: `agent-profiles.service.ts` (create + validation), `native-coordinator-tools.ts` (inference), `pricing.service.ts` (per-variant pricing rows), `interaction.service.ts` (model-aware `resolveContextWindow`), `app.module.ts` (ModelsModule).
+- **Adding a new model**: just add a `ModelVariant` entry — billing, resource class, pricing, and context length auto-align.
+
+### Gaps closed (2026-06-11)
+
+| Gap | Fix |
+|---|---|
+| No model variant definitions | `model-variants.ts` — 7 variants: 3 gemma-4, qwen3, deepseek-v4-flash, deepseek-v3.2, nomic-embed, qwen3-vision |
+| No context_length per model | `getContextLength()` helper wired into interaction service `resolveContextWindow()` |
+| No model-to-provider validation | `validateModelProvider()` called during profile creation — catches `model: "claude-opus-4-7"` + `provider: "ollama"` |
+| deepseek-v3.2 missing from pricing | Added to `DEFAULT_PRICING` + `model-variants.ts` — fixes computer-use cost estimates |
+| Ratatoskr hardcoded cost | `registry.ts` now reads `RATATOSKR_INPUT_COST_PER_M` / `RATATOSKR_OUTPUT_COST_PER_M` env vars |
+| No model lookup endpoint | `GET /api/v1/models` → lists all variants; `GET /api/v1/models/lookup?model=...&provider=...` → single lookup |
+| No model registry tests | `model-variants.spec.ts` — 18 tests covering lookup, inference, validation, context length |
+
+### 2026-06-11 — LLM cost ownership moved from Ratatoskr to Oasis API Gateway
+
+- **Change**: Ratatoskr no longer calculates `cost_usd` for LLM operations. Instead it reports the actual `model` used and `tokens` (input/output). Oasis `JobUsageService` computes cost server-side using `PricingService.estimateUsd()` with the child's reported model.
+- **Why**: Pricing is an Oasis concern — Ratatoskr shouldn't carry pricing tables. Enables Oasis to update prices without redeploying runners.
+- **Affected files**:
+  - `apps/agent-runner/src/yggdrasil-pool.ts` — `runSubAgent` reports `model` + `tokens`, no `cost_usd`
+  - `apps/agent-runner/src/registry.ts` — `runAgentTask` reports `model` + `tokens`, no `costUsd`
+  - `apps/api-gateway/src/coordinator/coordinator.service.ts` — `pollChildTask` extracts `model` + `tokens` from metadata
+  - `apps/api-gateway/src/coordinator/coordinator.controller.ts` — child-report body accepts `model` + `tokens`
+  - `apps/api-gateway/src/coordinator/job-usage.service.ts` — `addChildUsage` computes cost per child via `PricingService` using the child's model
+- **PricingService suffix match**: Added "Step 3.5" in `pricingFor()` — when no provider is given, tries to match a table key ending with `:<model>`. Fixes lookups for bare model names like `google/gemma-4-26b-a4b-qat` without a provider prefix.
+- **Cross-model cost fix**: `JobUsageService.addChildUsage` previously used the *last* model for total cost, contaminating across heterogeneous child tasks. Now each child's cost is computed independently and summed.
+
+### 2026-06-11 — Capability presets consolidated into @theaiinc/yggdrasil-ratatoskr
+
+- **Change**: `apps/agent-runner/src/presets/` folder removed entirely. Preset schema, builtins, and `resolveCapabilities` now live in `@theaiinc/yggdrasil-ratatoskr`.
+- **New files in Ratatoskr**:
+  - `packages/ratatoskr/src/presets/schema.js` — `CapabilityPreset`, `CombinedPreset`, `combinePresets()`, `getPreset()`, `generateDockerfile()`
+  - `packages/ratatoskr/src/presets/builtins.js` — 6 presets: `llm`, `web_search`, `shell`, `agent`, `code`, `python`
+  - `packages/ratatoskr/src/presets/resolve.js` — `resolveCapabilities()` (moved out of `ratatoskr.ts` to break circular dependency)
+- **Consumers**: Oasis `yggdrasil-pool.ts` and `registry.ts` import `resolveCapabilities` and preset types from `@theaiinc/yggdrasil-ratatoskr`.
+- **Version alignment**: `@theaiinc/yggdrasil` and `@theaiinc/yggdrasil-ratatoskr` always share the same version. Bumped to 0.2.3 together.
+
+### 2026-06-11 — Yggdrasil Grafana dashboard (provisioned)
+
+- **Dashboard**: `packages/yggdrasil/grafana/provisioning/dashboards/json/yggdrasil-runners.json` — classic Grafana JSON schema (v38), provisioned via `default.yml`.
+- **12 panels**: Total Runners, Online, Offline, Outdated, Pending Updates, Server Uptime, Expected Version (row 0); Runners Over Time, Memory Used (row 1); Runner Versions (table), Memory Usage % (row 2); Tasks Over Time, CPU Usage % (row 3).
+- **Layout**: 20-column grid. Stacks at Grafana port 3001 (admin/admin).
+- **Metrics source**: Prometheus scrapes `orchestration-controller:3000/metrics` at job name `orchestration-controller` (10s interval).
+
+### 2026-06-11 — Dockerfile fixes for monorepo lockfile
+
+- **Problem**: The Yggdrasil monorepo uses Nx workspaces with `package-lock.json` at root, but Dockerfiles ran `npm ci` which requires a local lock file. Builds failed.
+- **Fix**: Changed all `RUN npm ci` / `RUN npm ci --omit=dev` to `RUN npm install` / `RUN npm install --omit=dev` in both `packages/yggdrasil/Dockerfile` and `packages/ratatoskr/Dockerfile`. Also added `*.tgz` to `.gitignore` and ran `git rm --cached` for already-tracked tarballs.

@@ -1,0 +1,79 @@
+# Docker Compose profile for the parallel subagent pool.
+#
+# Yggdrasil IS the agent pool — the orchestration controller has a built-in
+# Ratatoskr runner that registers itself and executes tasks in-process.
+# No separate agent-registry service needed.
+#
+# Activate with:
+#   docker compose -f docker-compose.yml -f docker-compose.agent-pool.yml up -d
+#
+# Architecture:
+#   ┌─────────────┐   HTTP (dispatchTask, admission state)
+#   │ api-gateway │◄──────────────────────────────────┐
+#   │ (bridge)    │  GET /api/runners, POST /runners/ │
+#   └─────────────┘  :id/tasks, PATCH /:id/tasks/:tid │
+#        │                                              │
+#        └──────────────────────────────────────────────┘
+#                              │
+#                     ┌────────▼────────────────┐
+#                     │     yggdrasil-pool      │
+#                     │  ┌──────────────────┐   │
+#                     │  │ Orchestration    │   │
+#                     │  │ controller       │   │
+#                     │  └────────┬─────────┘   │
+#                     │           │ self-register│
+#                     │  ┌────────▼─────────┐   │
+#                     │  │ Built-in         │   │
+#                     │  │ Ratatoskr runner │   │
+#                     │  │ (LLM sub-agent)  │   │
+#                     │  └──────────────────┘   │
+#                     └─────────────────────────┘
+#
+# Additional external runners (e.g. registry.ts on other hosts) can register
+# with this Yggdrasil controller as well — they just POST /runners/register.
+#
+# Env overrides:
+#   API_KEYS                        — comma-separated API keys (optional)
+#   YGGDRASIL_LEASE_TTL_MS          — heartbeat timeout (default 60000)
+#   YGGDRASIL_MAX_CONCURRENCY       — max concurrent tasks (default 4)
+#   CAPABILITIES                    — comma-separated preset names (default: agent)
+#   LLM_MODEL             — sub-agent LLM model
+#   LLM_BASE_URL          — OpenAI-compatible base URL
+#   LLM_API_KEY           — API key (falls back to OASIS_OPENAI_API_KEY)
+#   LLM_MAX_TOOL_ITERATIONS   — max tool call cycles (default 25)
+
+services:
+  yggdrasil:
+    build:
+      context: apps/agent-runner
+      dockerfile: yggdrasil.Dockerfile
+    profiles:
+      - agent-pool
+    restart: unless-stopped
+    ports:
+      - "${YGGDRASIL_PORT:-3100}:3100"
+    environment:
+      - PORT=3100
+      - LEASE_TTL_MS=${YGGDRASIL_LEASE_TTL_MS:-60000}
+      - API_KEYS=${YGGDRASIL_API_KEY:-}
+      - NODE_ENV=${NODE_ENV:-production}
+      - MAX_CONCURRENT_TASKS=${YGGDRASIL_MAX_CONCURRENCY:-4}
+      - CAPABILITIES=${CAPABILITIES:-agent}
+      - LLM_MODEL=${LLM_MODEL:-google/gemma-4-26b-a4b-qat}
+      - LLM_BASE_URL=${LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+      - LLM_API_KEY=${LLM_API_KEY:-}
+      - AGENT_MAX_TOOL_ITERATIONS=${AGENT_MAX_TOOL_ITERATIONS:-25}
+      - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
+      - EXPECTED_RUNNER_VERSION=${EXPECTED_RUNNER_VERSION:-0.1.0}
+      # Code capability overrides (use defaults if not set)
+      - CODE_LLM_MODEL=${CODE_LLM_MODEL:-google/gemma-4-26b-a4b-qat}
+      - CODE_LLM_BASE_URL=${CODE_LLM_BASE_URL:-http://host.docker.internal:1234/v1}
+      - CODE_TEMPERATURE=${CODE_TEMPERATURE:-0.2}
+      - CODE_MAX_TOKENS=${CODE_MAX_TOKENS:-8192}
+      # LLM cost is computed server-side by the api-gateway PricingService
+    healthcheck:
+      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3100/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 5s

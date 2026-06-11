@@ -10,6 +10,7 @@ import { TokenUsageDonut } from './TokenUsageDonut';
 import type { ContextBudget } from '@/lib/types';
 import { MobilePairingStatus } from '../mobile/MobilePairingStatus';
 import oasisLogo from '@/assets/oasis-logo.svg';
+import { SessionBudgetPill, type SessionUsage, type SessionBudget } from './SessionBudgetPill';
 
 interface ChatHeaderProps {
   statusText: string;
@@ -42,6 +43,14 @@ interface ChatHeaderProps {
   runningMissionCount?: number;
   /** Click handler — typically scrolls to top of chat so the inline ActiveMissionsBar is visible. */
   onOpenMissions?: () => void;
+  /** Per-session cumulative token / USD usage (for the budget pill). */
+  sessionUsage?: SessionUsage | null;
+  /** Per-session cap config — drives the pill's mode + color. */
+  sessionBudget?: SessionBudget | null;
+  /** 0..1+ fraction of cap consumed; precomputed by the gateway so UI doesn't repeat the math. */
+  sessionBudgetPct?: number;
+  /** Open the Settings panel where the cap can be raised. */
+  onOpenBudget?: () => void;
 }
 
 export function ChatHeader({
@@ -68,6 +77,10 @@ export function ChatHeader({
   missionCount,
   runningMissionCount,
   onOpenMissions,
+  sessionUsage,
+  sessionBudget,
+  sessionBudgetPct,
+  onOpenBudget,
 }: ChatHeaderProps) {
   // Vision button reflects native screen sharing (ComputerUsePanel) OR voice sharing
   const visionActive = cuScreenSharing || isSharing;
@@ -123,6 +136,12 @@ export function ChatHeader({
                 <span className="text-[11px] text-emerald-300 font-medium">{ruleCount} rule{ruleCount === 1 ? '' : 's'}</span>
               </button>
             )}
+            <SessionBudgetPill
+              usage={sessionUsage ?? null}
+              budget={sessionBudget ?? null}
+              pct={sessionBudgetPct ?? 0}
+              onClick={onOpenBudget}
+            />
             {typeof missionCount === 'number' && missionCount > 0 && (
               <button
                 type="button"

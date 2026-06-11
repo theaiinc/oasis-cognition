@@ -16,7 +16,8 @@ class LLMClient:
     Supports:
       - "anthropic" — Anthropic Messages API
       - "openai"    — OpenAI Chat Completions API (also works with any
-                       OpenAI-compatible endpoint via `openai_base_url`)
+                       OpenAI-compatible endpoint via `openai_base_url`, e.g.
+                       DeepSeek, LLM API, vLLM, Groq, etc.)
       - "ollama"    — Ollama native API (no API key needed)
     """
 

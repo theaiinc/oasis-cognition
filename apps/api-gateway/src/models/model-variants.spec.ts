@@ -38,6 +38,18 @@ describe('model-variants', () => {
     it('returns null for unknown model', () => {
       expect(lookupVariant(null, 'nonexistent-model-v9')).toBeNull();
     });
+
+    it('finds e2b (2B gemma-4 testing variant)', () => {
+      const v = lookupVariant('openai', 'google/gemma-4-e2b');
+      expect(v).not.toBeNull();
+      expect(v!.name).toBe('Gemma 4 e2B');
+      expect(v!.parameter_size_b).toBe(2);
+      expect(v!.capabilities.tools).toBe(true);
+      expect(v!.capabilities.thinking).toBe(true);
+      expect(v!.capabilities.vision).toBe(false);
+      expect(v!.billing_class).toBe('free_local');
+      expect(v!.resource_class).toBe('standard');
+    });
   });
 
   describe('inferBillingClass', () => {
@@ -89,9 +101,10 @@ describe('model-variants', () => {
   describe('listVariants', () => {
     it('returns all registered variants', () => {
       const all = listVariants();
-      expect(all.length).toBeGreaterThanOrEqual(6);  // 3 gemma-4 + qwen3 + 2 deepseek + nomic + qwen-vision
+      expect(all.length).toBeGreaterThanOrEqual(7);  // 4 gemma-4 + qwen3 + 2 deepseek + nomic + qwen-vision
       const names = all.map(v => v.name);
       expect(names).toContain('Gemma 4 26B (4B active) QAT');
+      expect(names).toContain('Gemma 4 e2B');
       expect(names).toContain('DeepSeek V4 Flash');
     });
   });

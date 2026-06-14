@@ -19,9 +19,17 @@
  *   4. Bare model prefix
  */
 
-import type { BillingClass, ResourceClass } from '../coordinator/coordinator.types';
+// ── Types (moved from coordinator types to avoid circular dep) ──────────
 
-// ── Types ──────────────────────────────────────────────────────────────
+export type BillingClass =
+  | 'free_local'
+  | 'paid_api'
+  | 'subscription_external'
+  | 'uncertain';
+
+export type ResourceClass = 'light' | 'standard' | 'gpu';
+
+// ── Model variant definitions ─────────────────────────────────────────────
 
 export interface ModelVariant {
   /** The exact model string the LLM API expects. */
@@ -128,6 +136,30 @@ const registry: ModelVariant[] = [
       thinking: true,
       vision: true,
       code: true,
+      embedding: false,
+    },
+
+    billing_class: 'free_local',
+    resource_class: 'standard',
+  },
+
+  // google/gemma-4-e2b — 2B, fast for testing
+  {
+    id: 'google/gemma-4-e2b',
+    name: 'Gemma 4 e2B',
+    family: 'gemma-4',
+    provider: 'openai',
+    source: 'lmstudio',
+
+    parameter_size_b: 2,
+    quantization: 'fp16',
+    context_length: 262_144,
+
+    capabilities: {
+      tools: true,
+      thinking: true,
+      vision: false,
+      code: false,
       embedding: false,
     },
 

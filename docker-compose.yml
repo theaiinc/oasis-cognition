@@ -331,6 +331,7 @@ services:
       - YGGDRASIL_URL=http://yggdrasil:3100
       - YGGDRASIL_API_KEY=${YGGDRASIL_API_KEY:-}
       - YGGDRASIL_MAX_CONCURRENCY=${YGGDRASIL_MAX_CONCURRENCY:-8}
+      - OASIS_AGENT_URL=http://oasis-agent:8020
       - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-true}
       - LANGFUSE_HOST=http://langfuse:3000
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}

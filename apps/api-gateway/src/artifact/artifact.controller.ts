@@ -256,7 +256,7 @@ export class ProjectsController {
   private readonly logger = new Logger(ProjectsController.name);
 
   @Post()
-  async create(@Body() body: { name: string; description?: string }) {
+  async create(@Body() body: { name: string; description?: string; project_path?: string }) {
     if (!body.name) throw new HttpException('name is required', HttpStatus.BAD_REQUEST);
     try {
       const res = await axios.post(`${MEMORY_URL}/internal/memory/projects`, body);

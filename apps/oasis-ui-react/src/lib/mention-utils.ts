@@ -9,7 +9,8 @@ export interface MentionSegment {
   artifactName?: string;
 }
 
-export function parseMessageMentions(text: string): MentionSegment[] {
+export function parseMessageMentions(text: string | null | undefined): MentionSegment[] {
+  if (text == null) return [];
   // regex to match @[Artifact Name](artifact_id)
   const mentionRegex = /@\[([^\]]+)\]\(([a-f0-9-]+)\)/g;
   const segments: MentionSegment[] = [];
@@ -39,7 +40,8 @@ export function parseMessageMentions(text: string): MentionSegment[] {
 /**
  * Extract all mentioned artifact IDs from a message text.
  */
-export function extractMentionedArtifactIds(text: string): string[] {
+export function extractMentionedArtifactIds(text: string | null | undefined): string[] {
+  if (text == null) return [];
   const mentionRegex = /@\[([^\]]+)\]\(([a-f0-9-]+)\)/g;
   const ids: string[] = [];
   let match;
@@ -52,6 +54,7 @@ export function extractMentionedArtifactIds(text: string): string[] {
 /**
  * Strip mention markup for display purposes (shows just the name with @ prefix).
  */
-export function stripMentionMarkup(text: string): string {
+export function stripMentionMarkup(text: string | null | undefined): string {
+  if (text == null) return '';
   return text.replace(/@\[([^\]]+)\]\([a-f0-9-]+\)/g, '@$1');
 }

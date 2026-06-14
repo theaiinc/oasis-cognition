@@ -8,8 +8,8 @@
 
 import axios from 'axios';
 
-const GATEWAY_SELF = process.env.OASIS_GATEWAY_SELF_URL || 'http://localhost:8000';
-const API = `${GATEWAY_SELF}/api/v1/coordinator`;
+const OASIS_AGENT_URL = process.env.OASIS_AGENT_URL || 'http://oasis-agent:8020';
+const API = `${OASIS_AGENT_URL}/api/v1/coordinator`;
 
 export const NATIVE_COORDINATOR_TOOLS = new Set([
   'delegate_tasks',

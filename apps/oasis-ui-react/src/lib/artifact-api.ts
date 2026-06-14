@@ -26,6 +26,7 @@ export interface Project {
   project_id: string;
   name: string;
   description: string;
+  project_path?: string;
   created_at: string;
   updated_at: string;
   artifact_count?: number;
@@ -114,8 +115,8 @@ export async function searchArtifacts(
 
 /* ── Projects ──────────────────────────────────────────────────────────── */
 
-export async function createProject(name: string, description?: string): Promise<Project> {
-  const res = await axios.post(`${API}/projects`, { name, description });
+export async function createProject(name: string, description?: string, projectPath?: string): Promise<Project> {
+  const res = await axios.post(`${API}/projects`, { name, description, ...(projectPath ? { project_path: projectPath } : {}) });
   return res.data.project;
 }
 

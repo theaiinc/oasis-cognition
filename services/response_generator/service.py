@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -1719,7 +1720,78 @@ Think out loud about the user's request:
 
 ═══ EXPECTED OUTPUT ═══
 FREE TEXT reasoning. Be technical, investigative, and tool-oriented.
+
+═══ TOOL USE ═══
+You have access to tools during thinking. Use them to explore the codebase, read files,
+search for patterns, and gather context. Tool calls execute in real-time and results
+feed back into your reasoning. This is a loop — you can call multiple tools sequentially.
+Use tools FIRST, then synthesize your findings into final thoughts.
+You are NOT required to use tools — only use them when you need more information.
 """
+
+THINKING_TOOL_DEFINITIONS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file from the project workspace. Use for reading small files or specific sections.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file"},
+                    "start_line": {"type": "integer", "description": "1-based start line (optional)"},
+                    "end_line": {"type": "integer", "description": "1-based end line inclusive (optional)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search for a regex pattern across files in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
+                    "path": {"type": "string", "description": "Path to search in (default: /workspace)"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List files and directories in a given path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path to list"},
+                    "recursive": {"type": "boolean", "description": "Set to true for recursive listing (max 4 levels)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Find files by name or glob pattern (e.g. '*.tsx', '*Controller*').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "File name or glob pattern"},
+                    "path": {"type": "string", "description": "Directory to search in"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+]
 
 DECISION_LAYER_PROMPT = """\
 You are an advanced decision-making agent. Your role is to decide the next step for a coding agent.
@@ -2016,7 +2088,7 @@ class ResponseGeneratorService:
         """Attempt to repair malformed JSON via LLM."""
         logger.info("Attempting LLM JSON repair for %d chars", len(malformed_json))
         try:
-            repaired = self._tool_plan_llm.chat(
+            repaired = await self._tool_plan_llm.chat_async(
                 system=JSON_REPAIR_PROMPT,
                 user_message=f"REPAIR THIS JSON:\n{malformed_json}",
             )
@@ -2118,7 +2190,8 @@ class ResponseGeneratorService:
             # Use dedicated CU LLM client when available and this is a CU call
             llm_for_vision = self._cu_llm if (self._cu_llm and system_override) else self._llm
             logger.info("Vision model selected: %s (client: %s)", vision_model, "cu_llm" if llm_for_vision is self._cu_llm else "default")
-            text = llm_for_vision.chat_with_images(
+            text = await asyncio.to_thread(
+                llm_for_vision.chat_with_images,
                 system=vision_system,
                 user_message=user_message,
                 images=[screen_image],
@@ -2204,7 +2277,7 @@ class ResponseGeneratorService:
         if model_override:
             chat_kwargs["model"] = model_override
             logger.info("Using model override for chat: %s", model_override)
-        text = llm_for_chat.chat(**chat_kwargs)
+        text = await llm_for_chat.chat_async(**chat_kwargs)
         return text
 
     def stream_casual_response(
@@ -2329,7 +2402,8 @@ class ResponseGeneratorService:
                 "\n- Do NOT describe the screen in generic terms — describe the SPECIFIC content."
                 "\n- Keep your response concise and relevant."
             )
-            text = self._llm.chat_with_images(
+            text = await asyncio.to_thread(
+                self._llm.chat_with_images,
                 system=vision_system,
                 user_message=vision_user_msg,
                 images=[screen_image],
@@ -2370,7 +2444,7 @@ class ResponseGeneratorService:
             self._last_context_budget = budget.as_dict()
             # Generative intents (create, implement) need more output tokens
             output_tokens = 2048 if is_generative else 512
-            text = self._llm.chat(
+            text = await self._llm.chat_async(
                 system=full_system,
                 user_message=labeled_input,
                 max_tokens=output_tokens,
@@ -2445,16 +2519,79 @@ class ResponseGeneratorService:
         ):
             yield chunk
 
+    async def stream_format_response_structured(
+        self,
+        decision: DecisionTree,
+        context: dict | None = None,
+        user_message: str | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+    ):
+        """Like ``stream_format_response`` but yields NDJSON lines with type
+        discrimination so the gateway can forward thinking (reasoning) chunks
+        to the frontend separately from visible content.
+
+        Yields ``{"type": "reasoning", "text": "..."}`` and
+        ``{"type": "content", "text": "..."}`` as NDJSON lines (one per chunk).
+        """
+        logger.info("Structured streaming for conclusion: %s", decision.conclusion)
+        memory_stale_hint = (context or {}).get("memory_stale_hint", "")
+        payload = {
+            "conclusion": decision.conclusion,
+            "confidence": decision.confidence,
+            "reasoning_trace": decision.reasoning_trace,
+            "hypotheses": [
+                {
+                    "title": h["title"],
+                    "score": h.get("score", 0),
+                    "eliminated": h.get("eliminated", False),
+                }
+                for h in decision.hypotheses
+            ],
+        }
+
+        intent = (context or {}).get("intent", "diagnose")
+        is_generative = intent in ("create", "implement", "explain")
+        parts = []
+        if memory_stale_hint:
+            parts.append(f"Note: {memory_stale_hint}\n")
+        if user_message:
+            parts.append(f"Message: {user_message}\n")
+        if is_generative:
+            parts.append(
+                "Your reasoning (internal, do NOT show in your reply):\n"
+                + json.dumps(payload)
+                + "\n\nThe user is asking you to CREATE or PRODUCE content (a plan, document, proposal, spec, etc.). "
+                "Write a thorough, detailed, well-structured response. Use headings, bullet points, and sections as appropriate. "
+                "Do NOT just summarize — actually produce the requested content in full. "
+                "Reply in second person (you). Do not say \"the user\"."
+            )
+        else:
+            parts.append(
+                "Your reasoning (internal, do NOT show in your reply):\n"
+                + json.dumps(payload)
+                + "\n\nReply concisely in second person (you). Do not say \"the user\"."
+            )
+        labeled_input = "\n".join(parts)
+        output_tokens = 2048 if is_generative else 512
+
+        async for item in self._llm.stream_chat_structured_async(
+            system=SYSTEM_PROMPT + _load_project_context(),
+            user_message=labeled_input,
+            max_tokens=output_tokens,
+            history=chat_history,
+        ):
+            yield json.dumps(item, ensure_ascii=False) + "\n"
+
     async def cleanup_transcript(self, raw_text: str) -> str:
         """Clean up ASR transcript text for downstream LLM consumption."""
         raw = (raw_text or "").strip()
         if not raw:
             return ""
         try:
-            cleaned = self._llm.chat(
+            cleaned = (await self._llm.chat_async(
                 system=TRANSCRIPT_CLEANUP_SYSTEM_PROMPT,
                 user_message=f"TRANSCRIPT TO CLEAN:\n{raw}",
-            ).strip()
+            )).strip()
             # Strip common LLM commentary prefixes (covers many variations)
             import re
 
@@ -2580,7 +2717,7 @@ class ResponseGeneratorService:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 parsed = extract_json(raw)
                 if not isinstance(parsed, dict):
                     raise ValueError(
@@ -2707,7 +2844,7 @@ class ResponseGeneratorService:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 try:
                     parsed = extract_json(raw)
                 except (ValueError, json.JSONDecodeError):
@@ -2801,7 +2938,7 @@ class ResponseGeneratorService:
                 )
             user_input = user_input_base + retry_suffix
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 try:
                     parsed = extract_json(raw)
                 except (ValueError, json.JSONDecodeError) as je:
@@ -2855,6 +2992,7 @@ class ResponseGeneratorService:
         user_message: str,
         context: dict[str, Any] | None = None,
         memory_context: list[dict[str, Any]] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Choose the next macro-step: ACT, NEED_MORE_INFO, or ANSWER_DIRECTLY."""
         system = DECISION_LAYER_PROMPT + _load_project_context()
@@ -2873,12 +3011,19 @@ class ResponseGeneratorService:
                 f"Memory/Knowledge Context: {json.dumps(memory_context[:5])}\n\n"
             )
 
+        if chat_history:
+            # Include recent chat history so the decision has context of the conversation
+            history_parts = []
+            for m in chat_history[-6:]:  # last 6 turns for context
+                history_parts.append(f"{m['role']}: {m['content']}")
+            user_input += f"Conversation History:\n" + "\n".join(history_parts) + "\n\n"
+
         user_input += f"Generated Thoughts:\n{thought_str}\n\nDecide the next step."
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 parsed = extract_json(raw)
 
                 decision = str(parsed.get("decision", "ACT")).upper()
@@ -2946,7 +3091,7 @@ class ResponseGeneratorService:
             f"PROPOSED ANSWER:\n{proposed_answer[:500]}"
         )
         try:
-            parsed = self._llm.chat_json(system=system, user_message=user_msg, max_tokens=100)
+            parsed = await self._llm.chat_json_async(system=system, user_message=user_msg, max_tokens=100)
             return {
                 "is_punt": bool(parsed.get("is_punt", False)),
                 "reason": str(parsed.get("reason", "")),
@@ -2964,15 +3109,14 @@ class ResponseGeneratorService:
         observer_feedback: str | None = None,
     ) -> str:
         """Generate a free-form reasoning thought trace (Free Thoughts)."""
-        # Gather from the stream to ensure consistency
         full_text = ""
-        for chunk in self.stream_free_thoughts(
+        async for chunk in self._stream_free_thoughts_async(
             user_message, context, chat_history, tool_results, observer_feedback
         ):
             full_text += chunk
         return full_text
 
-    def stream_free_thoughts(
+    async def _stream_free_thoughts_async(
         self,
         user_message: str,
         context: dict[str, Any] | None = None,
@@ -3000,10 +3144,132 @@ class ResponseGeneratorService:
         # Cap thoughts at 500 tokens to prevent hallucination/repetition loops.
         # The prompt says "MAX 3 THOUGHTS" but without a hard token cap the LLM
         # can ramble or repeat indefinitely.
-        yield from self._tool_plan_llm.stream_chat(
+        async for chunk in self._tool_plan_llm.stream_chat_async(
             system=system, user_message=user_input, history=chat_history,
             max_tokens=500,
-        )
+        ):
+            yield chunk
+
+    async def _stream_free_thoughts_structured_async(
+        self,
+        user_message: str,
+        context: dict[str, Any] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+        tool_results: list[dict[str, Any]] | None = None,
+        observer_feedback: str | None = None,
+    ):
+        """Stream a structured reasoning trace with tool call support (NDJSON).
+
+        Yields structured dicts:
+        - ``{"type": "reasoning", "text": "..."}`` — reasoning/thinking tokens
+        - ``{"type": "tool_call", "id": "...", "function": {"name": "...", "arguments": "..."}}``
+          — tool call requests (from either native API or text-parsed)
+        - ``{"type": "content", "text": "..."}`` — visible content
+        - ``{"type": "done", "text": "..."}`` — final accumulated text when streaming completes
+
+        The caller (gateway) is expected to detect ``tool_call`` items, execute
+        the tool, and re-invoke this method with the results appended via
+        ``tool_results``. This creates a loop: LLM thinks → calls tools → gets
+        results → thinks more → calls more tools → final synthesized reasoning.
+
+        Tool calls can come from two sources:
+        1. Native OpenAI API ``delta.tool_calls`` (models that support it)
+        2. Plain text patterns like ``ACTION: read_file`` or ``read_file(/path)``
+           (fallback for local models like Gemma that emit tools as text)
+        """
+        system = REASONING_LAYER_PROMPT + _load_project_context()
+        user_input = f"User asked: {user_message}"
+        if context:
+            user_input += f"\nContext: {json.dumps(context)}"
+
+        if tool_results:
+            results_text = "\n".join(
+                f"- Tool: {r.get('tool')}, Success: {r.get('success')}, Output: {str(r.get('output'))[:500]}"
+                for r in tool_results
+            )
+            user_input += f"\n\nRECENT TOOL RESULTS:\n{results_text}"
+
+        if observer_feedback:
+            user_input += f"\n\nOBSERVER FEEDBACK:\n{observer_feedback}"
+
+        logger.info("Streaming structured thoughts with tools for: %s", user_message[:80])
+
+        full_text = ""
+        async for item in self._tool_plan_llm.stream_chat_structured_async(
+            system=system,
+            user_message=user_input,
+            history=chat_history,
+            max_tokens=2000,
+            tools=THINKING_TOOL_DEFINITIONS,
+        ):
+            if item.get("type") == "tool_call":
+                yield item  # pass through to gateway for execution
+            elif item.get("type") in ("reasoning", "content"):
+                full_text += item.get("text", "")
+
+        # ── Text-based tool call fallback ──
+        # For models like Gemma that don't support native tool calls,
+        # scan the accumulated text for tool call patterns.
+        # Patterns: "TOOL: read_file(...)" or "ACTION: grep" or "read_file(/path)"
+        text_tool_calls = self._extract_text_tool_calls(full_text)
+
+        for tc in text_tool_calls:
+            # Mark as text-detected so the gateway knows it's not native API
+            yield {"type": "tool_call", "id": tc["id"], "function": tc["function"], "_source": "text"}
+            # Pause here — the gateway will re-invoke with tool results
+
+        yield {"type": "done", "text": full_text}
+
+    _TOOL_CALL_PATTERNS: list[tuple[str, str]] = [
+        # ACTION: tool_name / PARAM_KEY: value
+        (r'ACTION:\s*(\w+)', 'flat'),
+        # tool_name(param1=value1, param2=value2)
+        (r'(read_file|grep|list_dir|find_files|search_artifacts|web_search)\s*\(([^)]*)\)', 'inline'),
+    ]
+
+    def _extract_text_tool_calls(self, text: str) -> list[dict]:
+        """Scan free-form text for tool call patterns.
+        
+        Returns a list of dicts like ``{"id": "...", "function": {"name": "...", "arguments": "..."}}``.
+        """
+        import uuid
+        calls: list[dict] = []
+
+        # Pattern 1: Flat key-value format (like the tool plan prompt)
+        # ACTION: read_file / PARAM_PATH: /foo
+        lines = text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            action_match = re.match(r'^ACTION:\s*(\w+)$', line, re.IGNORECASE)
+            if action_match and action_match.group(1).lower() in ('read_file', 'grep', 'list_dir', 'find_files', 'search_artifacts', 'web_search'):
+                tool_name = action_match.group(1).lower()
+                args: dict[str, Any] = {}
+                i += 1
+                while i < len(lines):
+                    param_line = lines[i].strip()
+                    param_match = re.match(r'^PARAM_(\w+):\s*(.*)$', param_line, re.IGNORECASE)
+                    if not param_match:
+                        break
+                    key = param_match.group(1).lower()
+                    val = param_match.group(2).strip()
+                    if val.lower() in ('true', 'false'):
+                        val = val.lower() == 'true'
+                    elif val.isdigit():
+                        val = int(val)
+                    args[key] = val
+                    i += 1
+                calls.append({
+                    "id": f"text_tc_{uuid.uuid4().hex[:8]}",
+                    "function": {"name": tool_name, "arguments": json.dumps(args)},
+                })
+                continue
+            i += 1
+
+        if calls:
+            logger.info("Extracted %d text-based tool call(s) from thinking: %s", len(calls), [c["function"]["name"] for c in calls])
+
+        return calls
 
     def _build_tool_plan_combined_message(
         self,
@@ -3533,7 +3799,7 @@ class ResponseGeneratorService:
         last_error: Exception | None = None
         for attempt in range(1, max_retries + 1):
             try:
-                raw = self._tool_plan_llm.chat(
+                raw = await self._tool_plan_llm.chat_async(
                     system=system, user_message=combined, history=chat_history
                 )
                 return await self.parse_tool_plan_raw(raw)
@@ -3644,7 +3910,7 @@ class ResponseGeneratorService:
             parts.append(f"\n--- Tool #{i}: {r.get('tool', '?')} [{status}] ---")
             parts.append(r.get("output", "(no output)")[:3000])
 
-        text = self._llm.chat(system=system, user_message="\n".join(parts))
+        text = await self._llm.chat_async(system=system, user_message="\n".join(parts))
         return text
 
     async def summarize_history(self, messages: list[dict[str, str]]) -> str:
@@ -3662,4 +3928,4 @@ class ResponseGeneratorService:
             content = (m.get("content", "") or "")[:2000]
             parts.append(f"{role.upper()}: {content}")
         user_msg = "\n\n".join(parts)
-        return self._llm.chat(system=system, user_message=user_msg, max_tokens=512)
+        return await self._llm.chat_async(system=system, user_message=user_msg, max_tokens=512)

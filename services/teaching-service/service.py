@@ -101,7 +101,7 @@ class TeachingService:
         logger.info("Extracting assertion from: %s", raw_input[:100])
 
         try:
-            parsed = self._llm.chat_json(system=EXTRACT_PROMPT, user_message=raw_input)
+            parsed = await self._llm.chat_json_async(system=EXTRACT_PROMPT, user_message=raw_input)
         except Exception as e:
             logger.error("Failed to extract assertion: %s", e)
             return TeachingAssertion(assertion=raw_input, category="fact", domain="general"), raw_input
@@ -170,7 +170,7 @@ class TeachingService:
             user_msg = f"Validate: {assertion.assertion}"
             if supporting:
                 user_msg += f"\n\nContext to apply:\n{supporting}"
-            parsed = self._llm.chat_json(system=prompt, user_message=user_msg)
+            parsed = await self._llm.chat_json_async(system=prompt, user_message=user_msg)
         except Exception as e:
             logger.error("Validation LLM call failed: %s", e)
             return ValidationResult(

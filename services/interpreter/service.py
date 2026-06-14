@@ -144,7 +144,7 @@ class InterpreterService:
                 )
 
         try:
-            parsed = self._llm.chat_json(system=SYSTEM_PROMPT, user_message=user_message)
+            parsed = await self._llm.chat_json_async(system=SYSTEM_PROMPT, user_message=user_message)
         except Exception as e:
             # If the LLM returns non-JSON or parse fails, fall back to a safe default
             # instead of bubbling a 500 to the rest of the pipeline.

@@ -103,7 +103,7 @@ def test_chat_routes_to_ollama(mock_call, ollama_settings):
     client = LLMClient(ollama_settings)
     result = client.chat(system="sys", user_message="hello")
     assert result == "ollama response"
-    mock_call.assert_called_once_with("sys", "hello", "llama3", 1024, None)
+    mock_call.assert_called_once_with("sys", "hello", "llama3", 8192, None)
 
 
 @patch("packages.shared_utils.llm_client.LLMClient._call_openai", return_value="local model response")
@@ -111,7 +111,7 @@ def test_chat_with_custom_base_url(mock_call, openai_custom_base_settings):
     client = LLMClient(openai_custom_base_settings)
     result = client.chat(system="sys", user_message="hello")
     assert result == "local model response"
-    mock_call.assert_called_once_with("sys", "hello", "llama3", 1024, None)
+    mock_call.assert_called_once_with("sys", "hello", "llama3", 8192, None)
 
 
 def test_openai_custom_base_url_stored(openai_custom_base_settings):
@@ -124,3 +124,105 @@ def test_ollama_custom_host(ollama_custom_host_settings):
     client = LLMClient(ollama_custom_host_settings)
     assert client._settings.ollama_host == "http://gpu-server:11434"
     assert client._settings.llm_model == "mistral"
+
+
+# ── Async cancellable method tests ──────────────────────────────────────
+
+@pytest.mark.asyncio
+@patch("packages.shared_utils.llm_client.LLMClient._call_openai_async", return_value="async openai response")
+async def test_chat_async_routes_to_openai(mock_call, openai_settings):
+    client = LLMClient(openai_settings)
+    result = await client.chat_async(system="sys", user_message="hello")
+    assert result == "async openai response"
+    mock_call.assert_called_once_with("sys", "hello", "gpt-4o", 8192, None)
+
+
+@pytest.mark.asyncio
+@patch("packages.shared_utils.llm_client.LLMClient._call_ollama_async", return_value="async ollama response")
+async def test_chat_async_routes_to_ollama(mock_call, ollama_settings):
+    client = LLMClient(ollama_settings)
+    result = await client.chat_async(system="sys", user_message="hello")
+    assert result == "async ollama response"
+    mock_call.assert_called_once_with("sys", "hello", "llama3", 8192, None)
+
+
+@pytest.mark.asyncio
+@patch("packages.shared_utils.llm_client.LLMClient._call_anthropic_async", return_value="async claude response")
+async def test_chat_async_routes_to_anthropic(mock_call, anthropic_settings):
+    client = LLMClient(anthropic_settings)
+    result = await client.chat_async(system="sys", user_message="hello")
+    assert result == "async claude response"
+    mock_call.assert_called_once_with("sys", "hello", "claude-sonnet-4-20250514", 8192, None)
+
+
+@pytest.mark.asyncio
+@patch("packages.shared_utils.llm_client.LLMClient.chat_async", return_value='{"key": "value"}')
+async def test_chat_json_async(mock_chat, openai_settings):
+    client = LLMClient(openai_settings)
+    result = await client.chat_json_async(system="sys", user_message="hello")
+    assert result == {"key": "value"}
+
+
+@pytest.mark.asyncio
+async def test_chat_async_is_coroutine(openai_settings):
+    """Verify chat_async returns a real coroutine (not thread-pool wrapper)."""
+    import inspect
+    client = LLMClient(openai_settings)
+    assert inspect.iscoroutinefunction(client.chat_async)
+
+
+@pytest.mark.asyncio
+async def test_chat_json_async_is_coroutine(openai_settings):
+    """Verify chat_json_async returns a real coroutine."""
+    import inspect
+    client = LLMClient(openai_settings)
+    assert inspect.iscoroutinefunction(client.chat_json_async)
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_async_is_asyncgen(openai_settings):
+    """Verify stream_chat_async is an async generator function (cancellable)."""
+    import inspect
+    client = LLMClient(openai_settings)
+    assert inspect.isasyncgenfunction(client.stream_chat_async)
+
+
+@pytest.mark.asyncio
+async def test_stream_chat_structured_async_is_asyncgen(openai_settings):
+    """Verify stream_chat_structured_async is an async generator function."""
+    import inspect
+    client = LLMClient(openai_settings)
+    assert inspect.isasyncgenfunction(client.stream_chat_structured_async)
+
+
+@pytest.mark.asyncio
+@patch("packages.shared_utils.llm_client.LLMClient._stream_openai_async")
+async def test_stream_chat_async_routes_to_openai(mock_stream, openai_settings):
+    """Verify stream_chat_async yields from the right provider method."""
+    async def _mock_gen(*args, **kwargs):
+        yield "chunk1"
+        yield "chunk2"
+    mock_stream.return_value = _mock_gen()
+    client = LLMClient(openai_settings)
+    chunks = []
+    async for chunk in client.stream_chat_async(system="sys", user_message="hello"):
+        chunks.append(chunk)
+    assert chunks == ["chunk1", "chunk2"]
+
+
+@pytest.mark.asyncio
+@patch("packages.shared_utils.llm_client.LLMClient._stream_openai_structured_async")
+async def test_stream_chat_structured_async_routes_to_openai(mock_stream, openai_settings):
+    """Verify stream_chat_structured_async yields structured items."""
+    async def _mock_gen(*args, **kwargs):
+        yield {"type": "reasoning", "text": "thinking"}
+        yield {"type": "content", "text": "response"}
+    mock_stream.return_value = _mock_gen()
+    client = LLMClient(openai_settings)
+    items = []
+    async for item in client.stream_chat_structured_async(system="sys", user_message="hello"):
+        items.append(item)
+    assert items == [
+        {"type": "reasoning", "text": "thinking"},
+        {"type": "content", "text": "response"},
+    ]

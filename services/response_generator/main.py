@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import os
@@ -160,6 +161,24 @@ async def generate_response_stream(req: GenerateRequest):
         for chunk in generator.stream_format_response(decision, context=req.context, user_message=req.user_message, chat_history=req.chat_history):
             yield chunk
     return StreamingResponse(generate(), media_type="text/plain")
+
+
+@app.post("/internal/response/generate-stream-structured")
+async def generate_response_stream_structured(req: GenerateRequest):
+    """Like ``/generate-stream`` but yields NDJSON lines with ``type``
+    discrimination so the gateway can forward reasoning (thinking) tokens
+    to the frontend separately from visible content.
+
+    Each line is JSON: ``{"type": "reasoning", "text": "..."}`` or
+    ``{"type": "content", "text": "..."}``.
+    """
+    decision = DecisionTree(**req.decision_tree)
+    async def generate():
+        async for line in generator.stream_format_response_structured(
+            decision, context=req.context, user_message=req.user_message, chat_history=req.chat_history,
+        ):
+            yield line
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @app.post("/internal/response/chat")
@@ -349,6 +368,7 @@ class DecisionRequest(BaseModel):
     user_message: str
     context: dict[str, Any] | None = None
     memory_context: list[dict[str, Any]] | None = None
+    chat_history: list[dict[str, str]] | None = None
 
 
 @app.post("/internal/decision")
@@ -359,6 +379,7 @@ async def make_decision(req: DecisionRequest):
         user_message=req.user_message,
         context=req.context,
         memory_context=req.memory_context,
+        chat_history=req.chat_history,
     )
 
 
@@ -427,8 +448,8 @@ from fastapi.responses import StreamingResponse
 @app.post("/internal/thought/reason-stream")
 async def reasoning_layer_stream(req: ThoughtReasonRequest):
     """Stream a free-form reasoning thought trace (Free Thoughts)."""
-    def generate():
-        for chunk in generator.stream_free_thoughts(
+    async def generate():
+        async for chunk in generator._stream_free_thoughts_async(
             req.user_message,
             context=req.context,
             chat_history=req.chat_history,
@@ -438,6 +459,28 @@ async def reasoning_layer_stream(req: ThoughtReasonRequest):
             yield chunk
 
     return StreamingResponse(generate(), media_type="text/plain")
+
+
+@app.post("/internal/thought/reason-stream-structured")
+async def reasoning_layer_stream_structured(req: ThoughtReasonRequest):
+    """Stream a structured reasoning thought trace with tool call support (NDJSON).
+
+    Each line is JSON with a ``type`` field: ``"reasoning"``, ``"tool_call"``,
+    ``"content"``, or ``"done"``. When ``type`` is ``"tool_call"``, the gateway
+    should execute the requested tool and re-invoke this endpoint with the
+    results appended to ``tool_results``.
+    """
+    async def generate():
+        async for item in generator._stream_free_thoughts_structured_async(
+            req.user_message,
+            context=req.context,
+            chat_history=req.chat_history,
+            tool_results=req.tool_results,
+            observer_feedback=req.observer_feedback,
+        ):
+            yield json.dumps(item) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @app.post("/internal/thought/reason")

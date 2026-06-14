@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog } from 'lucide-react';
+import { Terminal, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog, FolderOpen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Toaster } from "@/components/ui/toaster";
@@ -30,7 +30,7 @@ import { ActiveMissionsBar, type MissionRow } from '@/components/chat/ActiveMiss
 import { EmptyChatHints } from '@/components/chat/EmptyChatHints';
 import type { SessionUsage as BudgetUsage, SessionBudget } from '@/components/chat/SessionBudgetPill';
 import { GraphPanel } from '@/components/graph';
-import { SettingsPanel, HistoryPanel, ArtifactsPanel } from '@/components/panels';
+import { SettingsPanel, HistoryPanel, ArtifactsPanel, ProjectsPanel } from '@/components/panels';
 import { AgentsPanel } from '@/components/agents/AgentsPanel';
 import { RolePicker } from '@/components/chat/RolePicker';
 import { WorkflowsPanel } from '@/components/workflows/WorkflowsPanel';
@@ -67,6 +67,7 @@ export default function App() {
     return id;
   });
   const [timelineByClientMessageId, setTimelineByClientMessageId] = useState<Record<string, TimelineEvent[]>>({});
+  const [liveReasoningByClientId, setLiveReasoningByClientId] = useState<Record<string, string>>({});
   const [selectedTimelineMessageId, setSelectedTimelineMessageId] = useState<string | null>(null);
   const [activeClientMessageId, setActiveClientMessageId] = useState<string | null>(null);
   const [voiceIdModalOpen, setVoiceIdModalOpen] = useState(false);
@@ -81,6 +82,7 @@ export default function App() {
   const [showWorkflowsPanel, setShowWorkflowsPanel] = useState(false);
   const [showMobilePairingPanel, setShowMobilePairingPanel] = useState(false);
   const [showArtifactsPanel, setShowArtifactsPanel] = useState(false);
+  const [showProjectsPanel, setShowProjectsPanel] = useState(false);
   // Missions visible inline in the chat — not in a separate panel. The map is the source of
   // truth; the SSE handlers below mutate it as Mission* events arrive.
   const [missionsById, setMissionsById] = useState<Record<string, MissionRow>>({});
@@ -116,6 +118,41 @@ export default function App() {
   }, []);
   const [contextBudget, setContextBudget] = useState<ContextBudget | null>(null);
   const [activeProjectName, setActiveProjectName] = useState<string | undefined>(undefined);
+
+  // ── Agent completion notifications ──
+  const [notifications, setNotifications] = useState<string[]>([]);
+  const originalTitleRef = useRef<string>('');
+  const flashTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Tracks which client_message_ids have received a ThinkingChunkGenerated
+  // event.  When absent, the model doesn't expose separate reasoning tokens
+  // and we show content text in the overlay instead of a blank "Working…".
+  const seenThinkingRef = useRef<Set<string>>(new Set());
+
+  /** Flash the document title between original and a badge so the user
+   *  notices even if they're on another tab.  Auto-restores after 4s. */
+  const flashTitle = useCallback((badge: string) => {
+    if (!originalTitleRef.current) originalTitleRef.current = document.title;
+    if (flashTimerRef.current) {
+      clearInterval(flashTimerRef.current);
+      flashTimerRef.current = null;
+    }
+    let toggle = false;
+    flashTimerRef.current = setInterval(() => {
+      document.title = toggle ? `🔔 ${badge}` : originalTitleRef.current;
+      toggle = !toggle;
+    }, 1200);
+    setTimeout(() => {
+      if (flashTimerRef.current) {
+        clearInterval(flashTimerRef.current);
+        flashTimerRef.current = null;
+      }
+      document.title = originalTitleRef.current;
+    }, 4000);
+  }, []);
+  /** Stable ref so the SSE effect can call flashTitle without being in its dep array. */
+  const flashTitleRef = useRef(flashTitle);
+  flashTitleRef.current = flashTitle;
 
   // Fetch active project name whenever activeProjectId changes
   useEffect(() => {
@@ -165,6 +202,62 @@ export default function App() {
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Auto-load messages on startup ──
+  // When the user refreshes, restore the chat history so the session picks
+  // up where they left off.  If the last interaction was in-flight we also
+  // persist & restore the client message id so SSE backlog events
+  // (ResponseChunkGenerated, ThinkingChunkGenerated etc.) find the correct
+  // message rows instead of duplicating.
+  useEffect(() => {
+    const sid = sessionStorage.getItem('oasis-session-id');
+    if (!sid) return;
+
+    const storedClientId = sessionStorage.getItem('oasis-last-client-msg');
+
+    axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, { params: { session_id: sid }, timeout: 8000 })
+      .then(res => {
+        const raw = res.data.messages || [];
+        const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
+          id: '',
+          text: m.content,
+          sender: m.role === 'user' ? 'user' : 'assistant',
+          timestamp: new Date(m.timestamp),
+        }));
+
+        // If the last interaction was in-flight, reconstruct the last user
+        // (and possibly assistant) row with SSE-compatible IDs so backlog
+        // events find the matching rows instead of duplicating.
+        if (storedClientId && msgs.length >= 1) {
+          const last = msgs[msgs.length - 1];
+          if (last.sender === 'user') {
+            // In-flight: user message has no reply yet
+            msgs[msgs.length - 1] = { ...last, id: storedClientId };
+          } else {
+            // Completed pair (last msg is assistant)
+            if (msgs.length >= 2 && msgs[msgs.length - 2]?.sender === 'user') {
+              msgs[msgs.length - 2] = { ...msgs[msgs.length - 2], id: storedClientId };
+              msgs[msgs.length - 1] = { ...last, id: assistantMessageId(storedClientId) };
+            }
+            sessionStorage.removeItem('oasis-last-client-msg');
+          }
+        }
+
+        // Fallback: stable hist-* IDs for everything without an assigned id
+        setMessages(msgs.map((m, i) => (m.id ? m : { ...m, id: `hist-${sid}-${i}` })));
+
+        // If the last message is user with no assistant reply →
+        // an interaction was in-flight when the page was closed/refreshed.
+        if (msgs.length > 0 && msgs[msgs.length - 1].sender === 'user') {
+          // Restore the active client message id so ThinkingOverlay shows progress
+          if (storedClientId) setActiveClientMessageId(storedClientId);
+          setIsThinking(true);
+        }
+      })
+      .catch(() => {
+        // No history for this session yet — start fresh
+      });
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const quickUpload = useQuickUpload();
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -172,6 +265,51 @@ export default function App() {
   const isSendingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const { toast } = useToast();
+
+  // Auto-request notification permission on mount so the browser prompt
+  // fires from a user-gesture context (the first click / interaction).
+  useEffect(() => {
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission === 'granted' || Notification.permission === 'denied') return;
+    const timer = setTimeout(() => { void Notification.requestPermission(); }, 2000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  /** Fire an OS-level notification — uses Electron IPC in desktop, Web Notification API in browser. */
+  const fireOsNotification = useCallback((msg: string) => {
+    try {
+      // Electron desktop shell
+      const w = window as unknown as { oasis?: { isDesktop?: boolean; notify?: (o: { title: string; body: string; silent?: boolean }) => void } };
+      if (w.oasis?.isDesktop && w.oasis.notify) {
+        w.oasis.notify({ title: 'Oasis', body: msg });
+        return;
+      }
+      // Browser: use the Web Notification API
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        new Notification('Oasis', { body: msg });
+      }
+    } catch { /* notifications not supported */ }
+  }, []);
+
+  /** Push a notification, fire a toast, flash the document title, and send an OS notification.
+   *  Used at every agent completion boundary so the user never misses
+   *  a response even when looking at another tab. */
+  const notifyAgentEvent = useCallback((msg: string, opts?: { variant?: 'default' | 'destructive' }) => {
+    setNotifications(prev => [msg, ...prev].slice(0, 20));
+    flashTitleRef.current(msg.length > 22 ? msg.slice(0, 20) + '…' : msg);
+    toast({ title: msg, variant: opts?.variant || 'default' });
+    // Fire OS notification on the next microtask so it doesn't block rendering
+    queueMicrotask(() => fireOsNotification(msg));
+  }, [toast, fireOsNotification]);
+  /** Stable ref so the SSE effect can call notifyAgentEvent without being in its dep array. */
+  const notifyRef = useRef(notifyAgentEvent);
+  notifyRef.current = notifyAgentEvent;
+  /** Tracks client_message_ids we've already notified for (SSE backlog replay suppression) */
+  const notifiedIdsRef = useRef<Set<string>>(new Set());
+
+  const dismissNotification = useCallback((idx: number) => {
+    setNotifications(prev => prev.filter((_, i) => i !== idx));
+  }, []);
 
   const addMessage = useCallback((text: string, sender: Message['sender'], confidence?: string, isTranscript?: boolean, isQueued?: boolean, id?: string, replyTo?: { messageId: string; preview: string }) => {
     setMessages(prev => [...prev, {
@@ -417,6 +555,7 @@ export default function App() {
     isSendingRef.current = false;
     queueRef.current = [];
     setQueuedMessages([]);
+    sessionStorage.removeItem('oasis-last-client-msg');
     addMessage('Pipeline stopped.', 'system');
   }, [addMessage]);
 
@@ -577,7 +716,7 @@ export default function App() {
     axios.get(`${OASIS_BASE_URL}/api/v1/project/config`, { timeout: 5000 })
       .then(res => { const d = res.data; if (d?.success && d.config) setProjectConfig({ configured: true, project_path: d.config.project_path, project_name: d.config.project_name, project_type: d.config.project_type, git_url: d.config.git_url, last_indexed: d.config.last_indexed, context_summary: d.config.context_summary, tech_stack: d.config.tech_stack, frameworks: d.config.frameworks }); })
       .catch(() => { /* dev-agent not running */ });
-  }, []);
+  }, [activeProjectId]);
 
   // ── CU session progress poller (lives at App level so it survives panel close) ──
   const cuPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -680,6 +819,35 @@ export default function App() {
             void reloadBudget(textSessionId);
           }
         }
+
+        // Terminal events clear the thinking state — important when the
+        // pipeline finished while the page was refreshing (SSE backlog replay).
+        if (
+          data.event_type === 'ResponseGenerated' ||
+          data.event_type === 'ResponseFailed' ||
+          data.event_type === 'InteractionFailed' ||
+          data.event_type === 'InteractionAborted'
+        ) {
+          setIsThinking(false);
+          sessionStorage.removeItem('oasis-last-client-msg');
+          // Clear reasoning overlay + tracking ref once the response is done
+          const clientMsgId = (data.payload as any)?.client_message_id;
+          if (clientMsgId) {
+            seenThinkingRef.current.delete(clientMsgId);
+            setLiveReasoningByClientId(prev => {
+              if (prev[clientMsgId]) { const n = { ...prev }; delete n[clientMsgId]; return n; }
+              return prev;
+            });
+          }
+          // Notify the user when a chat response completes (or fails).
+          // Suppress backlog replay duplicates by tracking notified client_message_ids.
+          if (data.event_type === 'ResponseGenerated' && clientMsgId && !notifiedIdsRef.current.has(clientMsgId)) {
+            notifiedIdsRef.current.add(clientMsgId);
+            notifyRef.current('Agent finished responding.');
+          } else if (data.event_type === 'ResponseFailed') {
+            notifyRef.current('Agent response failed.', { variant: 'destructive' });
+          }
+        }
         if (data.event_type === 'MissionRunStarted') {
           const p = data.payload as Record<string, any>;
           const mid = p?.mission_id;
@@ -766,6 +934,12 @@ export default function App() {
               : (p.result ? String(p.result).replace(/\s+/g, ' ').slice(0, 200) : 'Run completed.');
             try { w.oasis.notify({ title, body: bodyText }); } catch { /* notifications not supported */ }
           }
+          // Toast + title flash so the user notices even in the browser.
+          if (p.error) {
+            notifyRef.current(`Mission failed: ${(p.goal || 'untitled').slice(0, 60)}`, { variant: 'destructive' });
+          } else {
+            notifyRef.current(`Mission completed: ${(p.goal || 'untitled').slice(0, 60)}`);
+          }
           return;
         }
 
@@ -818,6 +992,12 @@ export default function App() {
             } else if (data.event_type === 'JobCompleted') {
               j.status = p.status === 'completed' ? 'completed' : p.status === 'failed' ? 'failed' : 'cancelled';
               if (p.error) j.error = p.error;
+              // Notify for completed coordinator jobs
+              if (p.status === 'completed') {
+                notifyRef.current('Coordinator job completed.');
+              } else if (p.status === 'failed') {
+                notifyRef.current('Coordinator job failed.', { variant: 'destructive' });
+              }
             }
             return { ...m, jobApproval: j };
           }));
@@ -831,10 +1011,20 @@ export default function App() {
         if (data.event_type === 'ResponseChunkGenerated') {
           const fullText = (data.payload as any).full_text;
           const assistantRowId = assistantMessageId(clientId);
+          // Do NOT push response chunks into the thinking overlay — that's
+          // for reasoning tokens (ThinkingChunkGenerated) only.  The chat
+          // message itself already streams the response text, so putting it
+          // in the overlay too just duplicates content, especially for
+          // casual/complex routes that never produce reasoning tokens.
           setMessages(prev => {
             const aidx = prev.findIndex(m => m.id === assistantRowId);
             if (aidx >= 0) {
               return prev.map(m => (m.id === assistantRowId ? { ...m, text: fullText } : m));
+            }
+            // Backlog replay: check if an assistant message with this text (or containing this chunk)
+            // already exists (loaded from history with a hist-* ID). If so, don't duplicate.
+            if (fullText && prev.some(m => m.sender === 'assistant' && m.text.includes(fullText))) {
+              return prev;
             }
             const uidx = prev.findIndex(m => m.id === clientId && m.sender === 'user');
             if (uidx >= 0) {
@@ -871,6 +1061,14 @@ export default function App() {
             });
             return { ...prev, [clientId]: updatedEvents };
           });
+          return;
+        }
+
+        // Live reasoning from thinking models (Gemma, DeepSeek R1, etc.)
+        if (data.event_type === 'ThinkingChunkGenerated') {
+          const fullReasoning = (data.payload as any).full_reasoning || '';
+          seenThinkingRef.current.add(clientId);
+          setLiveReasoningByClientId(prev => ({ ...prev, [clientId]: fullReasoning }));
           return;
         }
 
@@ -937,6 +1135,7 @@ export default function App() {
       return;
     }
     setActiveClientMessageId(clientMessageId);
+    sessionStorage.setItem('oasis-last-client-msg', clientMessageId);
     addMessage(trimmed, 'user', undefined, false, false, clientMessageId, replyTo ? { messageId: replyTo.messageId, preview: replyTo.preview } : undefined);
     quickUpload.clearAll();
     isSendingRef.current = true;
@@ -944,6 +1143,8 @@ export default function App() {
     try {
       const data = await sendToApi(trimmed, clientMessageId, replyTo, mentionedIds, attachedIds);
       setIsThinking(false);
+      // Clear the stored client message id since the response completed
+      sessionStorage.removeItem('oasis-last-client-msg');
       const assistantReply = typeof data?.response === 'string' ? data.response.trim() : '';
       if (assistantReply) {
         upsertAssistantMessage(clientMessageId, assistantReply, data.confidence?.toString());
@@ -989,6 +1190,7 @@ export default function App() {
     const newId = `browser-${crypto?.randomUUID?.() || Math.random().toString(36).slice(2)}`;
     setTextSessionId(newId);
     sessionStorage.setItem('oasis-session-id', newId);
+    sessionStorage.removeItem('oasis-last-client-msg');
     setTimelineByClientMessageId({});
     setGraphsBySessionId({});
     setShowHistoryPanel(false);
@@ -1057,6 +1259,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title={
@@ -1086,6 +1289,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Knowledge graph & Logic engine"
@@ -1107,6 +1311,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Self Teaching"
@@ -1128,6 +1333,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Computer Use"
@@ -1149,6 +1355,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Agents"
@@ -1170,6 +1377,7 @@ export default function App() {
                 setShowAgentsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Workflows"
@@ -1212,6 +1420,7 @@ export default function App() {
                 setShowAgentsPanel(false);
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Artifacts"
@@ -1234,6 +1443,7 @@ export default function App() {
             setShowWorkflowsPanel(false);
             setShowMobilePairingPanel(false);
             setShowArtifactsPanel(false);
+            setShowProjectsPanel(false);
           }}
           title="Settings"
         >
@@ -1318,6 +1528,16 @@ export default function App() {
         )}
       </AnimatePresence>
       <AnimatePresence>
+        {showProjectsPanel && (
+          <ProjectsPanel
+            open={showProjectsPanel}
+            onClose={() => setShowProjectsPanel(false)}
+            activeProjectId={activeProjectId}
+            onActiveProjectChange={_setActiveProjectId}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
         {showSettingsPanel && <SettingsPanel open={showSettingsPanel} onClose={() => setShowSettingsPanel(false)} projectConfig={projectConfig} onProjectConfigured={(cfg) => setProjectConfig({ ...cfg, configured: true })} sessionId={textSessionId} autonomousMode={autonomousMode} onAutonomousModeChange={handleAutonomousModeChange} activeProjectId={activeProjectId} onActiveProjectChange={_setActiveProjectId} />}
       </AnimatePresence>
 
@@ -1326,7 +1546,7 @@ export default function App() {
         // Full-canvas panels replace the chat area entirely.
         (showWorkflowsPanel || showAgentsPanel) && "hidden",
       )}>
-<ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} sessionUsage={sessionUsage} sessionBudget={sessionBudget} sessionBudgetPct={sessionBudgetPct} onOpenBudget={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} />
+<ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} onOpenProjects={() => { setShowProjectsPanel(v => !v); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} sessionUsage={sessionUsage} sessionBudget={sessionBudget} sessionBudgetPct={sessionBudgetPct} onOpenBudget={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} notifications={notifications} onDismissNotification={dismissNotification} />
 
         <div className="flex-1 overflow-hidden flex flex-col p-6 max-w-5xl mx-auto w-full">
           <ActiveMissionsBar
@@ -1381,6 +1601,7 @@ export default function App() {
                     messages={messages}
                     onViewTimeline={setSelectedTimelineMessageId}
                     onStop={handleStopPipeline}
+                    liveReasoning={activeClientMessageId ? liveReasoningByClientId[activeClientMessageId] || '' : ''}
                   />
                 )}
               </AnimatePresence>

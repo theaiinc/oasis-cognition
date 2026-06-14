@@ -119,7 +119,7 @@ async function condenseChatHistoryIfNeeded(
       `${RESPONSE_URL}/internal/response/summarize-history`,
       { messages: toSummarize },
       undefined,
-      { timeout: LLM_TIMEOUT_MS },
+      { timeout: 0 },
     );
     const summary = res.data?.summary || '[Conversation summary]';
     return [
@@ -950,23 +950,25 @@ async function axiosWithRetry<T = any>(
   url: string,
   dataOrConfig?: any,
   config?: any,
-  options: { timeout?: number; retries?: number } = {},
+  options: { timeout?: number; retries?: number; signal?: AbortSignal } = {},
 ): Promise<{ data: T }> {
   const timeout = options.timeout ?? FAST_TIMEOUT_MS;
   const maxRetries = options.retries ?? MAX_RETRIES;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
+      if (options.signal?.aborted) throw new DOMException('Pipeline cancelled', 'AbortError');
       if (method === 'get') {
-        return await axios.get(url, { ...dataOrConfig, timeout });
+        return await axios.get(url, { ...dataOrConfig, timeout, signal: options.signal });
       } else if (method === 'delete') {
-        return await axios.delete(url, { ...dataOrConfig, timeout });
+        return await axios.delete(url, { ...dataOrConfig, timeout, signal: options.signal });
       } else if (method === 'patch') {
-        return await axios.patch(url, dataOrConfig, { ...config, timeout });
+        return await axios.patch(url, dataOrConfig, { ...config, timeout, signal: options.signal });
       } else {
-        return await axios.post(url, dataOrConfig, { ...config, timeout });
+        return await axios.post(url, dataOrConfig, { ...config, timeout, signal: options.signal });
       }
     } catch (err: any) {
+      if (err.name === 'AbortError' || err.name === 'CanceledError') throw err; // Don't retry aborts
       const isRetryable =
         err.code === 'ECONNREFUSED' ||
         err.code === 'ECONNRESET' ||
@@ -1290,6 +1292,14 @@ export class InteractionService {
   // on each `_setSessionWorktreeId` and on first lookup that misses (see _refreshSessionWorktree).
   private sessionWorktrees: Map<string, string> = new Map();
 
+  /**
+   * Per-session AbortControllers for in-flight pipeline requests.
+   * When a new interaction arrives for the same session, the previous
+   * pipeline is cancelled so LM Studio resources are freed immediately
+   * instead of waiting for the 300s timeout.
+   */
+  private pendingPipelineAbort: Map<string, AbortController> = new Map();
+
   constructor(
     private readonly events: RedisEventService,
     private readonly langfuse: LangfuseService,
@@ -1376,6 +1386,23 @@ export class InteractionService {
     const interactionId = uuidv4();
     const clientMessageId = req.context?.client_message_id;
 
+    // ── Cancel any in-flight pipeline for this session ──────────────
+    // If the user sends a new message while the previous request is still
+    // processing (e.g. interpreter hanging on LM Studio), abort the old one
+    // so LM Studio resources are freed immediately.
+    const prevController = this.pendingPipelineAbort.get(sessionId);
+    if (prevController) {
+      this.logger.warn(`Session ${sessionId}: cancelling stale pipeline (new interaction arrived)`);
+      prevController.abort();
+      this.pendingPipelineAbort.delete(sessionId);
+    }
+    const abortController = new AbortController();
+    const signal = abortController.signal;
+    this.pendingPipelineAbort.set(sessionId, abortController);
+
+    // Wrap isAborted so it also checks the signal
+    const combinedAborted = () => isAborted() || signal.aborted;
+
     // ── Budget enforcement ──────────────────────────────────────────
     // Refuse the interaction up-front if the session has already hit its
     // per-session token / USD cap. Returning a structured response (rather
@@ -1455,42 +1482,54 @@ export class InteractionService {
         return this.handleTeachingFollowup(sessionId, req, pending, trace, interactionId, clientMessageId);
       }
 
-      // ── Step 1: Interpret (always runs) ──────────────────────────────
-      this.logger.log('Calling interpreter service...');
+      // ── Step 1: Start thinking stream immediately + interpret in parallel ──
+      // Instead of blocking 4-5 min on the interpreter, kick off the LLM
+      // thinking stream right away so the user sees feedback.
+      this.logger.log('Calling interpreter service (parallel with thinking)...');
       const interpretSpan = trace?.span({ name: 'interpreter', input: { text: req.user_message } });
-      const llmStart = Date.now();
-      await this.events.publish('LlmCallStarted', sessionId, {
-        service: 'interpreter',
+      
+      // Warm up the thinking stream with a placeholder so UI shows activity immediately
+      await this.events.publish('ThinkingChunkGenerated', sessionId, {
+        chunk: 'Warming up model...',
+        full_reasoning: 'Warming up model...\n',
         interaction_id: interactionId,
         client_message_id: clientMessageId,
       });
-      const interpretRes = await axiosWithRetry('post', `${INTERPRETER_URL}/internal/interpret`, {
-        text: req.user_message,
-        context: req.context || {},
-        chat_history: chatHistory.length > 0 ? buildInterpreterChatHistory(chatHistory) : undefined,
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
-      await this.events.publish('LlmCallCompleted', sessionId, {
-        service: 'interpreter',
-        duration_ms: Date.now() - llmStart,
-        interaction_id: interactionId,
-        client_message_id: clientMessageId,
-      });
+
+      // Fire both the interpreter and the initial thinking stream in parallel
+      const interpretPromise = (async () => {
+        const llmStart = Date.now();
+        await this.events.publish('LlmCallStarted', sessionId, {
+          service: 'interpreter',
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        });
+        const res = await axiosWithRetry('post', `${INTERPRETER_URL}/internal/interpret`, {
+          text: req.user_message,
+          context: req.context || {},
+          chat_history: chatHistory.length > 0 ? buildInterpreterChatHistory(chatHistory) : undefined,
+        }, undefined, { timeout: 0, signal }); // 0 = no wall-clock limit — models can think for 10+ min
+        await this.events.publish('LlmCallCompleted', sessionId, {
+          service: 'interpreter',
+          duration_ms: Date.now() - llmStart,
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        });
+        return res;
+      })();
+
+      // Wait for interpreter to finish
+      const interpretRes = await interpretPromise;
       const semanticStructure = interpretRes.data.semantic_structure;
       let route = semanticStructure.route || 'complex';
       interpretSpan?.end({ output: { ...semanticStructure, route } });
 
-      // ── Route correction: if the previous turn was tool_use and this message is a
-      // short imperative follow-up (likely "continue", "do it", "fix that too"), override
-      // casual → tool_use.  But leave "complex" alone — follow-up questions asking for
-      // opinions, suggestions, or analysis should stay in the complex pipeline where chat
-      // history + knowledge graph provide the answer, not the tool-use loop.
+      // ── Route correction ────────────────────────────────────────────
       if (route === 'casual') {
         const prevAssistantTurn = chatHistory.filter(t => t.role === 'assistant').slice(-1)[0];
         const msgText = (req.user_message || '').trim();
         const msgLen = msgText.length;
-        // Only override very short imperative follow-ups (not questions)
         const looksLikeQuestion = /\?|suggest|would you|should|what|how|why|any other|anything extra/i.test(msgText);
-        // Check if previous assistant message looks like a tool_use response
         const prevLooksLikeToolUse = prevAssistantTurn?.content &&
           (/Tool calls:|```|worktree|applied patch|diff|created file|edited file/i.test(prevAssistantTurn.content) ||
            !!this._getSessionWorktreeId(sessionId));
@@ -1503,24 +1542,47 @@ export class InteractionService {
         }
       }
 
+      // If the interpreter classified as "complex" but the intent implies code
+      // inspection or editing, the LLM mis-classified.  Complex route does NOT
+      // run tools — it only generates text.  Redirect to tool_use so the agent
+      // can read files, run commands, and make changes.
+      if (route === 'complex') {
+        const toolUseIntents = ['implement', 'fix', 'explore', 'execute', 'diagnose', 'compare'];
+        const intent = (semanticStructure?.intent || '').toLowerCase().trim();
+        const msgText = (req.user_message || '').toLowerCase().trim();
+        const looksLikeCodeWork =
+          toolUseIntents.includes(intent) ||
+          /\b(add|fix|change|create|update|enable|implement|remove|refactor|build|make|write|edit|delete|show|find|check|run|investigate|debug|test)\b/i.test(msgText.slice(0, 80));
+        if (looksLikeCodeWork) {
+          this.logger.warn(
+            `Route override: ${route} → tool_use (intent=${intent}, message suggests code work: "${msgText.slice(0, 60)}")`,
+          );
+          route = 'tool_use';
+          semanticStructure.route = 'tool_use';
+        }
+      }
+
       await this.events.publish('SemanticParsed', sessionId, { ...semanticStructure, route, interaction_id: interactionId, client_message_id: clientMessageId });
       this.logger.log(`Route classified: ${route}`);
 
-      // ── Step 2: Route-based dispatch ─────────────────────────────────
+      // ── Step 2: Route-based dispatch ──
       let result: InteractionResponse;
       switch (route) {
         case 'casual':
-          result = await this.handleCasual(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory);
+          result = await this.handleCasual(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, signal);
           break;
         case 'teaching':
           result = await this.handleTeaching(sessionId, req, semanticStructure, trace, interactionId, clientMessageId);
           break;
         case 'tool_use':
-          result = await this.handleToolUse(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, isAborted);
+          // Only start the thinking stream after route is known,
+          // so we don't waste an LLM call on routes that don't use it.
+          result = await this.handleToolUse(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, combinedAborted, signal);
           break;
         case 'complex':
         default:
-          result = await this.handleComplex(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory);
+          // Complex route does its own response generation — no pre-thinking needed.
+          result = await this.handleComplex(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, signal);
           break;
       }
 
@@ -1555,6 +1617,21 @@ export class InteractionService {
 
       return result;
     } catch (err: any) {
+      const isAbortErr = err.name === 'AbortError' || err.name === 'CanceledError';
+      if (isAbortErr) {
+        this.logger.warn(`Session ${sessionId}: pipeline cancelled by new interaction`);
+        await this.events.publish('PipelineCancelled', sessionId, {
+          reason: 'New interaction arrived',
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        });
+        // Re-throw a CancelledError instead of AbortError so the controller
+        // can distinguish it from a regular error.
+        throw new HttpException(
+          { error: 'Pipeline cancelled', detail: 'Replaced by a new interaction for this session' },
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
       this.logger.error(`Pipeline failed: ${err.message}`);
       trace?.update({ output: { error: err.message } });
       const detail = err.response?.data || err.message;
@@ -1571,6 +1648,12 @@ export class InteractionService {
         { error: 'Reasoning pipeline failed', detail },
         err.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
+    } finally {
+      // Clean up the AbortController from the session map
+      const current = this.pendingPipelineAbort.get(sessionId);
+      if (current === abortController) {
+        this.pendingPipelineAbort.delete(sessionId);
+      }
     }
   }
 
@@ -1604,6 +1687,7 @@ export class InteractionService {
     _interactionId: string,
     _clientMessageId: string | undefined,
     chatHistory: Array<{ role: string; content: string }> = [],
+    signal?: AbortSignal,
   ): Promise<InteractionResponse> {
     this.logger.log('Casual route — direct LLM chat');
     const chatSpan = trace?.span({ name: 'casual-chat', input: { text: req.user_message } });
@@ -1653,7 +1737,7 @@ export class InteractionService {
       user_message: req.user_message,
       context: chatContext,
       chat_history: chatHistory.length > 0 ? chatHistory : undefined,
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
+    }, undefined, { timeout: 0, signal }); // no wall-clock limit — LLM can think
     await this.events.publish('LlmCallCompleted', sessionId, {
       service: 'response-generator',
       route: 'casual',
@@ -1691,6 +1775,7 @@ export class InteractionService {
     interactionId: string,
     clientMessageId: string | undefined,
     chatHistory: Array<{ role: string; content: string }> = [],
+    signal?: AbortSignal,
   ): Promise<InteractionResponse> {
     this.logger.log('Complex route — full reasoning pipeline');
 
@@ -1699,7 +1784,7 @@ export class InteractionService {
     const graphRes = await axiosWithRetry('post', `${GRAPH_BUILDER_URL}/internal/graph/build`, {
       semantic_structure: semanticStructure,
       session_id: sessionId,
-    }, undefined, { timeout: FAST_TIMEOUT_MS });
+    }, undefined, { timeout: FAST_TIMEOUT_MS, signal });
     const reasoningGraph = graphRes.data.reasoning_graph;
     graphSpan?.end({ output: { graph_id: reasoningGraph.id, node_count: reasoningGraph.nodes?.length || 0 } });
 
@@ -1822,7 +1907,7 @@ export class InteractionService {
         artifact_search_results: artifactSearchResults.length > 0 ? artifactSearchResults : undefined,
         artifact_context: artifactContext || undefined,
       };
-      responseText = await this.generateStreamingResponse(
+      responseText = await this.generateStreamingResponseStructured(
         sessionId,
         interactionId,
         clientMessageId,
@@ -1832,7 +1917,8 @@ export class InteractionService {
           context: responseContext,
           chat_history: chatHistory.length > 0 ? chatHistory : undefined,
         },
-        '/internal/response/generate-stream'
+        '/internal/response/generate-stream-structured',
+        signal,
       );
       responseSpan?.end({ output: { response_length: responseText.length } });
 
@@ -1896,6 +1982,7 @@ export class InteractionService {
     clientMessageId: string | undefined,
     chatHistory: Array<{ role: string; content: string }> = [],
     isAborted: () => boolean = () => false,
+    signal?: AbortSignal,
   ): Promise<InteractionResponse> {
     this.logger.log('Tool-use route — multi-agent loop (Plan → Execute → Observer)');
     const toolSpan = trace?.span({ name: 'tool-use', input: { text: req.user_message } });
@@ -1932,60 +2019,110 @@ export class InteractionService {
       }
     }
 
-    // ── Pre-Phase: Free Thoughts (Free-form reasoning) ─────────────
-    let freeThoughts = await this.generateStreamingThoughts(
-      sessionId,
-      req.user_message,
-      req.context,
-      chatHistory,
-      interactionId,
-      clientMessageId,
-    );
+    // ── Pre-Phase: Free Thoughts (Free-form reasoning with tool support) ──
+    let freeThoughts = '';
+    let thoughtToolCalls = 0;
+
+    // Start structured thinking inline (not preloaded, to avoid double LLM calls)
+    try {
+      const structuredResult = await this.generateStreamingThoughtsStructured(
+        sessionId,
+        req.user_message,
+        req.context,
+        chatHistory,
+        interactionId,
+        clientMessageId,
+        undefined,
+        undefined,
+        signal,
+      );
+      freeThoughts = structuredResult.thoughts;
+      thoughtToolCalls = structuredResult.toolCalls;
+
+      // Fallback: if structured returned nothing (e.g. endpoint not available),
+      // use the classic plain-text approach.
+      if (!freeThoughts && thoughtToolCalls === 0) {
+        freeThoughts = await this.generateStreamingThoughts(
+          sessionId,
+          req.user_message,
+          req.context,
+          chatHistory,
+          interactionId,
+          clientMessageId,
+          undefined,
+          undefined,
+          signal,
+        );
+      }
+    } catch {
+      this.logger.warn('Initial thinking stream failed, continuing with empty thoughts');
+    }
+
+    if (thoughtToolCalls > 0) {
+      this.logger.log(`Thought phase made ${thoughtToolCalls} tool call(s)`);
+    }
 
     let consecutiveNeedInfo = 0;
 
-    // ── Pre-Phase: Decision Layer (Think → Decide → Act) ─────────────
-    const decisionStartTime = Date.now();
-    const decisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
-      thoughts: freeThoughts,
-      user_message: req.user_message,
-      context: { ...req.context, interactionId },
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
-    
-    let decision = decisionRes.data.decision;
-    const timeToDecision = Date.now() - decisionStartTime;
-    const timeToAction = Date.now() - loopStartTime;
-    
-    // Structured logging for metrics
-    this.logger.log(`[DECISION_LOG] decision_type=${decision} thought_count=1 time_to_decision_ms=${timeToDecision} time_to_action_ms=${timeToAction}`);
-    this.logger.log(`Decision Layer [pre-loop]: ${decision} (in ${timeToDecision}ms)`);
+    let decision: string;
+    let decisionReason = '';
 
-    if (decision === 'NEED_MORE_INFO') {
-      consecutiveNeedInfo++;
-      if (consecutiveNeedInfo >= 2) {
-        this.logger.warn(`Overthinking Recovery [pre-loop]: Forced ACT after ${consecutiveNeedInfo} consecutive NEED_MORE_INFO.`);
-        decision = 'ACT';
-      }
+    // If thoughts are empty (model produced nothing), skip decision layer and default to ACT
+    if (!freeThoughts || freeThoughts.trim().length === 0) {
+      this.logger.warn('Thought stream returned empty — skipping decision layer, defaulting to ACT');
+      decision = 'ACT';
+      decisionReason = 'Thought stream returned empty, defaulting to action.';
     } else {
-      consecutiveNeedInfo = 0;
+      // ── Pre-Phase: Decision Layer (Think → Decide → Act) ─────────────
+      const decisionStartTime = Date.now();
+      const decisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
+        thoughts: freeThoughts,
+        user_message: req.user_message,
+        context: { ...req.context, interactionId },
+        chat_history: chatHistory.length > 0 ? chatHistory : undefined,
+      }, undefined, { timeout: 0, signal }).catch((err) => {
+        this.logger.warn(`Decision layer call failed: ${err.message} — defaulting to ACT`);
+        return { data: { decision: 'ACT', reason: '', confidence: 0.5 } };
+      });
+      
+      decision = decisionRes.data.decision;
+      decisionReason = decisionRes.data.reason || '';
+      const timeToDecision = Date.now() - decisionStartTime;
+      const timeToAction = Date.now() - loopStartTime;
+      
+      // Structured logging for metrics
+      this.logger.log(`[DECISION_LOG] decision_type=${decision} thought_count=1 time_to_decision_ms=${timeToDecision} time_to_action_ms=${timeToAction}`);
+      this.logger.log(`Decision Layer [pre-loop]: ${decision} (in ${timeToDecision}ms)`);
+
+      if (decision === 'NEED_MORE_INFO') {
+        consecutiveNeedInfo++;
+        // On the first NEED_MORE_INFO in the pre-loop, force ACT instead of exiting.
+        // The user explicitly asked to implement something — they don't need the agent
+        // asking them questions back.
+        this.logger.warn('Pre-loop NEED_MORE_INFO — forcing ACT to enter the tool loop instead of asking for clarification');
+        decision = 'ACT';
+      } else {
+        consecutiveNeedInfo = 0;
+      }
+
+      await this.events.publish('DecisionLayerGenerated', sessionId, {
+        decision,
+        reason: decisionReason,
+        confidence: decisionRes.data.confidence,
+        interaction_id: interactionId,
+        client_message_id: clientMessageId,
+        forced: decision !== 'NEED_MORE_INFO',
+      });
     }
 
-    await this.events.publish('DecisionLayerGenerated', sessionId, {
-      decision,
-      reason: decisionRes.data.reason,
-      confidence: decisionRes.data.confidence,
-      interaction_id: interactionId,
-      client_message_id: clientMessageId,
-      forced: consecutiveNeedInfo >= 2,
-    });
-
+    // If decided to answer directly (and had meaningful thoughts)
     if (decision === 'ANSWER_DIRECTLY') {
       this.logger.log('Decision: ANSWER_DIRECTLY — bypassing tool loop');
       const chatRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/response/chat`, {
         user_message: req.user_message,
         context: { ...(req.context || {}), thoughts: freeThoughts },
         chat_history: chatHistory.length > 0 ? chatHistory : undefined,
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
+      }, undefined, { timeout: 0, signal });
       const responseText =
         typeof chatRes.data.response_text === 'string' && chatRes.data.response_text.trim()
           ? chatRes.data.response_text.trim()
@@ -2002,25 +2139,6 @@ export class InteractionService {
         response: responseText,
         reasoning_graph: {},
         confidence: 1.0,
-        reasoning_trace: [`Route: tool_use (Decision: ${decision})`, freeThoughts].filter(Boolean),
-        route: 'tool_use',
-      };
-    }
-
-    if (decision === 'NEED_MORE_INFO') {
-      this.logger.log('Decision: NEED_MORE_INFO — requesting clarification');
-      const question = decisionRes.data.reason || "I need more information before I can act.";
-      const options: string[] = Array.isArray(decisionRes.data.options) ? decisionRes.data.options : [];
-      // Format with clickable options if available
-      let responseText = `🤔 **I need more info:** ${question}`;
-      if (options.length > 0) {
-        responseText += '\n\n' + options.map(o => `- ${o}`).join('\n');
-      }
-      return {
-        session_id: sessionId,
-        response: responseText,
-        reasoning_graph: {},
-        confidence: decisionRes.data.confidence || 0.5,
         reasoning_trace: [`Route: tool_use (Decision: ${decision})`, freeThoughts].filter(Boolean),
         route: 'tool_use',
       };
@@ -2120,7 +2238,7 @@ export class InteractionService {
         memory_stale_hint: memoryStaleHint,
         free_thoughts: freeThoughts,
         // Artifacts are no longer auto-injected; the LLM uses search_artifacts tool
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
+      }, undefined, { timeout: 0 });
       upfrontPlan = {
         steps: planRes.data.steps || [],
         success_criteria: planRes.data.success_criteria || [],
@@ -2220,6 +2338,7 @@ export class InteractionService {
 
     const runObserverReplan = async (feedbackForPlanner: string, atIteration: number): Promise<boolean> => {
       try {
+        if (signal?.aborted) return false;
         const planRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/plan/tool-use`, {
           user_message: req.user_message,
           semantic_structure: semanticStructure,
@@ -2230,7 +2349,7 @@ export class InteractionService {
           observer_feedback: feedbackForPlanner,
           previous_plan: upfrontPlan.steps.length > 0 ? upfrontPlan : undefined,
           replan_after_observer: true,
-        }, undefined, { timeout: LLM_TIMEOUT_MS });
+        }, undefined, { timeout: 0, signal });
         upfrontPlan = {
           steps: planRes.data.steps || [],
           success_criteria: planRes.data.success_criteria || [],
@@ -2341,12 +2460,21 @@ export class InteractionService {
     }
 
     let maxDurationReached = false;
+    let hallucinationStartTime: number | null = null; // starts ticking on first duplicate detection
+    const HALLUCINATION_LOOP_TIMEOUT_MS = 300_000; // 5 min guard once hallucination is confirmed
     for (let iteration = 0; iteration < maxIterations; iteration++) {
-      if (isAborted()) {
+      if (isAborted() || signal?.aborted) {
         this.logger.warn(
           'Connection closed before response was sent — stopping tool loop. Causes: user Stop, tab refresh/close, network drop, or proxy idle timeout during long gaps between tool rounds.',
         );
         throw new Error('Pipeline stopped by client');
+      }
+
+      // Only check the hallucination timeout if it has been armed by actual evidence of a loop.
+      if (hallucinationStartTime && Date.now() - hallucinationStartTime > HALLUCINATION_LOOP_TIMEOUT_MS) {
+        this.logger.warn(`Hallucination loop guard: exceeded 5 min since first duplicate — stopping loop`);
+        maxDurationReached = true;
+        break;
       }
 
       // Time limit (autonomous mode)
@@ -2587,13 +2715,14 @@ export class InteractionService {
           clientMessageId,
           toolResults.slice(-5),
           observerFeedback,
+          signal,
         );
 
         const iterationDecisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
           thoughts: freeThoughts,
           user_message: req.user_message,
-          context: { ...req.context, interactionId, iteration },
-        }, undefined, { timeout: LLM_TIMEOUT_MS });
+        context: { ...req.context, interactionId, iteration },
+      }, undefined, { timeout: 0, signal });
 
         let iterationDecision = iterationDecisionRes.data.decision;
         const timeToIterationDecision = Date.now() - iterationDecisionStartTime;
@@ -3444,6 +3573,9 @@ export class InteractionService {
 
           if (priorSucceeded && CACHED_DUPLICATE_READ_TOOLS.has(toolName)) {
             consecutiveDuplicates++;
+            if (!hallucinationStartTime && consecutiveDuplicates >= 1) {
+              hallucinationStartTime = Date.now();
+            }
             this.logger.log(
               `Duplicate ${toolName} (same params) — returning cached output (${priorFullOutput.length} chars) [streak=${consecutiveDuplicates}]`,
             );
@@ -3487,6 +3619,9 @@ export class InteractionService {
           }
 
           consecutiveDuplicates++;
+          if (!hallucinationStartTime && consecutiveDuplicates >= 1) {
+            hallucinationStartTime = Date.now();
+          }
           this.logger.warn(
             `Duplicate tool call detected: ${toolName} ${path || pattern || command} — injecting redirect [streak=${consecutiveDuplicates}]`,
           );
@@ -3821,6 +3956,7 @@ export class InteractionService {
             interaction_id: interactionId, client_message_id: clientMessageId,
           });
           consecutiveDuplicates = 0;
+          hallucinationStartTime = null;
           consecutiveFailures = 0;
           updateThoughtsOnlyStreak();
           continue;
@@ -3877,6 +4013,7 @@ export class InteractionService {
             interaction_id: interactionId, client_message_id: clientMessageId,
           });
           consecutiveDuplicates = 0;
+          hallucinationStartTime = null;
           consecutiveFailures = 0;
           updateThoughtsOnlyStreak();
           continue;
@@ -4239,7 +4376,9 @@ export class InteractionService {
           }
 
           // Track consecutive failures and force teaching
-          consecutiveDuplicates = 0; // non-duplicate call executed — reset streak
+          consecutiveDuplicates = 0;
+          hallucinationStartTime = null;
+          // non-duplicate call executed — reset streak
           if (!result.success || result.blocked) {
             consecutiveFailures++;
           } else {
@@ -4476,7 +4615,7 @@ export class InteractionService {
             const sumRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/response/tool-summarize`, {
               user_message: req.user_message,
               tool_results: toolResults,
-            }, undefined, { timeout: LLM_TIMEOUT_MS });
+            }, undefined, { timeout: 0 });
             responseText = sumRes.data.response_text || 'Done.';
           } catch {
             responseText = toolResults.map((r, i) => `#${i + 1} [${r.tool}] ${r.success ? 'OK' : 'FAILED'}: ${(r.output || '').slice(0, 200)}`).join('\n');
@@ -4552,7 +4691,7 @@ export class InteractionService {
       const sumRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/response/tool-summarize`, {
         user_message: req.user_message,
         tool_results: toolResults,
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
+      }, undefined, { timeout: 0 });
       responseText = sumRes.data.response_text || (maxDurationReached
         ? `I ran for ${sessionCfg.autonomous_max_duration_hours} hours (autonomous mode time limit).`
         : 'I ran several commands but reached the iteration limit.');
@@ -4607,7 +4746,7 @@ export class InteractionService {
     const teachRes = await axiosWithRetry('post', `${TEACHING_URL}/internal/teaching/validate`, {
       user_message: req.user_message,
       semantic_structure: semanticStructure,
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
+    }, undefined, { timeout: 0 });
     await this.events.publish('LlmCallCompleted', sessionId, {
       service: 'teaching-service',
       route: 'teaching',
@@ -4814,7 +4953,7 @@ export class InteractionService {
       assertion: pending.assertion || {},
       search_query: pending.search_query || '',
       prior_validation: pending.validation || null,
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
+    }, undefined, { timeout: 0 });
     const assertion = teachRes.data.assertion;
     const searchQuery = teachRes.data.search_query || pending.search_query || '';
     const validation = teachRes.data.validation;
@@ -4912,6 +5051,7 @@ export class InteractionService {
     clientMessageId: string | undefined,
     toolResults?: any[],
     observerFeedback?: string | null,
+    signal?: AbortSignal,
   ): Promise<string> {
     let fullThoughts = '';
     const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
@@ -4928,16 +5068,30 @@ export class InteractionService {
           observer_feedback: observerFeedback,
         },
         responseType: 'stream',
-        timeout: LLM_TIMEOUT_MS,
+        // Use 0 = no wall-clock timeout for streaming. We add idle-timeout below.
+        timeout: 0,
+        signal,
       });
 
       const stream = response.data;
-      const MAX_THOUGHT_CHARS = 3000; // hard cap — thoughts should be concise
+      const MAX_THOUGHT_CHARS = 30_000; // increased — modern LLMs can output 10k+ reasoning chars
+      const IDLE_TIMEOUT_MS = 60_000; // kill if no data for 60s
       let aborted = false;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const resetIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          this.logger.warn(`Thought stream idle for ${IDLE_TIMEOUT_MS}ms — aborting`);
+          aborted = true;
+          stream.destroy();
+        }, IDLE_TIMEOUT_MS);
+      };
 
       return new Promise((resolve) => {
         stream.on('data', (chunk: Buffer) => {
           if (aborted) return;
+          resetIdle(); // data arrived, reset idle timer
           const text = chunk.toString();
           fullThoughts += text;
 
@@ -4945,6 +5099,7 @@ export class InteractionService {
           if (fullThoughts.length > MAX_THOUGHT_CHARS) {
             this.logger.warn(`Thought stream exceeded ${MAX_THOUGHT_CHARS} chars — aborting (likely hallucination)`);
             fullThoughts = fullThoughts.slice(0, MAX_THOUGHT_CHARS) + '\n[Thoughts truncated — too long]';
+            if (idleTimer) clearTimeout(idleTimer);
             aborted = true;
             stream.destroy();
             return;
@@ -4956,9 +5111,9 @@ export class InteractionService {
             const earlier = fullThoughts.slice(0, fullThoughts.length - 200);
             if (earlier.includes(tail)) {
               this.logger.warn('Thought stream detected repetition — aborting');
-              // Trim to just before the repeated block
               const repeatStart = earlier.indexOf(tail);
               fullThoughts = fullThoughts.slice(0, repeatStart + 200) + '\n[Thoughts truncated — repetition detected]';
+              if (idleTimer) clearTimeout(idleTimer);
               aborted = true;
               stream.destroy();
               return;
@@ -4966,15 +5121,22 @@ export class InteractionService {
           }
 
           // Publish chunk for real-time UI animation
-          this.events.publish('ThoughtChunkGenerated', sessionId, {
+          this.events.publish('ThinkingChunkGenerated', sessionId, {
             chunk: text,
+            full_reasoning: fullThoughts,
             interaction_id: interactionId,
             client_message_id: clientMessageId,
           }).catch(err => this.logger.warn(`Failed to publish thought chunk: ${err.message}`));
         });
 
         stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.log(`Finished streaming thoughts (${fullThoughts.length} chars)`);
+          // NOTE: tool_call markers NOT stripped here — the caller (handleToolUse etc.)
+          // extracts them first via _extractToolCallsFromText, then strips them after.
+          if (!fullThoughts) {
+            fullThoughts = '(No thoughts produced by model)';
+          }
           // Final bulk event for reliability/persistence
           this.events.publish('ThoughtLayerGenerated', sessionId, {
             thoughts: fullThoughts,
@@ -4985,12 +5147,14 @@ export class InteractionService {
         });
 
         stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.error(`Thought stream error: ${err.message}`);
           resolve(fullThoughts);
         });
 
         // Also resolve on destroy (when we abort)
         stream.on('close', () => {
+          if (idleTimer) clearTimeout(idleTimer);
           if (aborted) resolve(fullThoughts);
         });
       });
@@ -4998,6 +5162,306 @@ export class InteractionService {
       this.logger.warn(`Streaming thoughts failed: ${err.message}`);
       return '';
     }
+  }
+
+  private async generateStreamingThoughtsStructured(
+    sessionId: string,
+    userMessage: string,
+    context: any,
+    chatHistory: any[],
+    interactionId: string,
+    clientMessageId: string | undefined,
+    initialToolResults?: any[],
+    observerFeedback?: string | null,
+    signal?: AbortSignal,
+  ): Promise<{ thoughts: string; toolCalls: number }> {
+    const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
+    const MAX_ITERATIONS = 5;
+    let fullThoughts = '';
+    let toolCallCount = 0;
+    let toolResults = initialToolResults || [];
+
+    for (let iter = 0; iter <= MAX_ITERATIONS; iter++) {
+      if (signal?.aborted) break;
+      const stream = await this._streamSingleThoughtRound(
+        sessionId, userMessage, context, chatHistory,
+        interactionId, clientMessageId, toolResults, observerFeedback,
+        responseUrl, fullThoughts, signal,
+      );
+      if (!stream) break; // stream failed
+
+      const { thoughts, toolCall } = stream;
+
+      // Accumulate reasoning
+      if (thoughts) {
+        // Only add if there's new content (avoid duplication)
+        if (!fullThoughts.endsWith(thoughts)) {
+          fullThoughts += (fullThoughts ? '\n' : '') + thoughts;
+        }
+      }
+
+      if (!toolCall) {
+        // No tool call — thinking is done
+        this.logger.log(`Finished structured streaming thoughts (${fullThoughts.length} chars, ${toolCallCount} tool calls)`);
+        this.events.publish('ThoughtLayerGenerated', sessionId, {
+          thoughts: fullThoughts,
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        }).catch(err => this.logger.warn(`Failed to publish full thoughts: ${err.message}`));
+        return { thoughts: fullThoughts, toolCalls: toolCallCount };
+      }
+
+      toolCallCount++;
+
+      // Execute the tool
+      const toolName = toolCall.function?.name;
+      let args: Record<string, any> = {};
+      try { args = JSON.parse(toolCall.function?.arguments || '{}'); } catch { /* ignore */ }
+
+      this.logger.log(`Thought-tool #${toolCallCount}: ${toolName}(${JSON.stringify(args).slice(0, 200)})`);
+
+      // Publish UI events
+      this.events.publish('ToolCallStarted', sessionId, {
+        tool: toolName, ...args,
+        reasoning: `[During reasoning] ${toolName}`,
+        iteration: -1,
+        interaction_id: interactionId,
+        client_message_id: clientMessageId,
+      }).catch(() => {});
+
+      let toolOutput = '';
+      let toolSuccess = false;
+      try {
+        const execResult = await this.executeToolCall(toolName, args, sessionId);
+        toolOutput = execResult.output?.toString() || '';
+        toolSuccess = execResult.success;
+      } catch (execErr: any) {
+        toolOutput = `Error: ${execErr.message}`;
+      }
+
+      this.logger.log(`Thought-tool result: ${toolName} success=${toolSuccess} (${(toolOutput || '').length} chars)`);
+
+      this.events.publish('ToolCallCompleted', sessionId, {
+        tool: toolName, ...args,
+        output: toolOutput.slice(0, 1000),
+        success: toolSuccess,
+        iteration: -1,
+        interaction_id: interactionId,
+        client_message_id: clientMessageId,
+      }).catch(() => {});
+
+      // Feed results back for the next round
+      toolResults = [
+        ...toolResults,
+        { tool: toolName, success: toolSuccess, output: toolOutput.slice(0, 5000) },
+      ];
+      // Continue loop → next API call with tool results
+    }
+
+    // Max iterations reached
+    this.logger.warn(`Structured thinking reached max ${MAX_ITERATIONS} iterations`);
+    return { thoughts: fullThoughts, toolCalls: toolCallCount };
+  }
+
+  /**
+   * Make a single streaming API call to /internal/thought/reason-stream-structured
+   * and return the accumulated reasoning plus any tool call found.
+   */
+  private async _streamSingleThoughtRound(
+    sessionId: string,
+    userMessage: string,
+    context: any,
+    chatHistory: any[],
+    interactionId: string,
+    clientMessageId: string | undefined,
+    toolResults: any[] | undefined,
+    observerFeedback: string | null | undefined,
+    responseUrl: string,
+    accumulatedThoughts: string, // running total from prior rounds
+    signal?: AbortSignal,
+  ): Promise<{ thoughts: string; toolCall: any } | null> {
+    try {
+      if (signal?.aborted) return null;
+      const response = await axios({
+        method: 'post',
+        url: `${responseUrl}/internal/thought/reason-stream-structured`,
+        data: {
+          user_message: userMessage,
+          context,
+          chat_history: chatHistory?.length > 0 ? chatHistory : undefined,
+          tool_results: toolResults,
+          observer_feedback: observerFeedback,
+        },
+        responseType: 'stream',
+        // No wall-clock timeout for streaming — idle timeout handled by caller
+        timeout: 0,
+        signal,
+      });
+
+      const stream = response.data;
+
+      return new Promise((resolve, reject) => {
+        let thoughts = '';
+        let toolCall: any = null;
+        let lineBuffer = '';
+        const IDLE_TIMEOUT_MS = 60_000;
+        let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const resetIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            stream.destroy();
+            resolve({ thoughts, toolCall });
+          }, IDLE_TIMEOUT_MS);
+        };
+
+        const processLine = (line: string) => {
+          resetIdle();
+          try {
+            const item = JSON.parse(line);
+            if (item.type === 'tool_call') {
+              toolCall = item;
+              stream.destroy(); // stop reading — we'll handle it in the loop
+            } else if (item.type === 'done') {
+              thoughts = item.text || thoughts;
+              stream.destroy();
+            } else if (item.type === 'reasoning') {
+              thoughts += item.text;
+              const runningReasoning = accumulatedThoughts
+                ? accumulatedThoughts + '\n' + thoughts
+                : thoughts;
+              this.events.publish('ThinkingChunkGenerated', sessionId, {
+                chunk: item.text,
+                full_reasoning: runningReasoning,
+                interaction_id: interactionId,
+                client_message_id: clientMessageId,
+              }).catch(() => {});
+            } else if (item.type === 'content') {
+              thoughts += item.text;
+            }
+          } catch {
+            // skip invalid JSON
+          }
+        };
+
+        stream.on('data', (chunk: Buffer) => {
+          lineBuffer += chunk.toString();
+          const parts = lineBuffer.split('\n');
+          lineBuffer = parts.pop() || '';
+          for (const part of parts) {
+            const trimmed = part.trim();
+            if (trimmed) processLine(trimmed);
+          }
+        });
+
+        stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          const trimmed = lineBuffer.trim();
+          if (trimmed) processLine(trimmed);
+          resolve({ thoughts, toolCall });
+        });
+
+        stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
+          this.logger.warn(`Thought round stream error: ${err.message}`);
+          resolve({ thoughts, toolCall });
+        });
+
+        stream.on('close', () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          resolve({ thoughts, toolCall });
+        });
+      });
+    } catch (err: any) {
+      this.logger.warn(`Thought round failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Parse <|tool_call|> patterns from free-form thinking text (e.g. Gemma output).
+   * These models don't use native OpenAI API tool calls; they emit text markers like:
+   *   <|tool_call|>call:tools:grep_files{pattern:".*foo.*",recursive:true}<tool_call|>
+   * or older patterns like TOOL: read_file(/path).
+   */
+  private _extractToolCallsFromText(text: string): Array<{ tool: string; args: Record<string, any> }> {
+    const results: Array<{ tool: string; args: Record<string, any> }> = [];
+    if (!text) return results;
+
+    // Pattern 1: <|tool_call|>call:tools:tool_name{...json args...}<tool_call|>
+    const toolCallRe = /<\|tool_call\|>call:tools:(\w+)\{([^}]*)\}<tool_call\|>/g;
+    let m: RegExpExecArray | null;
+    while ((m = toolCallRe.exec(text)) !== null) {
+      const toolName = m[1];
+      let args: Record<string, any> = {};
+      try {
+        // Attempt to parse as JSON object literal (keys unquoted in Gemma output)
+        // e.g. {pattern:".*foo.*",recursive:true}
+        const raw = m[2].trim();
+        if (raw) {
+          // Wrap keys in quotes for JSON.parse and re-wrap with braces
+          const jsonStr = '{' + raw.replace(/(\w+):/g, '"$1":') + '}';
+          args = JSON.parse(jsonStr);
+        }
+      } catch {
+        // If parsing fails, use raw value as a single string arg
+        args = { value: m[2] };
+      }
+      results.push({ tool: toolName, args });
+    }
+
+    // Pattern 2: TOOL: read_file(path) or read_file(path)
+    if (results.length === 0) {
+      const simpleRe = /(?:TOOL:\s*)?(\w+)\(([^)]*)\)/g;
+      while ((m = simpleRe.exec(text)) !== null) {
+        results.push({ tool: m[1], args: { path: m[2].trim() } });
+      }
+    }
+
+    return results;
+  }
+
+  private async executeToolCall(
+    toolName: string,
+    args: Record<string, any>,
+    sessionId: string,
+  ): Promise<{ output: string; success: boolean }> {
+    // Determine routing
+    const isDevAgentTool = DEV_AGENT_TOOLS.has(toolName);
+    const targetUrl = isDevAgentTool
+      ? `${DEV_AGENT_URL}/internal/dev-agent/execute`
+      : `${TOOL_EXECUTOR_URL}/internal/tool/execute`;
+
+    const execPayload: Record<string, any> = { tool: toolName };
+
+    if (isDevAgentTool) {
+      execPayload.path = args.path || undefined;
+      execPayload.content = args.content || undefined;
+      execPayload.old_string = args.old_string || undefined;
+      execPayload.new_string = args.new_string || undefined;
+      execPayload.patch = args.patch || undefined;
+      execPayload.command = args.command || undefined;
+      execPayload.name = args.name || undefined;
+      if (args.start_line != null) execPayload.start_line = args.start_line;
+      if (args.end_line != null) execPayload.end_line = args.end_line;
+    } else {
+      // Tool executor: read_file, list_dir, grep, find_files, browse_url
+      execPayload.path = args.path || undefined;
+      execPayload.pattern = args.pattern || undefined;
+      execPayload.recursive = args.recursive;
+      execPayload.start_line = args.start_line;
+      execPayload.end_line = args.end_line;
+      execPayload.url = args.url || undefined;
+      execPayload.query = args.query || undefined;
+      execPayload.limit = args.limit;
+    }
+
+    const response = await axiosWithRetry('post', targetUrl, execPayload, undefined, { timeout: LLM_TIMEOUT_MS });
+    const data = response.data;
+    return {
+      output: data.output ?? data.result ?? data.response_text ?? JSON.stringify(data),
+      success: data.success ?? true,
+    };
   }
 
   private async generateStreamingResponse(
@@ -5016,13 +5480,23 @@ export class InteractionService {
         url: `${responseUrl}${endpoint}`,
         data: payload,
         responseType: 'stream',
-        timeout: LLM_TIMEOUT_MS,
+        timeout: 0,
       });
 
       const stream = response.data;
-      
+
       return new Promise((resolve) => {
+        const IDLE_TIMEOUT_MS = 60_000;
+        let idleTimer: ReturnType<typeof setTimeout> | null = null;
+        const resetIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            try { stream.destroy(); } catch {}
+          }, IDLE_TIMEOUT_MS);
+        };
+
         stream.on('data', (chunk: Buffer) => {
+          resetIdle();
           const text = chunk.toString();
           fullResponse += text;
           this.events.publish('ResponseChunkGenerated', sessionId, {
@@ -5034,17 +5508,115 @@ export class InteractionService {
         });
 
         stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.log(`Finished streaming response (${fullResponse.length} chars)`);
           resolve(fullResponse);
         });
 
         stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.error(`Response stream error: ${err.message}`);
           resolve(fullResponse);
         });
       });
     } catch (err: any) {
       this.logger.warn(`Streaming response failed: ${err.message}`);
+      return '';
+    }
+  }
+
+  /**
+   * Same as generateStreamingResponse but reads NDJSON with "type" discrimination.
+   * - type="reasoning" → publishes ThinkingChunkGenerated (live thinking tokens for the frontend)
+   * - type="content"   → publishes ResponseChunkGenerated (visible response text)
+   * Falls back to plain-text mode if the response is not NDJSON (e.g. older endpoint).
+   */
+  private async generateStreamingResponseStructured(
+    sessionId: string,
+    interactionId: string,
+    clientMessageId: string | undefined,
+    payload: any,
+    endpoint: string, // '/internal/response/generate-stream-structured' or '/internal/response/chat-stream-structured'
+    signal?: AbortSignal,
+  ): Promise<string> {
+    let fullResponse = '';
+    let fullReasoning = '';
+    const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
+    try {
+      this.logger.log(`Starting structured streaming (${endpoint}) for session ${sessionId}`);
+      if (signal?.aborted) return '';
+      const response = await axios({
+        method: 'post',
+        url: `${responseUrl}${endpoint}`,
+        data: payload,
+        responseType: 'stream',
+        timeout: 0,
+        signal,
+      });
+
+      const stream = response.data;
+      const IDLE_TIMEOUT_MS = 60_000;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      const resetIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          try { stream.destroy(); } catch {}
+        }, IDLE_TIMEOUT_MS);
+      };
+
+      return new Promise((resolve) => {
+        stream.on('data', (chunk: Buffer) => {
+          resetIdle();
+          const raw = chunk.toString();
+          // NDJSON: each line is a JSON object
+          const lines = raw.split('\n').filter(Boolean);
+          for (const line of lines) {
+            try {
+              const item = JSON.parse(line);
+              if (item.type === 'reasoning') {
+                fullReasoning += item.text;
+                this.events.publish('ThinkingChunkGenerated', sessionId, {
+                  chunk: item.text,
+                  full_reasoning: fullReasoning,
+                  interaction_id: interactionId,
+                  client_message_id: clientMessageId,
+                }).catch(err => this.logger.warn(`Failed to publish thinking chunk: ${err.message}`));
+              } else if (item.type === 'content') {
+                fullResponse += item.text;
+                this.events.publish('ResponseChunkGenerated', sessionId, {
+                  chunk: item.text,
+                  interaction_id: interactionId,
+                  client_message_id: clientMessageId,
+                  full_text: fullResponse,
+                }).catch(err => this.logger.warn(`Failed to publish response chunk: ${err.message}`));
+              }
+            } catch {
+              // Not valid JSON — fall back to plain-text chunk (compatibility)
+              fullResponse += line;
+              this.events.publish('ResponseChunkGenerated', sessionId, {
+                chunk: line,
+                interaction_id: interactionId,
+                client_message_id: clientMessageId,
+                full_text: fullResponse,
+              }).catch(err => this.logger.warn(`Failed to publish response chunk: ${err.message}`));
+            }
+          }
+        });
+
+        stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          this.logger.log(`Finished structured streaming (response: ${fullResponse.length} chars, reasoning: ${fullReasoning.length} chars)`);
+          resolve(fullResponse);
+        });
+
+        stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
+          this.logger.error(`Structured streaming error: ${err.message}`);
+          resolve(fullResponse);
+        });
+      });
+    } catch (err: any) {
+      this.logger.warn(`Structured streaming failed: ${err.message}`);
       return '';
     }
   }
@@ -5089,13 +5661,19 @@ export class InteractionService {
         url: `${responseUrl}/internal/response/tool-plan-stream`,
         data: payload,
         responseType: 'stream',
-        timeout: LLM_TIMEOUT_MS,
+        timeout: 0,
       });
 
       const stream = response.data;
+      const IDLE_TIMEOUT_MS = 60_000;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
       return new Promise((resolve) => {
         stream.on('data', (chunk: Buffer) => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            try { stream.destroy(); } catch {}
+          }, IDLE_TIMEOUT_MS);
           const text = chunk.toString();
           fullJsonText += text;
 
@@ -5130,6 +5708,7 @@ export class InteractionService {
         });
 
         stream.on('end', async () => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.log(`Finished streaming tool-plan (${fullJsonText.length} chars)`);
 
           const spanInput: Record<string, unknown> = {
@@ -5270,6 +5849,7 @@ export class InteractionService {
         });
 
         stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.error(`Tool-plan stream error: ${err.message}`);
           try {
             trace

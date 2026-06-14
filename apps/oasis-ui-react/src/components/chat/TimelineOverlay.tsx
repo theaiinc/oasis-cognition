@@ -44,6 +44,7 @@ const NOISE_EVENTS = new Set([
   'ThoughtChunkGenerated',
   'ResponseChunkGenerated',
   'ToolReasoningChunkGenerated',
+  'ThinkingChunkGenerated',
 ]);
 
 export function TimelineOverlay({ sessionId, events, onClose }: TimelineOverlayProps) {

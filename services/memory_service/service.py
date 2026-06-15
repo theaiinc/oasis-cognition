@@ -265,6 +265,7 @@ class MemoryService:
         user_id: str = "default",
         session_id: str | None = None,
         walls: list[str] | None = None,
+        project_id: str | None = None,
     ) -> None:
         content = graph.model_dump(mode="json")
         if session_id:
@@ -274,6 +275,8 @@ class MemoryService:
         tags = [n.title for n in graph.nodes[:5]]
         if session_id:
             tags.append(f"session:{session_id}")
+        if project_id:
+            tags.append(f"project:{project_id}")
         if walls:
             for w in walls[:10]:
                 tags.append(f"wall:{w}")
@@ -335,6 +338,7 @@ class MemoryService:
         reason: str,
         suggestion: str = "",
         session_id: str | None = None,
+        project_id: str | None = None,
         user_id: str = "default",
     ) -> None:
         """Store a 'not achievable' entry for a goal (path doesn't exist, etc.)."""
@@ -350,6 +354,8 @@ class MemoryService:
         if session_id:
             content["session_id"] = session_id
             tags.append(f"session:{session_id}")
+        if project_id:
+            tags.append(f"project:{project_id}")
         entry = MemoryEntry(
             memory_type=MemoryType.EPISODIC,
             content=content,
@@ -974,7 +980,7 @@ class MemoryService:
 
         return {"nodes": nodes, "edges": edges}
 
-    async def retrieve(self, query: str, limit: int = 10, session_id: str | None = None) -> list[MemoryEntry]:
+    async def retrieve(self, query: str, limit: int = 10, session_id: str | None = None, project_id: str | None = None) -> list[MemoryEntry]:
         if self._use_fallback:
             results = []
             for m in self._fallback_memories:
@@ -984,6 +990,10 @@ class MemoryService:
                         tags = m.get("tags", [])
                         if session_id not in str(content) and f"session:{session_id}" not in tags:
                             continue
+                    if project_id:
+                        tags = m.get("tags", [])
+                        if f"project:{project_id}" not in tags:
+                            continue
                     results.append(MemoryEntry(**m))
                     if len(results) >= limit:
                         break
@@ -992,9 +1002,12 @@ class MemoryService:
         params: dict[str, Any] = {"q": query, "limit": limit}
         where_extra = ""
         if session_id:
-            where_extra = " AND (m.content CONTAINS $session_id OR m.tags CONTAINS $session_tag)"
+            where_extra += " AND (m.content CONTAINS $session_id OR m.tags CONTAINS $session_tag)"
             params["session_id"] = session_id
             params["session_tag"] = f"session:{session_id}"
+        if project_id:
+            where_extra += " AND m.tags CONTAINS $project_tag"
+            params["project_tag"] = f"project:{project_id}"
 
         with self._driver.session() as session:
             result = session.run(

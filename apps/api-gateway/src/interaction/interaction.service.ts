@@ -1950,11 +1950,15 @@ export class InteractionService {
     try {
       const projectId = req.context?.project_id;
       const mentionedIds: string[] = req.context?.mentioned_artifact_ids || [];
+      const queryParams: Record<string, any> = { q: req.user_message, limit: 5, session_id: sessionId };
+      if (projectId) queryParams.project_id = projectId;
       const [memRes, rulesRes, artSearchRes, artMentions] = await Promise.all([
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-          params: { q: req.user_message, limit: 5, session_id: sessionId },
+          params: queryParams,
         }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
-        axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
+        projectId
+          ? axiosWithRetry('get', `${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 })
+          : axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
         fetchArtifactSearchResults(req.user_message, projectId, 5),
         resolveArtifactMentions(mentionedIds),
       ]);
@@ -2055,15 +2059,20 @@ export class InteractionService {
       const problemTitle = semanticStructure.problem || req.user_message;
       const projectId = req.context?.project_id;
       const mentionedIds: string[] = req.context?.mentioned_artifact_ids || [];
+      const queryParams: Record<string, any> = { q: problemTitle, limit: 5, session_id: sessionId };
+      if (projectId) queryParams.project_id = projectId;
       const [memRes, foundationalRes, rulesRes, artSearchRes, artMentions] = await Promise.all([
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-          params: { q: problemTitle, limit: 5, session_id: sessionId },
+          params: queryParams,
         }, undefined, { timeout: FAST_TIMEOUT_MS }),
         // Also fetch foundational graph nodes for grounded reasoning
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/nodes-by-tier`, {
           params: { tier: 'foundational', session_id: sessionId, limit: 10 },
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => ({ data: { nodes: [] } })),
-        axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS }),
+        // Use project-scoped rules when a project is active, otherwise global rules
+        projectId
+          ? axiosWithRetry('get', `${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS })
+          : axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS }),
         fetchArtifactSearchResults(req.user_message, projectId, 5),
         resolveArtifactMentions(mentionedIds),
       ]);
@@ -2197,6 +2206,7 @@ export class InteractionService {
       await axiosWithRetry('post', `${MEMORY_URL}/internal/memory/store`, {
         reasoning_graph: decisionTree.graph || reasoningGraph,
         user_id: 'default',
+        project_id: req.context?.project_id,
       }, undefined, { timeout: FAST_TIMEOUT_MS });
       storeSpan?.end({ output: { graph_id: reasoningGraph.id } });
       await this.events.publish('MemoryUpdated', sessionId, {
@@ -2431,17 +2441,24 @@ export class InteractionService {
 
       const projectId = req.context?.project_id;
       const mentionedIds: string[] = req.context?.mentioned_artifact_ids || [];
+      const queryParams: Record<string, any> = { q: memoryQuery, limit: 5, session_id: sessionId };
+      if (projectId) queryParams.project_id = projectId;
       const [memRes, foundationalRes, rulesRes, artSearchRes, artMentions] = await Promise.all([
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-          params: { q: memoryQuery, limit: 5, session_id: sessionId },
+          params: queryParams,
         }, undefined, { timeout: FAST_TIMEOUT_MS }),
         // Fetch foundational graph nodes — these should always inform tool-use planning
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/nodes-by-tier`, {
           params: { tier: 'foundational', session_id: sessionId, limit: 10 },
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => ({ data: { nodes: [] } })),
-        axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, {
-          params: rulesParams,
-        }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
+        // Use project-scoped rules when a project is active, otherwise global rules
+        projectId
+          ? axiosWithRetry('get', `${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}/rules`, {
+              params: rulesParams,
+            }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 })
+          : axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, {
+              params: rulesParams,
+            }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
         // Fetch project artifacts via RAG search so tool-use planning has artifact context
         fetchArtifactSearchResults(req.user_message, projectId, 5),
         resolveArtifactMentions(mentionedIds),
@@ -2660,6 +2677,7 @@ export class InteractionService {
           reason,
           suggestion,
           session_id: sessionId,
+          project_id: req.context?.project_id,
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => {});
         toolSpan?.end({ output: { feasibility: 'not_achievable' } });
         trace?.update({ output: { response: `This task appears not achievable: ${reason}. ${suggestion}`, route: 'tool_use' } });
@@ -3502,6 +3520,7 @@ export class InteractionService {
                   reasoning_graph: taskGraph,
                   user_id: 'default',
                   session_id: sessionId,
+                  project_id: req.context?.project_id,
                   walls: wallsHit.length > 0 ? wallsHit : undefined,
                 }, undefined, { timeout: FAST_TIMEOUT_MS });
               } catch {
@@ -5079,6 +5098,7 @@ export class InteractionService {
               reasoning_graph: taskGraph,
               user_id: 'default',
               session_id: sessionId,
+              project_id: req.context?.project_id,
               walls: wallsHit.length > 0 ? wallsHit : undefined,
             }, undefined, { timeout: FAST_TIMEOUT_MS });
             const conclusion = obsRes.data.goal_met ? 'Goal met' : `Goal not met: ${obsRes.data.feedback || 'Continue working on the task.'}`;
@@ -5213,6 +5233,7 @@ export class InteractionService {
           reasoning_graph: taskGraph,
           user_id: 'default',
           session_id: sessionId,
+          project_id: req.context?.project_id,
           walls: wallsHit.length > 0 ? wallsHit : undefined,
         }, undefined, { timeout: FAST_TIMEOUT_MS });
       } catch {

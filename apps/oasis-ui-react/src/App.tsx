@@ -115,6 +115,9 @@ export default function App() {
     setActiveProjectId(id);
     if (id) localStorage.setItem('oasis_active_project', id);
     else localStorage.removeItem('oasis_active_project');
+    // Clear session-bound graphs/timelines from the old project so stale data doesn't persist
+    setGraphsBySessionId({});
+    setTimelineByClientMessageId({});
   }, []);
   const [contextBudget, setContextBudget] = useState<ContextBudget | null>(null);
   const [activeProjectName, setActiveProjectName] = useState<string | undefined>(undefined);

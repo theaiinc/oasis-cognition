@@ -1,0 +1,72 @@
+services:
+  # Re-use the main docker-compose infrastructure but add test-specific config
+  neo4j:
+    image: neo4j:5-community
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/test-password
+      - NEO4J_PLUGINS=["apoc"]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p test-password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Core services needed for the test scenarios
+  api-gateway:
+    build:
+      context: ../../apps/api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8008:8008"
+    environment:
+      - OASIS_LLM_PROVIDER=ollama
+      - OASIS_LLM_MODEL=qwen3:8b
+      - OASIS_NEO4J_URI=bolt://neo4j:7687
+      - OASIS_NEO4J_USER=neo4j
+      - OASIS_NEO4J_PASSWORD=test-password
+      - OASIS_REDIS_HOST=redis
+      - OASIS_REDIS_PORT=6379
+      - OASIS_RESPONSE_GENERATOR_URL=http://response-generator:8012
+      - OASIS_MEMORY_SERVICE_URL=http://memory-service:8011
+      - OASIS_INTERPRETER_URL=http://interpreter:8005
+      - OASIS_GRAPH_BUILDER_URL=http://graph-builder:8006
+      - OASIS_LOGIC_ENGINE_URL=http://logic-engine:8004
+      - OASIS_OBSERVER_URL=http://observer-service:8021
+    depends_on:
+      neo4j: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  response-generator:
+    build:
+      context: ../../services/response_generator
+      dockerfile: Dockerfile
+    ports:
+      - "8012:8012"
+    environment:
+      - OASIS_LLM_PROVIDER=ollama
+      - OASIS_LLM_MODEL=qwen3:8b
+
+  memory-service:
+    build:
+      context: ../../services/memory_service
+      dockerfile: Dockerfile
+    ports:
+      - "8011:8011"
+    environment:
+      - OASIS_NEO4J_URI=bolt://neo4j:7687
+      - OASIS_NEO4J_USER=neo4j
+      - OASIS_NEO4J_PASSWORD=test-password

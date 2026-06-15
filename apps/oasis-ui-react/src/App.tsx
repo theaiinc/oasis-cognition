@@ -122,6 +122,11 @@ export default function App() {
   const [contextBudget, setContextBudget] = useState<ContextBudget | null>(null);
   const [activeProjectName, setActiveProjectName] = useState<string | undefined>(undefined);
 
+  // ── Infinite-scroll pagination state ──────────────────────────────────
+  const [historyPage, setHistoryPage] = useState(0);
+  const [hasMoreHistory, setHasMoreHistory] = useState(true);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
   // ── Agent completion notifications ──
   const [notifications, setNotifications] = useState<string[]>([]);
   const originalTitleRef = useRef<string>('');
@@ -209,56 +214,14 @@ export default function App() {
   // When the user refreshes, restore the chat history so the session picks
   // up where they left off.  If the last interaction was in-flight we also
   // persist & restore the client message id so SSE backlog events
-  // (ResponseChunkGenerated, ThinkingChunkGenerated etc.) find the correct
-  // message rows instead of duplicating.
+  // find the correct message rows instead of duplicating.
   useEffect(() => {
     const sid = sessionStorage.getItem('oasis-session-id');
     if (!sid) return;
 
     const storedClientId = sessionStorage.getItem('oasis-last-client-msg');
 
-    axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, { params: { session_id: sid }, timeout: 8000 })
-      .then(res => {
-        const raw = res.data.messages || [];
-        const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
-          id: '',
-          text: m.content,
-          sender: m.role === 'user' ? 'user' : 'assistant',
-          timestamp: new Date(m.timestamp),
-        }));
-
-        // If the last interaction was in-flight, reconstruct the last user
-        // (and possibly assistant) row with SSE-compatible IDs so backlog
-        // events find the matching rows instead of duplicating.
-        if (storedClientId && msgs.length >= 1) {
-          const last = msgs[msgs.length - 1];
-          if (last.sender === 'user') {
-            // In-flight: user message has no reply yet
-            msgs[msgs.length - 1] = { ...last, id: storedClientId };
-          } else {
-            // Completed pair (last msg is assistant)
-            if (msgs.length >= 2 && msgs[msgs.length - 2]?.sender === 'user') {
-              msgs[msgs.length - 2] = { ...msgs[msgs.length - 2], id: storedClientId };
-              msgs[msgs.length - 1] = { ...last, id: assistantMessageId(storedClientId) };
-            }
-            sessionStorage.removeItem('oasis-last-client-msg');
-          }
-        }
-
-        // Fallback: stable hist-* IDs for everything without an assigned id
-        setMessages(msgs.map((m, i) => (m.id ? m : { ...m, id: `hist-${sid}-${i}` })));
-
-        // If the last message is user with no assistant reply →
-        // an interaction was in-flight when the page was closed/refreshed.
-        if (msgs.length > 0 && msgs[msgs.length - 1].sender === 'user') {
-          // Restore the active client message id so ThinkingOverlay shows progress
-          if (storedClientId) setActiveClientMessageId(storedClientId);
-          setIsThinking(true);
-        }
-      })
-      .catch(() => {
-        // No history for this session yet — start fresh
-      });
+    loadHistoryPage(sid, 0, false, storedClientId);
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   const quickUpload = useQuickUpload();
@@ -494,14 +457,18 @@ export default function App() {
 
   const loadSession = useCallback(async (sessionId: string) => {
     try {
-      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, { params: { session_id: sessionId } });
-      const msgs: Message[] = (res.data.messages || []).map((m: { role: string; content: string; timestamp: string }, i: number) => ({
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, { params: { session_id: sessionId, page: 0, limit: 50 } });
+      const raw = res.data.messages || [];
+      const hasMore = res.data.has_more === true;
+      setHasMoreHistory(hasMore);
+      const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
         id: `hist-${sessionId}-${i}`,
         text: m.content,
         sender: m.role === 'user' ? 'user' : 'assistant',
         timestamp: new Date(m.timestamp),
       }));
       setMessages(msgs);
+      setHistoryPage(0);
       setTextSessionId(sessionId);
       sessionStorage.setItem('oasis-session-id', sessionId);
       setTimelineByClientMessageId({});
@@ -692,6 +659,70 @@ export default function App() {
       lastScrollTop.current = viewport.scrollHeight;
     }
   }, []);
+
+  // ── Infinite-scroll history pagination ──────────────────────────────────
+  const loadingHistoryRef = useRef(false);
+  const loadHistoryPage = useCallback(async (sid: string, page: number, append: boolean, storedClientId?: string | null) => {
+    if (loadingHistoryRef.current) return;
+    loadingHistoryRef.current = true;
+    setLoadingHistory(true);
+    try {
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, {
+        params: { session_id: sid, page, limit: 50 },
+        timeout: 8000,
+      });
+      const raw = res.data.messages || [];
+      const hasMore = res.data.has_more === true;
+      setHasMoreHistory(hasMore);
+
+      if (page === 0 && !append) {
+        // Initial load: assign IDs and handle in-flight interaction
+        const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
+          id: '',
+          text: m.content,
+          sender: m.role === 'user' ? 'user' : 'assistant',
+          timestamp: new Date(m.timestamp),
+        }));
+
+        // If the last interaction was in-flight, reconstruct rows with SSE-compatible IDs
+        if (storedClientId && msgs.length >= 1) {
+          const last = msgs[msgs.length - 1];
+          if (last.sender === 'user') {
+            msgs[msgs.length - 1] = { ...last, id: storedClientId };
+          } else {
+            if (msgs.length >= 2 && msgs[msgs.length - 2]?.sender === 'user') {
+              msgs[msgs.length - 2] = { ...msgs[msgs.length - 2], id: storedClientId };
+              msgs[msgs.length - 1] = { ...last, id: assistantMessageId(storedClientId) };
+            }
+            sessionStorage.removeItem('oasis-last-client-msg');
+          }
+        }
+
+        setMessages(msgs.map((m, i) => (m.id ? m : { ...m, id: `hist-${sid}-${i}` })));
+
+        if (msgs.length > 0 && msgs[msgs.length - 1].sender === 'user') {
+          if (storedClientId) setActiveClientMessageId(storedClientId);
+          setIsThinking(true);
+        }
+      } else {
+        // Append older messages at the beginning (prepend)
+        const olderMsgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
+          id: `hist-${sid}-p${page}-${i}`,
+          text: m.content,
+          sender: m.role === 'user' ? 'user' : 'assistant',
+          timestamp: new Date(m.timestamp),
+        }));
+        setMessages(prev => [...olderMsgs, ...prev]);
+      }
+      setHistoryPage(page);
+    } catch {
+      // No more history or error
+      setHasMoreHistory(false);
+    } finally {
+      loadingHistoryRef.current = false;
+      setLoadingHistory(false);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Sync autonomous mode to backend whenever session changes (including new chats)
   useEffect(() => {
@@ -1570,31 +1601,26 @@ export default function App() {
                 />
               )}
 
-              {messages.length <= 20
-                ? messages.map((m) => (
-                    <ChatMessage
-                      key={m.id}
-                      message={m}
-                      timelineEvents={timelineByClientMessageId[timelineClientKeyForMessage(m)] || []}
-                      onOptionClick={handleOptionClick}
-                      onReply={(id, text) => { setReplyToMessageId(id); setReplyToMessageText(text); }}
-                      onViewTimeline={setSelectedTimelineMessageId}
-                      onEditResend={setInputText}
-                      onResend={sendText}
-                      inputRef={inputRef}
-                    />
-                  ))
-                : <VirtualizedChatMessages
-                    messages={messages}
-                    timelineByClientMessageId={timelineByClientMessageId}
-                    onOptionClick={handleOptionClick}
-                    onReply={(id, text) => { setReplyToMessageId(id); setReplyToMessageText(text); }}
-                    onViewTimeline={setSelectedTimelineMessageId}
-                    onEditResend={setInputText}
-                    onResend={sendText}
-                    inputRef={inputRef}
-                  />
-              }
+              {messages.length > 0 && (
+                <VirtualizedChatMessages
+                  messages={messages}
+                  timelineByClientMessageId={timelineByClientMessageId}
+                  onOptionClick={handleOptionClick}
+                  onReply={(id, text) => { setReplyToMessageId(id); setReplyToMessageText(text); }}
+                  onViewTimeline={setSelectedTimelineMessageId}
+                  onEditResend={setInputText}
+                  onResend={sendText}
+                  inputRef={inputRef}
+                  loadMore={() => {
+                    if (hasMoreHistory && !loadingHistory && textSessionId) {
+                      const nextPage = historyPage + 1;
+                      loadHistoryPage(textSessionId, nextPage, true);
+                    }
+                  }}
+                  hasMore={hasMoreHistory}
+                  loadingMore={loadingHistory}
+                />
+              )}
 
               <VoiceBubbles isTranscribing={voice.isTranscribing} liveTranscript={voice.liveTranscript} silenceSeconds={voice.silenceSeconds} />
 

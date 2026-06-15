@@ -10,3 +10,4 @@ export { ChatInputArea } from './ChatInputArea';
 export { ThinkingOverlay } from './ThinkingOverlay';
 export { VoiceBubbles } from './VoiceBubbles';
 export { ArtifactMentionDropdown } from './ArtifactMentionDropdown';
+export { StreamingCard } from './StreamingCard';

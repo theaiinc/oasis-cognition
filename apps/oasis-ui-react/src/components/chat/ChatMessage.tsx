@@ -6,7 +6,7 @@ import { cn, getErrorMessage, timelineClientKeyForMessage } from '@/lib/utils';
 import type { Message, TimelineEvent } from '@/lib/types';
 import { OASIS_BASE_URL } from '@/lib/constants';
 import { parseMessageMentions } from '@/lib/mention-utils';
-import { MarkdownMessage } from '@oasis/ui-kit';
+import { StreamingCard } from './StreamingCard';
 import { DiffViewer } from './DiffViewer';
 import { ActivityStream } from './ActivityStream';
 import { ToolCallsScrollContainer } from './ToolCallsScrollContainer';
@@ -42,6 +42,10 @@ export function ChatMessage({
   const thoughtLayers = timelineEvents.filter(e => e.event_type === 'ThoughtLayerGenerated');
   const hasStreamActivity = toolStarts.length > 0 || thoughts.length > 0 || thoughtLayers.length > 0;
   const diffEvent = timelineEvents.find(e => e.event_type === 'ToolCallCompleted' && (e.payload as Record<string, unknown>).diff);
+
+  // Is this assistant message actively streaming? Only if it's the last message
+  // and there's no terminal event yet.
+  const isStreaming = m.sender === 'assistant' && !m.text;
 
   // Mission digest cards have their own visual lane (full-width, no avatar/bubble) —
   // render an early return so the rest of the assistant/user/system layout stays simple.
@@ -136,18 +140,31 @@ export function ChatMessage({
           );
         })()}
         <div className="flex flex-col gap-1">
-          <div className={cn(
-            "p-4 rounded-2xl text-sm leading-relaxed shadow-sm",
-            m.sender === 'user' ? "bg-blue-600 text-white rounded-tr-none" : "bg-slate-900 border border-slate-800 text-slate-200 rounded-tl-none",
-            m.sender === 'system' && "bg-slate-950 border-none italic text-slate-400 py-2 px-0",
-            m.sender === 'assistant' && "max-h-72 overflow-y-auto"
-          )}>
-            {m.sender === 'assistant' ? (
-              <MarkdownMessage text={m.text} onOptionClick={onOptionClick} />
-            ) : (
+          {m.sender === 'assistant' ? (
+            <StreamingCard
+              variant="assistant"
+              content={m.text}
+              streaming={isStreaming}
+              autoScroll={false}
+              maxHeight="18rem"
+              onOptionClick={onOptionClick}
+            >
+              {m.sender === 'assistant' && timelineEvents.length > 0 && (
+                <ThinkingCard events={timelineEvents} onViewTimeline={() => onViewTimeline(timelineClientKeyForMessage(m))} />
+              )}
+            </StreamingCard>
+          ) : (
+            <div className={cn(
+              "p-4 rounded-2xl text-sm leading-relaxed shadow-sm",
+              m.sender === 'user' ? "bg-blue-600 text-white rounded-tr-none" : (
+                m.sender === 'system'
+                  ? "bg-slate-950 border-none italic text-slate-400 py-2 px-0"
+                  : "bg-slate-900 border border-slate-800 text-slate-200 rounded-tl-none"
+              ),
+            )}>
               <UserMessageText text={m.text} />
-            )}
-          </div>
+            </div>
+          )}
           {m.sender === 'user' && (
             <div className={cn("flex gap-2 text-[10px] text-slate-500 mt-0.5", "justify-end")}>
               <button type="button" className="hover:text-slate-300 underline underline-offset-2" onClick={() => { onEditResend(m.text); inputRef.current?.focus(); }}>Edit &amp; resend</button>
@@ -164,9 +181,6 @@ export function ChatMessage({
             </div>
           )}
         </div>
-        {m.sender === 'assistant' && timelineEvents.length > 0 && (
-          <ThinkingCard events={timelineEvents} onViewTimeline={() => onViewTimeline(timelineClientKeyForMessage(m))} />
-        )}
       </div>
     </motion.div>
   );
@@ -197,4 +211,3 @@ function UserMessageText({ text }: { text: string }) {
     </>
   );
 }
-

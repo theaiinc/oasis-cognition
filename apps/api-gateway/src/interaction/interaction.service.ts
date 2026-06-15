@@ -93,8 +93,8 @@ function resolveThoughtTimeout(provider?: string | null, model?: string | null):
   const size = variant.parameter_size_b;
   // 0 = unknown/proprietary → use default
   if (size <= 0) return FAST_TIMEOUT_MS;
-  if (size <= 4) return 60_000;   // 2B models: 60s
-  if (size <= 12) return 45_000;  // 8B models: 45s
+  if (size <= 4) return 120_000;  // 2B models: 120s (gemma-4-e2b is slow)
+  if (size <= 12) return 60_000;  // 8B models: 60s
   return FAST_TIMEOUT_MS;          // 12B+: 30s
 }
 
@@ -1045,7 +1045,7 @@ function extractAndParseJson(text: string): any | null {
 }
 
 // Timeout for LLM-backed calls (interpreter, response-generator, teaching)
-const LLM_TIMEOUT_MS = 300_000;
+const LLM_TIMEOUT_MS = 600_000;
 const SESSION_CLEANUP_MS = 600_000;
 // Timeout for fast internal calls (graph-builder, logic-engine, memory)
 const FAST_TIMEOUT_MS = 30_000;
@@ -1134,10 +1134,10 @@ function selectModelByRouter(
   if (c === 'medium') return '4b';
   return '12b';
 }
-const OBSERVER_VALIDATE_TIMEOUT_MS = Number(process.env.OBSERVER_VALIDATE_TIMEOUT_MS) || 180_000;
+const OBSERVER_VALIDATE_TIMEOUT_MS = Number(process.env.OBSERVER_VALIDATE_TIMEOUT_MS) || 300_000;
 // Max retries for transient failures (service restarting after crash)
-const MAX_RETRIES = 2;
-const RETRY_DELAY_MS = 2000;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 3000;
 
 /**
  * Axios call with timeout + retry. If a service crashes and Docker restarts it,

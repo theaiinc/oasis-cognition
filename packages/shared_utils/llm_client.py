@@ -11,6 +11,12 @@ from packages.shared_utils.config import Settings
 
 logger = logging.getLogger(__name__)
 
+# Maximum number of retries for transient 5xx LLM provider errors.
+# gemma-4 on LM Studio sometimes returns 500/503 under load; a short
+# backoff avoids aborting the pipeline unnecessarily.
+_LLM_RETRIES = 2
+_LLM_RETRY_DELAY_MS = 2000
+
 
 class LLMClient:
     """Provider-agnostic LLM client.
@@ -355,7 +361,6 @@ class LLMClient:
         history: list[dict[str, str]] | None = None,
     ) -> str:
         """Cancellable async Anthropic call via httpx.AsyncClient."""
-        import httpx
         messages: list[dict[str, str]] = list(history or [])
         messages.append({"role": "user", "content": user_message})
         base_url = "https://api.anthropic.com/v1"
@@ -366,10 +371,11 @@ class LLMClient:
             "Content-Type": "application/json",
         }
         body = {"model": model, "max_tokens": max_tokens, "system": system, "messages": messages}
-        async with httpx.AsyncClient(timeout=None) as http:
-            resp = await http.post(f"{base_url}/messages", json=body, headers=headers)
-            data = resp.json()
-            return data["content"][0]["text"].strip()
+
+        data = await self._async_llm_call_with_retry(
+            f"{base_url}/messages", body, headers,
+        )
+        return data["content"][0]["text"].strip()
 
     def _call_openai(
         self, system: str, user_message: str, model: str, max_tokens: int,
@@ -386,6 +392,62 @@ class LLMClient:
         )
         return response.choices[0].message.content.strip()
 
+    @staticmethod
+    async def _async_llm_call(
+        http: httpx.AsyncClient,
+        url: str,
+        body: dict,
+        headers: dict,
+        timeout: float | None = None,
+    ) -> dict:
+        """Fire a single POST and return parsed JSON.
+
+        *timeout=None* means no HTTP-level timeout — the connection stays open
+        for as long as the LLM backend needs (critical for slow gemma-4).
+        """
+        resp = await http.post(url, json=body, headers=headers, timeout=timeout)
+        data = resp.json()
+        if resp.status_code >= 500:
+            raise RuntimeError(f"LLM provider 5xx ({resp.status_code}): {str(data)[:200]}")
+        if resp.status_code >= 400:
+            raise ValueError(f"LLM provider 4xx ({resp.status_code}): {str(data)[:200]}")
+        return data
+
+    @staticmethod
+    async def _async_llm_call_with_retry(
+        url: str,
+        body: dict,
+        headers: dict,
+        max_retries: int = _LLM_RETRIES,
+        timeout: float | None = None,
+    ) -> dict:
+        """POST with retry on 5xx / network blips.
+
+        gemma-4 on LM Studio sometimes returns transient 500 under load;
+        a short backoff avoids aborting the pipeline unnecessarily.
+        """
+        import httpx
+
+        last_err: Exception | None = None
+        for attempt in range(1, max_retries + 2):  # 1 initial + max_retries
+            try:
+                async with httpx.AsyncClient(timeout=None) as http:
+                    return await LLMClient._async_llm_call(http, url, body, headers, timeout)
+            except (httpx.HTTPError, RuntimeError, ValueError, KeyError, IndexError) as e:
+                last_err = e
+                is_5xx = isinstance(e, RuntimeError)
+                is_network = isinstance(e, httpx.HTTPError)
+                if attempt <= max_retries and (is_5xx or is_network):
+                    delay = _LLM_RETRY_DELAY_MS * attempt
+                    logger.warning(
+                        "LLM call attempt %d/%d failed (%s), retrying in %dms",
+                        attempt, max_retries + 1, e, delay,
+                    )
+                    await asyncio.sleep(delay / 1000)
+                    continue
+                raise
+        raise last_err  # type: ignore[misc]
+
     async def _call_openai_async(
         self, system: str, user_message: str, model: str, max_tokens: int,
         history: list[dict[str, str]] | None = None,
@@ -393,7 +455,6 @@ class LLMClient:
         """Cancellable async non-streaming OpenAI call via httpx.AsyncClient.
         When the caller task is cancelled (e.g. gateway aborted the HTTP request),
         this closes the connection to LM Studio so the model stops computing."""
-        import httpx
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
@@ -405,10 +466,10 @@ class LLMClient:
         }
         body = {"model": model, "max_tokens": max_tokens, "messages": messages, "stream": False}
 
-        async with httpx.AsyncClient(timeout=None) as http:
-            resp = await http.post(f"{base_url}/chat/completions", json=body, headers=headers)
-            data = resp.json()
-            return data["choices"][0]["message"]["content"].strip()
+        data = await self._async_llm_call_with_retry(
+            f"{base_url}/chat/completions", body, headers,
+        )
+        return data["choices"][0]["message"]["content"].strip()
 
     async def _call_openai_structured_async(
         self, system: str, user_message: str, model: str, max_tokens: int,
@@ -420,7 +481,6 @@ class LLMClient:
         Returns ``{"type": "text", "content": "..."}`` or
         ``{"type": "tool_calls", "calls": [...], "content": "..."}``.
         """
-        import httpx
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
@@ -440,9 +500,9 @@ class LLMClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
-        async with httpx.AsyncClient(timeout=None) as http:
-            resp = await http.post(f"{base_url}/chat/completions", json=body, headers=headers)
-            data = resp.json()
+        data = await self._async_llm_call_with_retry(
+            f"{base_url}/chat/completions", body, headers,
+        )
 
         choice = data["choices"][0]
         message = choice.get("message", {})
@@ -523,18 +583,17 @@ class LLMClient:
         history: list[dict[str, str]] | None = None,
     ) -> str:
         """Cancellable async Ollama call via httpx.AsyncClient."""
-        import httpx
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
         base_url = (self._settings.ollama_base_url or "http://localhost:11434").rstrip("/")
-        async with httpx.AsyncClient(timeout=None) as http:
-            resp = await http.post(
-                f"{base_url}/api/chat",
-                json={"model": model, "messages": messages, "options": {"num_predict": max_tokens}, "stream": False},
-            )
-            data = resp.json()
-            return data["message"]["content"].strip()
+
+        data = await self._async_llm_call_with_retry(
+            f"{base_url}/api/chat",
+            {"model": model, "messages": messages, "options": {"num_predict": max_tokens}, "stream": False},
+            {"Content-Type": "application/json"},
+        )
+        return data["message"]["content"].strip()
 
     async def _call_ollama_structured_async(
         self, system: str, user_message: str, model: str, max_tokens: int,

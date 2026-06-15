@@ -6213,10 +6213,11 @@ export class InteractionService {
 
           // Prefer flat `REASONING:` line (tool-plan prompt); fall back to partial JSON "reasoning" string.
           let currentReasoning = '';
-          const flatRe = /^\s*REASONING:\s*(.*)$/gim;
-          let fm: RegExpExecArray | null;
-          while ((fm = flatRe.exec(fullJsonText)) !== null) {
-            currentReasoning = (fm[1] ?? '').trimEnd();
+          // Multi-line: capture from REASONING: until the next recognized key or end of text.
+          const multiLineRe = /^\s*REASONING:\s*([\s\S]*?)(?=\n\s*(?:DECISION|ACTION|ANSWER|QUESTION|ANSWER_DIRECTLY|NEED_MORE_INFO|OPTIONS)\s*:|\n*$)/gim;
+          let mlMatch;
+          while ((mlMatch = multiLineRe.exec(fullJsonText)) !== null) {
+            currentReasoning = (mlMatch[1] ?? '').trimEnd();
           }
           if (!currentReasoning) {
             const reasoningMatch = fullJsonText.match(/"reasoning":\s*"([^"]*)/);

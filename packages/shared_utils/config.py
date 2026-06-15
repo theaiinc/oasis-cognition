@@ -88,6 +88,14 @@ class Settings(BaseSettings):
     # Empty = uses the same base URL as the vision model.
     computer_use_llm_base_url: str = ""
 
+    # Router model (tiny/fast model for intent routing)
+    router_model: str = ""  # empty = use llm_model as fallback
+
+    # Output token limits per model tier (0 = unlimited)
+    max_output_tokens_2b: int = 128
+    max_output_tokens_4b: int = 384
+    max_output_tokens_12b: int = 1024
+
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"

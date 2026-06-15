@@ -223,6 +223,9 @@ class ToolPlanRequest(BaseModel):
     tool_history_digest: list[str] | None = None  # compact one-liner per successful call from ALL toolResults
     artifact_search_results: list[dict[str, Any]] | None = None
     artifact_context: str | None = None
+    model_override: str | None = None  # model name for prompt-tier selection (e.g. "google/gemma-4-e2b")
+    rule_packs_to_inject: list[str] | None = None  # JIT-inject these rule packs (e.g. ["tool_rules", "coding_rules"])
+    max_tokens: int | None = None  # model-tier-specific output token cap
 
 class ThoughtGenerateRequest(BaseModel):
     user_message: str
@@ -294,6 +297,9 @@ async def tool_plan(req: ToolPlanRequest):
             free_thoughts=req.free_thoughts,
             active_worktree_id=req.active_worktree_id,
             tool_history_digest=req.tool_history_digest,
+            rule_packs_to_inject=req.rule_packs_to_inject,
+            model_override=req.model_override,
+            max_tokens=req.max_tokens,
         )
         # Attach context budget info so the gateway can relay to the UI
         if generator._last_context_budget:
@@ -358,9 +364,29 @@ async def tool_plan_stream(req: ToolPlanRequest):
             tool_history_digest=req.tool_history_digest,
             artifact_search_results=req.artifact_search_results,
             artifact_context=req.artifact_context,
+            model_override=req.model_override,
+            rule_packs_to_inject=req.rule_packs_to_inject,
+            max_tokens=req.max_tokens,
         ):
             yield chunk
     return StreamingResponse(generate(), media_type="text/plain")
+
+
+class RouteRequest(BaseModel):
+    user_message: str
+    chat_history: list[dict[str, str]] | None = None
+
+
+@app.post("/internal/route")
+async def route_request(req: RouteRequest):
+    """Classify a user request and return a model tier recommendation."""
+    from services.response_generator.service import route_request as _route
+
+    result = await _route(
+        user_message=req.user_message,
+        chat_history=req.chat_history,
+    )
+    return result
 
 
 class DecisionRequest(BaseModel):

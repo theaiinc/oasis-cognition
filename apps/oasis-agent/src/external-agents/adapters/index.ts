@@ -1,10 +1,12 @@
 import type { AgentAdapter, AgentType } from '../types';
 import { claudeCodeAdapter } from './claude-code';
 import { cursorCliAdapter } from './cursor-cli';
+import { openCodeAdapter } from './opencode';
 
 const ADAPTERS: Record<AgentType, AgentAdapter> = {
   'claude-code': claudeCodeAdapter,
   'cursor-cli': cursorCliAdapter,
+  'opencode': openCodeAdapter,
 };
 
 export function getAdapter(type: AgentType): AgentAdapter {

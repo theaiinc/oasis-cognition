@@ -1,4 +1,4 @@
-export type AgentType = 'claude-code' | 'cursor-cli';
+export type AgentType = 'claude-code' | 'cursor-cli' | 'opencode';
 
 export type PermissionMode =
   | 'plan'

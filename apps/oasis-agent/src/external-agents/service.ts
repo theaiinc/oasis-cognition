@@ -71,9 +71,9 @@ export class ExternalAgentsService {
       }
     }
 
-    if (resolvedAgentType === 'cursor-cli' && resolvedMcpEnabled) {
+    if ((resolvedAgentType === 'cursor-cli' || resolvedAgentType === 'opencode') && resolvedMcpEnabled) {
       console.warn(
-        `cursor-cli does not support per-session MCP loopback; mcp_enabled ignored for session ${session_id}.`,
+        `${resolvedAgentType} does not support per-session MCP loopback; mcp_enabled ignored for session ${session_id}.`,
       );
       resolvedMcpEnabled = false;
     }

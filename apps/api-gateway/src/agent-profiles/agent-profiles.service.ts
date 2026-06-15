@@ -95,7 +95,7 @@ export class AgentProfilesService implements OnModuleDestroy, OnModuleInit {
   async create(dto: CreateAgentProfileDto): Promise<AgentProfile> {
     if (!dto?.name?.trim()) throw new HttpException('name is required', HttpStatus.BAD_REQUEST);
     if (!dto?.agent_type) throw new HttpException('agent_type is required', HttpStatus.BAD_REQUEST);
-    if (!['internal', 'claude-code', 'cursor-cli'].includes(dto.agent_type)) {
+    if (!['internal', 'claude-code', 'cursor-cli', 'opencode'].includes(dto.agent_type)) {
       throw new HttpException(`unsupported agent_type: ${dto.agent_type}`, HttpStatus.BAD_REQUEST);
     }
     const now = iso();

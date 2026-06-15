@@ -5,7 +5,7 @@
  * and project roles both reference profiles by id.
  */
 
-export type ProfileAgentType = 'internal' | 'claude-code' | 'cursor-cli';
+export type ProfileAgentType = 'internal' | 'claude-code' | 'cursor-cli' | 'opencode';
 export type PermissionMode = 'plan' | 'acceptEdits' | 'bypassPermissions' | 'default';
 
 export interface AgentProfileConfig {
@@ -18,7 +18,7 @@ export interface AgentProfileConfig {
   /** External-only. Default `acceptEdits`. */
   permission_mode?: PermissionMode;
   /** External-only. Whether the Oasis MCP server should be auto-wired.
-   *  Defaults: true for claude-code, false for cursor-cli (no per-session
+   *  Defaults: true for claude-code, false for cursor-cli and opencode (no per-session
    *  MCP config flag). */
   mcp_enabled?: boolean;
   /** Prepended to every spawn's goal/prompt. Applied after the role

@@ -1048,11 +1048,11 @@ export default function App() {
         }
 
         if (data.event_type === 'ToolReasoningChunkGenerated') {
-          const fullReasoning = (data.payload as any).full_reasoning;
+          const fullReasoning = (data.payload as any).full_reasoning || '';
           const iteration = (data.payload as any).iteration;
+          // Update timeline event for this iteration
           setTimelineByClientMessageId(prev => {
             const events = prev[clientId] || [];
-            // Find and update the specific ToolCallStarted event for this iteration
             const updatedEvents = events.map(e => {
               if (e.event_type === 'ToolCallStarted' && (e.payload as any).iteration === iteration) {
                 return { ...e, payload: { ...e.payload, reasoning: fullReasoning } };
@@ -1061,6 +1061,9 @@ export default function App() {
             });
             return { ...prev, [clientId]: updatedEvents };
           });
+          // Update live reasoning overlay so thinking card shows tool-loop reasoning
+          seenThinkingRef.current.add(clientId);
+          setLiveReasoningByClientId(prev => ({ ...prev, [clientId]: fullReasoning }));
           return;
         }
 

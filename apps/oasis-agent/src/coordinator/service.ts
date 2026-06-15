@@ -12,6 +12,7 @@ import type {
   JobBudget,
   PlannerPlan,
   PreflightResult,
+  TaskResult,
 } from './types';
 import { JOB_REDIS_KEY, JOB_BUDGET_KEY, JOB_CHILD_KEY } from './types';
 
@@ -19,6 +20,8 @@ export class CoordinatorService {
   private redis: Redis | null = null;
   private redisReady = false;
   private readonly jobCache = new Map<string, CoordinatorJob>();
+  /** Accumulated results per task within a job, keyed by jobId → taskId → TaskResult */
+  private readonly taskResults = new Map<string, Record<string, TaskResult>>();
 
   constructor(
     private readonly preflight: CoordinatorPreflightService,
@@ -166,12 +169,22 @@ export class CoordinatorService {
     });
   }
 
-  async onChildReport(
+  private async onChildReport(
     jobId: string,
     taskId: string,
     report: { status: string; model?: string; tokens?: { input: number; output: number }; final_message?: string },
   ): Promise<void> {
     await this.setChild(jobId, taskId, { task_id: taskId, child_session_id: undefined, status: report.status });
+
+    // Store individual task result so parent agent can retrieve it
+    const results = this.taskResults.get(jobId) || {};
+    results[taskId] = {
+      status: report.status,
+      final_message: report.final_message || '',
+      model: report.model || null,
+      tokens: report.tokens || { input: 0, output: 0 },
+    };
+    this.taskResults.set(jobId, results);
 
     if (report.tokens) {
       await this.jobUsage.addChildUsage(jobId, {
@@ -197,8 +210,64 @@ export class CoordinatorService {
         total_cost: finalUsage.cost_usd,
         total_tokens: finalUsage.input_tokens + finalUsage.output_tokens,
         total_time_ms: 0,
+        task_results: results,
       });
     }
+  }
+
+  /**
+   * Get aggregated results for all tasks in a job.
+   * Returns a map of taskId → { status, final_message, model, tokens }.
+   */
+  async getTaskResults(jobId: string): Promise<Record<string, TaskResult>> {
+    return this.taskResults.get(jobId) || {};
+  }
+
+  // ── DAG-based parallel task execution ─────────────────────────────────────
+
+  /**
+   * Build a topological execution plan from the task list and their depends_on
+   * relationships.
+   *
+   * Returns an array of "layers" — each layer is a set of task IDs that can
+   * execute in parallel because all of their dependencies (depends_on) are in
+   * earlier layers.
+   *
+   * Tasks with no depends_on land in layer 0. If a task depends on a task that
+   * doesn't exist, it's still scheduled (the upstream result will be empty).
+   */
+  private buildDagLayers(tasks: CoordinatorTask[]): string[][] {
+    const taskIds = new Set(tasks.map(t => t.id));
+    const remaining = new Set(tasks.map(t => t.id));
+    const layers: string[][] = [];
+    const scheduled = new Set<string>();
+
+    while (remaining.size > 0) {
+      const layer: string[] = [];
+      for (const taskId of remaining) {
+        const task = tasks.find(t => t.id === taskId)!;
+        // All depends_on must either be in taskIds (exist) AND already scheduled,
+        // or reference tasks not in this job (external deps) — treat as satisfied.
+        const depsSatisfied = (task.depends_on ?? []).every(
+          depId => !taskIds.has(depId) || scheduled.has(depId),
+        );
+        if (depsSatisfied) {
+          layer.push(taskId);
+        }
+      }
+      if (layer.length === 0) {
+        // Circular dependency or broken graph — schedule remaining anyway
+        console.warn(`DAG cycle detected for tasks: ${[...remaining].join(', ')} — scheduling unconditionally`);
+        for (const taskId of remaining) layer.push(taskId);
+      }
+      for (const id of layer) {
+        scheduled.add(id);
+        remaining.delete(id);
+      }
+      layers.push(layer);
+    }
+
+    return layers;
   }
 
   private async dispatchApprovedJob(job: CoordinatorJob): Promise<void> {
@@ -227,14 +296,57 @@ export class CoordinatorService {
     const groups = job.plan.parallel_groups ?? [];
 
     if (groups.length > 0 && job.parallel_allowed >= 1) {
+      // ── Group-based dispatch (explicit parallel groups from LLM plan) ──
+      // Within each group, tasks run in parallel. Between groups, serial.
       for (const group of groups) {
         const groupTasks = tasks.filter(t => group.task_ids.includes(t.id));
-        const promises = groupTasks.map(t => this.spawnChild(job.job_id, t, job.parent_session_id));
-        await Promise.allSettled(promises);
+        await this.dispatchParallelBatch(job.job_id, groupTasks, job.parent_session_id, job.parallel_allowed);
+      }
+    } else if (tasks.some(t => (t.depends_on ?? []).length > 0)) {
+      // ── DAG-based dispatch (tasks have depends_on relationships) ──
+      const layers = this.buildDagLayers(tasks);
+      console.log(`Job ${job.job_id}: DAG scheduling ${tasks.length} tasks in ${layers.length} layers`);
+      for (const [i, layer] of layers.entries()) {
+        console.log(`  Layer ${i}: ${layer.join(', ')}`);
+        const layerTasks = tasks.filter(t => layer.includes(t.id));
+        await this.dispatchParallelBatch(job.job_id, layerTasks, job.parent_session_id, job.parallel_allowed);
       }
     } else {
-      for (const t of tasks) {
-        await this.spawnChild(job.job_id, t, job.parent_session_id);
+      // ── All-at-once (no dependencies — run everything in a single batch) ──
+      if (job.parallel_allowed >= 1 && tasks.length > 1) {
+        await this.dispatchParallelBatch(job.job_id, tasks, job.parent_session_id, job.parallel_allowed);
+      } else {
+        for (const t of tasks) {
+          await this.spawnChild(job.job_id, t, job.parent_session_id);
+        }
+      }
+    }
+  }
+
+  /**
+   * Dispatch multiple tasks in parallel, respecting the concurrency limit.
+   * All tasks in the batch run simultaneously; the method resolves when all
+   * have been dispatched (but NOT when they complete — completion is tracked
+   * via pollChildTask which updates the job status independently).
+   */
+  private async dispatchParallelBatch(
+    jobId: string,
+    batch: CoordinatorTask[],
+    parentSessionId: string,
+    maxParallel: number,
+  ): Promise<void> {
+    const slots = Math.min(maxParallel, batch.length);
+    console.log(`Job ${jobId}: dispatching batch of ${batch.length} tasks (${slots} parallel slots)`);
+
+    // Chunk the batch by concurrency limit
+    for (let i = 0; i < batch.length; i += slots) {
+      const chunk = batch.slice(i, i + slots);
+      const promises = chunk.map(t => this.spawnChild(jobId, t, parentSessionId));
+      const results = await Promise.allSettled(promises);
+      for (const r of results) {
+        if (r.status === 'rejected') {
+          console.warn(`Job ${jobId}: child spawn rejected: ${r.reason}`);
+        }
       }
     }
   }

@@ -233,6 +233,41 @@ class LLMClient:
         raw = await self.chat_async(system=system, user_message=user_message, model=model, max_tokens=max_tokens)
         return extract_json(raw)
 
+    async def chat_structured_async(
+        self,
+        *,
+        system: str,
+        user_message: str,
+        model: str | None = None,
+        max_tokens: int | None = None,
+        history: list[dict[str, str]] | None = None,
+        tools: list[dict] | None = None,
+    ) -> dict:
+        """Non-streaming async chat with tools (native function calling).
+
+        Returns a dict:
+          ``{"type": "text", "content": "..."}`` — no tool calls (final_answer)
+          ``{"type": "tool_calls", "calls": [...], "content": "..."}`` — has tool calls
+            where each call is ``{"id": "...", "function": {"name": "...", "arguments": "..."}}``
+
+        Only works with OpenAI-compatible and Ollama providers.
+        Falls back to ``chat_async`` for Anthropic.
+        """
+        model = model or self._settings.llm_model
+        max_tokens = max_tokens or self._settings.llm_max_tokens
+
+        if self.provider == "openai":
+            return await self._call_openai_structured_async(
+                system, user_message, model, max_tokens, history, tools,
+            )
+        if self.provider == "ollama":
+            return await self._call_ollama_structured_async(
+                system, user_message, model, max_tokens, history, tools,
+            )
+        # Anthropic fallback: tools not supported, just text
+        text = await self._call_anthropic_async(system, user_message, model, max_tokens, history)
+        return {"type": "text", "content": text}
+
     async def stream_chat_async(
         self,
         *,
@@ -375,6 +410,60 @@ class LLMClient:
             data = resp.json()
             return data["choices"][0]["message"]["content"].strip()
 
+    async def _call_openai_structured_async(
+        self, system: str, user_message: str, model: str, max_tokens: int,
+        history: list[dict[str, str]] | None = None,
+        tools: list[dict] | None = None,
+    ) -> dict:
+        """Non-streaming OpenAI call with native function calling support.
+
+        Returns ``{"type": "text", "content": "..."}`` or
+        ``{"type": "tool_calls", "calls": [...], "content": "..."}``.
+        """
+        import httpx
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        messages.extend(history or [])
+        messages.append({"role": "user", "content": user_message})
+
+        base_url = (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        headers = {
+            "Authorization": f"Bearer {self._settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        body: dict = {
+            "model": model,
+            "max_tokens": max_tokens,
+            "messages": messages,
+            "stream": False,
+        }
+        if tools:
+            body["tools"] = tools
+            body["tool_choice"] = "auto"
+
+        async with httpx.AsyncClient(timeout=None) as http:
+            resp = await http.post(f"{base_url}/chat/completions", json=body, headers=headers)
+            data = resp.json()
+
+        choice = data["choices"][0]
+        message = choice.get("message", {})
+        content = (message.get("content") or "").strip()
+        tc_list = message.get("tool_calls")
+
+        if tc_list:
+            calls = [
+                {
+                    "id": tc["id"],
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": tc["function"]["arguments"],
+                    },
+                }
+                for tc in tc_list
+            ]
+            return {"type": "tool_calls", "calls": calls, "content": content}
+
+        return {"type": "text", "content": content or ""}
+
     @staticmethod
     def _image_url_for_openai(image_b64_or_url: str) -> str:
         s = (image_b64_or_url or "").strip()
@@ -446,6 +535,54 @@ class LLMClient:
             )
             data = resp.json()
             return data["message"]["content"].strip()
+
+    async def _call_ollama_structured_async(
+        self, system: str, user_message: str, model: str, max_tokens: int,
+        history: list[dict[str, str]] | None = None,
+        tools: list[dict] | None = None,
+    ) -> dict:
+        """Non-streaming Ollama call with native function calling support.
+
+        Returns ``{"type": "text", "content": "..."}`` or
+        ``{"type": "tool_calls", "calls": [...], "content": "..."}``.
+        """
+        import httpx
+        messages: list[dict[str, str]] = [{"role": "system", "content": system}]
+        messages.extend(history or [])
+        messages.append({"role": "user", "content": user_message})
+        base_url = (self._settings.ollama_base_url or "http://localhost:11434").rstrip("/")
+
+        body: dict = {
+            "model": model,
+            "messages": messages,
+            "options": {"num_predict": max_tokens},
+            "stream": False,
+        }
+        if tools:
+            body["tools"] = tools
+
+        async with httpx.AsyncClient(timeout=None) as http:
+            resp = await http.post(f"{base_url}/api/chat", json=body)
+            data = resp.json()
+
+        msg = data.get("message", {}) or {}
+        content = (msg.get("content") or "").strip()
+        tc_list = msg.get("tool_calls")
+
+        if tc_list:
+            calls = [
+                {
+                    "id": tc.get("function", {}).get("name", f"ollama_{i}"),
+                    "function": {
+                        "name": tc["function"]["name"],
+                        "arguments": json.dumps(tc["function"].get("arguments", {})),
+                    },
+                }
+                for i, tc in enumerate(tc_list)
+            ]
+            return {"type": "tool_calls", "calls": calls, "content": content}
+
+        return {"type": "text", "content": content or ""}
 
     def _call_ollama_vision(
         self, system: str, user_message: str, images: list[str], model: str, max_tokens: int

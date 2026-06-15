@@ -54,6 +54,7 @@ const RESPONSE_URL = process.env.RESPONSE_URL || 'http://localhost:8005';
 const TEACHING_URL = process.env.TEACHING_URL || 'http://localhost:8006';
 const TOOL_EXECUTOR_URL = process.env.TOOL_EXECUTOR_URL || 'http://localhost:8007';
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
+const MCP_SERVER_URL = process.env.OASIS_MCP_URL || 'http://mcp-server:8020';
 const OBSERVER_URL = process.env.OBSERVER_URL || 'http://localhost:8009';
 const ARTIFACT_URL = process.env.ARTIFACT_SERVICE_URL || 'http://artifact-service:8012';
 
@@ -78,6 +79,66 @@ function resolveContextWindow(provider?: string | null, model?: string | null): 
   const variant = lookupVariant(provider, model);
   if (variant) return variant.context_length;
   return parseInt(process.env.OASIS_CONTEXT_WINDOW || '8192', 10);
+}
+
+/**
+ * Resolve the thought-layer timeout based on model parameter size.
+ * Small models (≤4B) are slow and need more time to reason.
+ * Large models (12B+) are fast.
+ * Falls back to FAST_TIMEOUT_MS (30s).
+ */
+function resolveThoughtTimeout(provider?: string | null, model?: string | null): number {
+  const variant = lookupVariant(provider, model);
+  if (!variant) return FAST_TIMEOUT_MS;
+  const size = variant.parameter_size_b;
+  // 0 = unknown/proprietary → use default
+  if (size <= 0) return FAST_TIMEOUT_MS;
+  if (size <= 4) return 60_000;   // 2B models: 60s
+  if (size <= 12) return 45_000;  // 8B models: 45s
+  return FAST_TIMEOUT_MS;          // 12B+: 30s
+}
+
+/**
+ * Resolve which tool capabilities a model has based on parameter size.
+ *
+ * Tiering:
+ *   ≤3B  → UTILITY: core only (search, read, edit, bash). NO delegation, NO get_rule, NO missions, NO workflows.
+ *   ≤6B  → OPERATIONAL: core + delegation + get_rule. NO workflow_create/delete, NO computer_action.
+ *   >6B  → COGNITIVE: full (everything).
+ *   0 (unknown/proprietary) → full (safest default).
+ */
+function resolveModelCapabilities(provider?: string | null, model?: string | null): {
+  canGetRule: boolean;
+  canDelegate: boolean;
+  tier: 'utility' | 'operational' | 'cognitive';
+  maxOutputTokens: number;
+} {
+  const variant = lookupVariant(provider, model);
+  if (!variant) return { canGetRule: true, canDelegate: true, tier: 'cognitive', maxOutputTokens: 4096 };
+  const size = variant.parameter_size_b;
+  if (size <= 0) return { canGetRule: true, canDelegate: true, tier: 'cognitive', maxOutputTokens: 4096 };
+  if (size <= 3) return { canGetRule: false, canDelegate: false, tier: 'utility', maxOutputTokens: 128 };
+  if (size <= 6) return { canGetRule: true, canDelegate: true, tier: 'operational', maxOutputTokens: 384 };
+  return { canGetRule: true, canDelegate: true, tier: 'cognitive', maxOutputTokens: 1024 };
+}
+
+// ── Execution modes ──────────────────────────────────────────
+// Thinking should be a scarce resource, not the default state.
+//   reactive:    no thinking at all. Act immediately. Default for 2B models (utility tier).
+//   guided:      minimal reasoning budget. Think only when stuck. Default for 4B models (operational).
+//   deliberative: full reasoning before each action. Default for 12B+ models (cognitive).
+//
+// The model can still opt into thinking by calling the `think` tool explicitly.
+type ExecutionMode = 'reactive' | 'guided' | 'deliberative';
+
+function resolveExecutionMode(provider?: string | null, model?: string | null): ExecutionMode {
+  const variant = lookupVariant(provider, model);
+  if (!variant) return 'deliberative';
+  const size = variant.parameter_size_b;
+  if (size <= 0) return 'deliberative';  // unknown/proprietary → full (safest)
+  if (size <= 3) return 'reactive';      // 2B: act first, think only when explicitly needed
+  if (size <= 6) return 'guided';        // 4B: small reasoning budget
+  return 'deliberative';                  // 12B+: full reasoning
 }
 
 /** Interpreter context: always keep `Conversation summary` system rows plus recent turns. Plain `slice(-6)` can drop the summary when the condensed window grows. */
@@ -249,6 +310,10 @@ const GATEWAY_HANDLED_TOOLS = new Set([
   'workflow_add_node', 'workflow_add_edge', 'workflow_remove_node',
   'node_catalog',
   'trigger_create', 'trigger_list', 'trigger_update', 'trigger_delete',
+  // Native coordinator tools (parallel sub-agent delegation) — see native-coordinator-tools.ts.
+  'delegate_tasks', 'delegate_job_status', 'delegate_job_cancel', 'delegate_job_results',
+  // Discovery tools — search MCP tools and skills on demand.
+  'search_mcp', 'search_skills',
 ]);
 
 const TOOL_NAME_ALIASES: Record<string, string> = {
@@ -287,6 +352,26 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
   fetch_artifact: 'read_artifact',
   artifact_content: 'read_artifact',
   view_artifact: 'read_artifact',
+  // Coordinator aliases — parallel sub-agent delegation
+  delegate: 'delegate_tasks',
+  delegate_job: 'delegate_tasks',
+  parallel_tasks: 'delegate_tasks',
+  parallel: 'delegate_tasks',
+  spawn_subagents: 'delegate_tasks',
+  job_status: 'delegate_job_status',
+  task_status: 'delegate_job_status',
+  cancel_job: 'delegate_job_cancel',
+  cancel: 'delegate_job_cancel',
+  get_results: 'delegate_job_results',
+  job_results: 'delegate_job_results',
+  task_results: 'delegate_job_results',
+  // Discovery aliases
+  discover_mcp: 'search_mcp',
+  find_mcp: 'search_mcp',
+  mcp_search: 'search_mcp',
+  discover_skills: 'search_skills',
+  find_skills: 'search_skills',
+  skill_search: 'search_skills',
 };
 
 function isKnownExecutorTool(tool: string): boolean {
@@ -423,6 +508,35 @@ const DEV_AGENT_TOOLS_NEED_WORKTREE = new Set([
 ]);
 
 const EXPLORATION_TOOLS = new Set(['grep', 'find_files', 'list_dir', 'read_file', 'browse_url']);
+
+// ── JIT rule pack auto-injection ──────────────────────────────────
+// Instead of loading all rules up front, we inject rule packs just-in-time
+// based on the model's planned action type or explicit get_rule call.
+const RULE_PACK_NAMES = new Set([
+  'tool_rules', 'delegation_rules', 'memory_rules', 'safety_rules',
+  'recovery_rules', 'final_answer_rules', 'coding_rules', 'planning_rules',
+]);
+
+// Map from action type (tool name) → rule pack(s) to auto-inject
+const ACTION_TO_RULE_PACKS: Record<string, string[]> = {
+  // Tool execution
+  apply_patch:     ['tool_rules', 'coding_rules'],
+  edit_file:       ['tool_rules', 'coding_rules'],
+  write_file:      ['tool_rules', 'coding_rules'],
+  bash:            ['tool_rules', 'safety_rules'],
+  // Delegation
+  delegate_tasks:  ['delegation_rules'],
+  delegate_job_status:  ['delegation_rules'],
+  delegate_job_results: ['delegation_rules'],
+  mission_create:  ['delegation_rules'],
+  workflow_create: ['delegation_rules'],
+  // Safety
+  computer_action: ['safety_rules'],
+  // Recovery (planned tool)
+  get_rule:        [],  // handled specially
+};
+// Also auto-inject recovery_rules + tool_rules if last call failed
+// (done dynamically below).
 
 const EXPLORATION_BROADEN_STAGNATION_MIN = 2;
 const EXPLORATION_IMPLEMENT_STAGNATION_MIN = 3;
@@ -738,7 +852,7 @@ function extractToolFromProse(raw: string): string | undefined {
 }
 
 function canonicalizeToolAlias(rawTool: string): { tool?: string; reason?: string } {
-  const allowed = new Set<string>([...DEV_AGENT_TOOLS, ...TOOL_EXECUTOR_TOOLS]);
+  const allowed = new Set<string>([...DEV_AGENT_TOOLS, ...TOOL_EXECUTOR_TOOLS, ...GATEWAY_HANDLED_TOOLS]);
 
   let s = (rawTool ?? '').toString().trim();
   // Strip common quoting artifacts from LLM outputs, e.g. ACTION: "grep"
@@ -936,6 +1050,90 @@ const SESSION_CLEANUP_MS = 600_000;
 // Timeout for fast internal calls (graph-builder, logic-engine, memory)
 const FAST_TIMEOUT_MS = 30_000;
 // Observer chains graph-builder + logic-engine sequentially; must exceed per-hop service timeouts.
+
+// ── Model routing — service defaults + router override ──────────────────
+
+/** Per-service default model tiers (before router override). */
+const SERVICE_DEFAULT_TIERS: Record<string, string> = {
+  echo: '4b',
+  missive: '2b',
+  pathway: '12b',
+  yggdrasil: '2b',
+  ratatoskr: '',  // no LLM
+};
+
+/** Coarse service detection from route + semantic intent. */
+function detectServiceType(route: string, semanticStructure: any): string {
+  const intent = (semanticStructure?.intent || '').toLowerCase();
+  if (route === 'teaching') return 'echo';
+  if (intent.includes('workflow') || intent.includes('pipeline')) return 'pathway';
+  if (intent.includes('memory') || intent.includes('extract') || intent.includes('index')) return 'missive';
+  if (intent.includes('orchestrat') || intent.includes('monitor') || intent.includes('health')) return 'yggdrasil';
+  if (intent.includes('plan') || intent.includes('design') || intent.includes('architect') || intent.includes('code') || intent.includes('implement') || intent.includes('fix')) return 'echo';
+  return 'echo';
+}
+
+/** Resolve the model string for a given tier label (2b/4b/12b). */
+function resolveTierModel(tier: string): string | null {
+  const envKey =
+    tier === '2b' ? 'OASIS_MODEL_2B' :
+    tier === '4b' ? 'OASIS_MODEL_4B' :
+    tier === '12b' ? 'OASIS_MODEL_12B' : null;
+  return envKey ? (process.env[envKey] || null) : null;
+}
+
+/** Resolve effective model after service-default + router-override. */
+function resolveEffectiveModel(
+  curModel: string | null,
+  curProvider: string | null,
+  route: string,
+  semanticStructure: any,
+): { model: string | null; provider: string | null; routing: string } {
+  if (curModel) return { model: curModel, provider: curProvider, routing: 'profile' };
+  const service = detectServiceType(route, semanticStructure);
+  const defaultTier = SERVICE_DEFAULT_TIERS[service] || '4b';
+  if (!defaultTier) return { model: null, provider: null, routing: 'none' };
+  const model = resolveTierModel(defaultTier);
+  if (!model) return { model: curModel, provider: curProvider, routing: `${service}:${defaultTier}(unresolved)` };
+  return { model, provider: curProvider, routing: `${service}:${defaultTier}` };
+}
+
+/** Apply router classification using a code policy (not model prediction from the LLM).
+ *
+ *  The router describes the request; this function decides which model tier to use.
+ *  This way the routing policy can evolve without retraining the router.
+ *
+ *  Policy logic:
+ *    - memory / extraction      → 2b (these domains rarely need more)
+ *    - coding + medium/complex   → 12b (code quality matters)
+ *    - planning / workflow       → 12b (multi-step reasoning needed)
+ *    - reasoning                 → 12b
+ *    - simple                    → 2b (cheapest)
+ *    - medium                    → 4b (balanced)
+ *    - complex                   → 12b
+ */
+function selectModelByRouter(
+  routerResult: { complexity: string; domain: string; reasoning: string } | null,
+): string {
+  if (!routerResult) return '4b';  // default to operational if router fails
+  const d = routerResult.domain || 'chat';
+  const c = routerResult.complexity || 'simple';
+  const r = routerResult.reasoning === 'true';
+
+  // Domain-first rules
+  if (d === 'memory' || d === 'extraction') return '2b';
+  if (d === 'workflow') return '12b';
+  if (d === 'coding' && (c === 'medium' || c === 'complex')) return '12b';
+  if (d === 'planning') return '12b';
+
+  // Reasoning flag overrides complexity
+  if (r) return '12b';
+
+  // Complexity-based
+  if (c === 'simple') return '2b';
+  if (c === 'medium') return '4b';
+  return '12b';
+}
 const OBSERVER_VALIDATE_TIMEOUT_MS = Number(process.env.OBSERVER_VALIDATE_TIMEOUT_MS) || 180_000;
 // Max retries for transient failures (service restarting after crash)
 const MAX_RETRIES = 2;
@@ -1565,6 +1763,57 @@ export class InteractionService {
       await this.events.publish('SemanticParsed', sessionId, { ...semanticStructure, route, interaction_id: interactionId, client_message_id: clientMessageId });
       this.logger.log(`Route classified: ${route}`);
 
+      // ── Step 1.5: Model routing — service defaults + router agent override ──
+      // Resolve the base model from service defaults (Echo→4B, Missive→2B, etc.),
+      // then use the Router Agent (2B model) for descriptive request classification
+      // and apply a code policy (`selectModelByRouter`) to choose the final tier.
+      const effective = resolveEffectiveModel(curModel, curProvider, route, semanticStructure);
+      this.logger.log(`Model routing base: ${effective.routing} → model=${effective.model}`);
+      if (effective.model && effective.model !== curModel && !curModel) {
+        req.context = { ...(req.context || {}), model_override: effective.model };
+      }
+      // Call the Router Agent (2B) for descriptive classification (not model prediction)
+      if (!curModel) {
+        try {
+          const routerResp = await axios.post(
+            `${RESPONSE_URL}/internal/route`,
+            { user_message: req.user_message, chat_history: chatHistory.slice(-4) },
+            { timeout: 5000 },
+          );
+          const routerResult = routerResp.data as { complexity: string; domain: string; reasoning: string };
+          // Apply code-based policy: the router describes, this function decides
+          const selectedTier = selectModelByRouter(routerResult);
+          const selectedModel = resolveTierModel(selectedTier);
+          if (selectedModel && selectedModel !== effective.model) {
+            this.logger.log(
+              `Router agent → policy override: ${effective.model} → ${selectedModel} ` +
+              `(complexity=${routerResult.complexity}, domain=${routerResult.domain}, reasoning=${routerResult.reasoning})`,
+            );
+            req.context = { ...(req.context || {}), model_override: selectedModel };
+          } else {
+            this.logger.log(
+              `Router agent confirmed: ${effective.model || selectedModel} ` +
+              `(complexity=${routerResult.complexity}, domain=${routerResult.domain})`,
+            );
+          }
+          // Publish routing telemetry
+          this.events
+            .publish('ModelRoutingTelemetry', sessionId, {
+              ...routerResult,
+              selected_tier: selectedTier,
+              selected_model: selectedModel,
+              default_tier: effective.routing,
+              default_model: effective.model,
+              route,
+              interaction_id: interactionId,
+              client_message_id: clientMessageId,
+            })
+            .catch(() => {});
+        } catch (err: any) {
+          this.logger.warn(`Model router call failed: ${err.message} — using service default ${effective.model}`);
+        }
+      }
+
       // ── Step 2: Route-based dispatch ──
       let result: InteractionResponse;
       switch (route) {
@@ -1993,6 +2242,26 @@ export class InteractionService {
     const maxIterations = autonomousMode ? 10000 : MAX_TOOL_ITERATIONS;
     const loopStartTime = Date.now();
 
+    // Resolve model info for timeouts and prompt-tier
+    const curModel = ((req.context as Record<string, unknown> | undefined)?.model_override as string | undefined) ?? null;
+    const curProvider = ((req.context as Record<string, unknown> | undefined)?.provider_override as string | undefined) ?? null;
+    const THOUGHT_TIMEOUT_MS = resolveThoughtTimeout(curProvider, curModel);
+
+    // ── Model capabilities (used for tool-tiering throughout the loop) ────
+    const modelCaps = resolveModelCapabilities(curProvider, curModel);
+    this.logger.log(
+      `Model capabilities: tier=${modelCaps.tier} canGetRule=${modelCaps.canGetRule} canDelegate=${modelCaps.canDelegate} (model=${curModel}, provider=${curProvider})`,
+    );
+
+    // ── Execution mode (thinking budget) ──────────────────────────────────
+    // Reactive: no automatic thinking. Act immediately. The model can still call `think` explicitly.
+    // Guided:   minimal reasoning. Think only when stuck or on failure.
+    // Deliberative: full pre-loop thinking + mid-loop re-thinking.
+    const execMode = resolveExecutionMode(curProvider, curModel);
+    this.logger.log(
+      `Execution mode: ${execMode} (model=${curModel}) — reactive=act only, guided=think when stuck, deliberative=full reasoning`,
+    );
+
     // ── Restore (or auto-claim) the session's worktree ──────────────
     // First, hydrate from the persistent SessionWorktreeService — this survives
     // gateway restarts and is the source of truth for "which session owns which worktree".
@@ -2019,30 +2288,14 @@ export class InteractionService {
       }
     }
 
-    // ── Pre-Phase: Free Thoughts (Free-form reasoning with tool support) ──
+    // ── Pre-Phase: Free Thoughts (only for deliberative mode; reactive/guided act directly) ──
     let freeThoughts = '';
     let thoughtToolCalls = 0;
 
-    // Start structured thinking inline (not preloaded, to avoid double LLM calls)
-    try {
-      const structuredResult = await this.generateStreamingThoughtsStructured(
-        sessionId,
-        req.user_message,
-        req.context,
-        chatHistory,
-        interactionId,
-        clientMessageId,
-        undefined,
-        undefined,
-        signal,
-      );
-      freeThoughts = structuredResult.thoughts;
-      thoughtToolCalls = structuredResult.toolCalls;
-
-      // Fallback: if structured returned nothing (e.g. endpoint not available),
-      // use the classic plain-text approach.
-      if (!freeThoughts && thoughtToolCalls === 0) {
-        freeThoughts = await this.generateStreamingThoughts(
+    if (execMode === 'deliberative') {
+      // Deliberative mode: full pre-loop reasoning to decompose the goal
+      try {
+        const structuredResult = await this.generateStreamingThoughtsStructured(
           sessionId,
           req.user_message,
           req.context,
@@ -2053,13 +2306,34 @@ export class InteractionService {
           undefined,
           signal,
         );
-      }
-    } catch {
-      this.logger.warn('Initial thinking stream failed, continuing with empty thoughts');
-    }
+        freeThoughts = structuredResult.thoughts;
+        thoughtToolCalls = structuredResult.toolCalls;
 
-    if (thoughtToolCalls > 0) {
-      this.logger.log(`Thought phase made ${thoughtToolCalls} tool call(s)`);
+        // Fallback: if structured returned nothing (e.g. endpoint not available),
+        // use the classic plain-text approach.
+        if (!freeThoughts && thoughtToolCalls === 0) {
+          freeThoughts = await this.generateStreamingThoughts(
+            sessionId,
+            req.user_message,
+            req.context,
+            chatHistory,
+            interactionId,
+            clientMessageId,
+            undefined,
+            undefined,
+            signal,
+          );
+        }
+      } catch {
+        this.logger.warn('Initial thinking stream failed, continuing with empty thoughts');
+      }
+
+      if (thoughtToolCalls > 0) {
+        this.logger.log(`Thought phase made ${thoughtToolCalls} tool call(s)`);
+      }
+    } else {
+      // Reactive/guided: no automatic pre-thinking. The model will use the `think` tool if needed.
+      this.logger.log(`Execution mode ${execMode}: skipping pre-loop thinking`);
     }
 
     let consecutiveNeedInfo = 0;
@@ -2067,52 +2341,33 @@ export class InteractionService {
     let decision: string;
     let decisionReason = '';
 
-    // If thoughts are empty (model produced nothing), skip decision layer and default to ACT
-    if (!freeThoughts || freeThoughts.trim().length === 0) {
-      this.logger.warn('Thought stream returned empty — skipping decision layer, defaulting to ACT');
-      decision = 'ACT';
-      decisionReason = 'Thought stream returned empty, defaulting to action.';
-    } else {
-      // ── Pre-Phase: Decision Layer (Think → Decide → Act) ─────────────
-      const decisionStartTime = Date.now();
-      const decisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
-        thoughts: freeThoughts,
-        user_message: req.user_message,
-        context: { ...req.context, interactionId },
-        chat_history: chatHistory.length > 0 ? chatHistory : undefined,
-      }, undefined, { timeout: 0, signal }).catch((err) => {
-        this.logger.warn(`Decision layer call failed: ${err.message} — defaulting to ACT`);
-        return { data: { decision: 'ACT', reason: '', confidence: 0.5 } };
-      });
-      
-      decision = decisionRes.data.decision;
-      decisionReason = decisionRes.data.reason || '';
-      const timeToDecision = Date.now() - decisionStartTime;
-      const timeToAction = Date.now() - loopStartTime;
-      
-      // Structured logging for metrics
-      this.logger.log(`[DECISION_LOG] decision_type=${decision} thought_count=1 time_to_decision_ms=${timeToDecision} time_to_action_ms=${timeToAction}`);
-      this.logger.log(`Decision Layer [pre-loop]: ${decision} (in ${timeToDecision}ms)`);
-
-      if (decision === 'NEED_MORE_INFO') {
-        consecutiveNeedInfo++;
-        // On the first NEED_MORE_INFO in the pre-loop, force ACT instead of exiting.
-        // The user explicitly asked to implement something — they don't need the agent
-        // asking them questions back.
-        this.logger.warn('Pre-loop NEED_MORE_INFO — forcing ACT to enter the tool loop instead of asking for clarification');
+    // ── Pre-Phase: Decision Layer (only for deliberative; reactive/guided skip to tool loop) ──
+    if (execMode === 'deliberative') {
+      if (!freeThoughts || freeThoughts.trim().length === 0) {
+        this.logger.warn('Thought stream returned empty — skipping decision layer, defaulting to ACT');
         decision = 'ACT';
+        decisionReason = 'Thought stream returned empty, defaulting to action.';
       } else {
-        consecutiveNeedInfo = 0;
+        const decisionStartTime = Date.now();
+        const decisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
+          thoughts: freeThoughts,
+          user_message: req.user_message,
+          context: { ...req.context, interactionId },
+          chat_history: chatHistory.length > 0 ? chatHistory : undefined,
+        }, undefined, { timeout: 0, signal }).catch((err) => {
+          this.logger.warn(`Decision layer call failed: ${err.message} — defaulting to ACT`);
+          return { data: { decision: 'ACT', reason: '', confidence: 0.5 } };         });
+        decision = decisionRes.data?.decision || 'ACT';
+        decisionReason = decisionRes.data?.reason || '';
+        const timeToDecision = Date.now() - decisionStartTime;
+        this.logger.log(`[DECISION_LOG] pre-loop decision=${decision} time_to_decision_ms=${timeToDecision}`);
+        this.logger.log(`Decision Layer: ${decision}`);
       }
-
-      await this.events.publish('DecisionLayerGenerated', sessionId, {
-        decision,
-        reason: decisionReason,
-        confidence: decisionRes.data.confidence,
-        interaction_id: interactionId,
-        client_message_id: clientMessageId,
-        forced: decision !== 'NEED_MORE_INFO',
-      });
+    } else {
+      // Reactive/guided: no decision layer — default to ACT and let the tool loop drive
+      decision = 'ACT';
+      decisionReason = `Execution mode ${execMode}: skipping decision layer, defaulting to ACT.`;
+      this.logger.log(decisionReason);
     }
 
     // If decided to answer directly (and had meaningful thoughts)
@@ -2462,6 +2717,26 @@ export class InteractionService {
     let maxDurationReached = false;
     let hallucinationStartTime: number | null = null; // starts ticking on first duplicate detection
     const HALLUCINATION_LOOP_TIMEOUT_MS = 300_000; // 5 min guard once hallucination is confirmed
+
+    // ── Stuck-loop auto-downgrade ─────────────────────────────────────
+    // Tracks consecutive iterations where the agent makes no progress
+    // (same clarification request, no new tool calls). After a threshold,
+    // we inject a "switch to simple mode" message into the next LLM call
+    // so the agent stops overthinking and starts executing.
+    let stuckIterations = 0;
+    let lastStuckAnswer = '';
+    let lastStuckActionsCount = 0;
+    const STUCK_DOWNGRADE_THRESHOLD = 5;  // downgrade after 5 stuck iterations
+    let promptDowngraded = false;
+
+    // ── JIT rule pack injection ─────────────────────────────────────────
+    // Instead of loading all rules up front, we auto-detect what's relevant
+    // and inject focused rule packs based on the model's planned action.
+    // The model can also explicitly call get_rule to request a specific pack.
+    let rulePacksToInject: string[] = [];
+    // Track the previous iteration's planned tool for auto-injection detection
+    let lastPlannedTool: string | null = null;
+
     for (let iteration = 0; iteration < maxIterations; iteration++) {
       if (isAborted() || signal?.aborted) {
         this.logger.warn(
@@ -2568,15 +2843,20 @@ export class InteractionService {
         }
       }
 
-      // ── Generate & Validate Thoughts ─────────────────────────────────
+    // ── Generate & Validate Thoughts ─────────────────────────────────
       // Preserve previous agent thoughts if reasoning layer isn't refreshed —
       // this ensures commitments like "run npm install" survive across iterations
       // until the reasoning layer re-evaluates.
       const previousThoughts = validatedThoughts;
       const lastToolResult = iteration > 0 ? toolResults[toolResults.length - 1] : undefined;
-      const shouldRefreshReasoningLayer =
-        iteration > 0 &&
-        (!lastToolResult?.success || feedbackWarrantsReasoningRefresh(observerFeedback));
+      const isRecoveryOrStuck = !lastToolResult?.success || feedbackWarrantsReasoningRefresh(observerFeedback) || thoughtsOnlyStreak >= 2;
+      const shouldRefreshReasoningLayer = iteration > 0 && (
+        execMode === 'deliberative'
+          ? (!lastToolResult?.success || feedbackWarrantsReasoningRefresh(observerFeedback))
+          : execMode === 'guided'
+            ? isRecoveryOrStuck
+            : false  // reactive: never automatic thinking
+      );
       try {
         if (shouldRefreshReasoningLayer) {
           this.logger.log(`Generating thoughts for iteration ${iteration + 1}`);
@@ -2588,7 +2868,7 @@ export class InteractionService {
             rules: rules.length > 0 ? rules : undefined,
             walls_hit: wallsHit.length > 0 ? wallsHit : undefined,
             observer_feedback: observerFeedback,
-          }, undefined, { timeout: FAST_TIMEOUT_MS });
+          }, undefined, { timeout: THOUGHT_TIMEOUT_MS });
 
           if (thoughtsRes.data?.thoughts?.length) {
             const validateRes = await axiosWithRetry('post', `${LOGIC_ENGINE_URL}/internal/reason/validate-thoughts`, {
@@ -2840,6 +3120,40 @@ export class InteractionService {
         else if (t !== '_system' && t !== 'validation_error') toolDigest.push(`✓ ${t}`);
       }
 
+      // ── JIT auto-injection: determine relevant rule packs ──────────────
+      // Auto-detect based on the previous plan's action tool (stored from
+      // the prior iteration). Explicit get_rule requests are handled in the
+      // tool execution section below.
+      const lastPlanAction = lastPlannedTool;  // set at bottom of loop
+      if (rulePacksToInject.length === 0 && iteration > 0 && lastPlanAction) {
+        const detectedPacks = ACTION_TO_RULE_PACKS[lastPlanAction];
+        if (detectedPacks) {
+          // Filter out delegation rule packs for models that can't delegate
+          if (!modelCaps.canDelegate) {
+            rulePacksToInject = detectedPacks.filter(
+              p => p !== 'delegation_rules',
+            );
+          } else {
+            rulePacksToInject = [...detectedPacks];
+          }
+        }
+        // If last tool call failed, inject recovery_rules
+        const lastResult = toolResults.length > 0 ? toolResults[toolResults.length - 1] : null;
+        if (lastResult && !lastResult.success && !lastResult.blocked) {
+          if (!rulePacksToInject.includes('recovery_rules')) {
+            rulePacksToInject.push('recovery_rules');
+          }
+          if (!rulePacksToInject.includes('tool_rules')) {
+            rulePacksToInject.push('tool_rules');
+          }
+        }
+        if (rulePacksToInject.length > 0) {
+          this.logger.log(`JIT auto-injecting rule packs: ${rulePacksToInject.join(', ')}`);
+        }
+      } else if (rulePacksToInject.length > 0 && iteration === 0) {
+        // Keep explicit rule packs requested at start
+      }
+
       let plan = await this.generateStreamingToolPlan(
         sessionId,
         interactionId,
@@ -2847,9 +3161,6 @@ export class InteractionService {
         {
           user_message: req.user_message,
           tool_results: toolResults.length > 0 ? toolResults.slice(-8) : null,
-          // chat_history omitted: knowledge graph, code graph, memory context,
-          // validated thoughts, and tool results provide sufficient context
-          // without consuming extra tokens on conversation history.
           upfront_plan: upfrontPlan.steps.length > 0 ? upfrontPlan : undefined,
           active_step_index: hasPlanSteps ? activeStepIndex : undefined,
           active_step_description: activeStepDescription || undefined,
@@ -2864,7 +3175,10 @@ export class InteractionService {
           free_thoughts: freeThoughts,
           active_worktree_id: activeWorktreeId || undefined,
           tool_history_digest: toolDigest.length > 2 ? toolDigest : undefined,
-          // Artifacts accessed via search_artifacts tool, not auto-injected
+          model_override: curModel || undefined,
+          max_tokens: modelCaps.maxOutputTokens > 0 ? modelCaps.maxOutputTokens : undefined,
+          // JIT: inject rule packs based on last plan's action or explicit get_rule
+          rule_packs_to_inject: rulePacksToInject.length > 0 ? rulePacksToInject : undefined,
         },
         iteration,
         trace,
@@ -2890,6 +3204,49 @@ export class InteractionService {
         // context budget is best-effort
       }
 
+      // ── Stuck clarification loop detection ──────────────────────
+      // If the agent keeps asking for more info without making tool calls,
+      // inject a "switch to simple mode" hint that discourages overthinking.
+      if (plan?.action === 'final_answer' && (plan.answer || '').toLowerCase().includes('please provide')) {
+        const currentAnswer = (plan.answer || '').trim();
+        const noNewToolCalls = toolResults.length === toolResultsBeforeIteration;
+
+        if (noNewToolCalls && currentAnswer === lastStuckAnswer) {
+          stuckIterations++;
+        } else if (noNewToolCalls) {
+          stuckIterations = Math.max(1, stuckIterations + 1);
+        } else {
+          stuckIterations = 0;
+        }
+        lastStuckAnswer = currentAnswer;
+        lastStuckActionsCount = toolResults.length;
+
+        if (stuckIterations >= STUCK_DOWNGRADE_THRESHOLD && !promptDowngraded) {
+          promptDowngraded = true;
+          this.logger.warn(
+            `Stuck clarification loop: ${stuckIterations} consecutive clarification requests. Injecting downgrade hint.`,
+          );
+          observerFeedback = observerFeedback
+            ? `${observerFeedback}\n\n[SIMPLE MODE: You have been stuck in a clarification loop. Stop asking questions. Use grep to explore the codebase directly and find what you need. DO NOT ask for more information.]`
+            : `[SIMPLE MODE: You have been stuck in a clarification loop. Stop asking questions. Use grep to explore the codebase directly and find what you need. DO NOT ask for more information.]`;
+        } else if (stuckIterations >= STUCK_DOWNGRADE_THRESHOLD && promptDowngraded) {
+          this.logger.warn(`Stuck clarification loop (post-downgrade): ${stuckIterations} iterations. Forcing grep.`);
+          plan = {
+            action: 'call_tool',
+            tool: 'grep',
+            pattern: 'TODO|FIXME|function',
+            path: '/workspace',
+            reasoning: 'Forced action after stuck clarification loop',
+            _forced_recovery: true,
+          };
+        }
+      } else {
+        if (plan?.action === 'call_tool') {
+          stuckIterations = 0;
+          lastStuckAnswer = '';
+        }
+      }
+
       // Deterministic last-resort: if we've already observed a long "thoughts only" streak,
       // and the model tries to finalize without producing new tool_results, force a tool call.
       if (thoughtsOnlyStreak >= 3 && plan?.action === 'final_answer' && !plan?._retry_hint) {
@@ -2903,6 +3260,7 @@ export class InteractionService {
           pattern: fallbackPattern,
           path: '/workspace',
           reasoning: 'Forced action after repeated thoughts-only iterations',
+          _forced_recovery: true,  // skip duplicate detection & hallucination guard
         };
       }
 
@@ -2929,6 +3287,7 @@ export class InteractionService {
           name: wtName,
           reasoning:
             'Autonomous cap: many read-only tools without edits; create a worktree, then edit_file or write_file.',
+          _forced_recovery: true,  // skip duplicate detection & hallucination guard
         };
       }
 
@@ -3012,28 +3371,28 @@ export class InteractionService {
             isPunting = puntRes.data?.is_punt === true;
             puntReason = puntRes.data?.reason || 'LLM detected punt';
           } catch {
-            // Fallback: phrase-based detection
+            // Behavioral fallback: score behavior, not isolated phrases.
+            // A single "please provide" or "could you clarify" is NOT a punt —
+            // the model may be genuinely confused. Only flag as punt when:
+            //   1. Same or very similar answer appeared 3+ times (clarification loop)
+            //   2. Model made no tool calls in this iteration
+            //   3. Answer is a clarification request (question-like) not a cop-out excuse
             const ansLower = (plan.answer || '').toLowerCase();
-            const PUNT_PHRASES = [
-              'you\'ll need to', 'you will need to', 'you can ', 'i can guide',
-              'i was unable', 'i wasn\'t able', 'i couldn\'t', 'i could not',
-              'here\'s how', 'however, i can', 'unfortunately', 'however, you',
-              'you should ', 'you may want', 'you might want',
-              'would you like me to', 'shall i ', 'do you want me to',
-              'should i ', 'want me to ', 'if you\'d like me to',
-              'i can also ', 'i could also ', 'let me know if',
-              'i\'ll need to', 'the next step would be', 'the next step is',
-              'no modifications were made', 'no changes were made',
-              'due to size limitations', 'which is quite large',
-              'due to a tool limitation', 'requires careful handling',
-              'would you like me to focus', 'focus on any specific part',
-              // Announcing plans without executing
-              'let me proceed', 'i\'ll proceed', 'i will proceed',
-              'the task requires', 'based on the existing code',
-              'i noticed that', 'looking at the code',
-            ];
-            isPunting = PUNT_PHRASES.some(p => ansLower.includes(p));
-            puntReason = 'phrase match fallback';
+            const clarificationWords = ['please provide', 'what task', 'could you clarify', 'what would you like',
+              'what specific', 'please specify', 'tell me what', 'what information',
+              'do you want me to', 'would you like me to'];
+            const isClarification = clarificationWords.some(w => ansLower.includes(w));
+
+            // Count how many previous final_answers were similar clarification loops
+            const clarificationCount = toolResults.filter(r =>
+              r.tool === '_system' && (r.output || '').toLowerCase().includes('blocked')
+            ).length;
+
+            // Only flag as punt if we've already blocked 3+ times (model is stuck in loop)
+            // AND this answer is a clarification request with no tool calls
+            const noNewToolCalls = toolResults.length === toolResultsBeforeIteration;
+            isPunting = isClarification && noNewToolCalls && clarificationCount >= 3;
+            puntReason = isPunting ? 'behavioral: stuck clarification loop' : 'phrase-match fallback (not punting — passing through)';
           }
 
           if (isPunting) {
@@ -3099,26 +3458,21 @@ export class InteractionService {
                 isPunt = puntRes.data?.is_punt === true;
                 puntReason = puntRes.data?.reason || '';
               } catch (puntErr: any) {
-                // Fallback: phrase-based punt detection when LLM check fails
-                this.logger.warn(`LLM punt check failed: ${puntErr.message} — falling back to phrase match`);
+                // Behavioral fallback: same scoring as pre-observer check.
+                // Isolated "please provide" or "could you clarify" is NOT a punt —
+                // the model may be genuinely confused.
+                this.logger.warn(`LLM punt check failed: ${puntErr.message} — using behavioral scoring`);
                 const ansLower = (plan.answer || '').toLowerCase();
-                const PUNT_PHRASES = [
-                  'you\'ll need to', 'you will need to', 'you can ', 'i can guide',
-                  'i was unable to', 'i wasn\'t able to', 'i couldn\'t', 'i could not',
-                  'here\'s how', 'however, i can', 'unfortunately',
-                  'would you like me to', 'shall i ', 'do you want me to',
-                  'should i ', 'want me to ', 'let me know if',
-                  'no modifications were made', 'no changes were made',
-                  'due to size limitations', 'which is quite large',
-                  'due to a tool limitation', 'requires careful handling',
-                  'would you like me to focus', 'focus on any specific part',
-                  // Announcing plans without executing
-                  'let me proceed', 'i\'ll proceed', 'i will proceed',
-                  'the task requires', 'based on the existing code',
-                  'i noticed that', 'looking at the code',
-                ];
-                isPunt = PUNT_PHRASES.some(p => ansLower.includes(p));
-                puntReason = 'phrase match fallback';
+                const clarificationWords = ['please provide', 'what task', 'could you clarify',
+                  'what information', 'please specify', 'tell me what',
+                  'would you like me to', 'do you want me to'];
+                const isClarification = clarificationWords.some(w => ansLower.includes(w));
+                const clarificationCount = toolResults.filter(r =>
+                  r.tool === '_system' && (r.output || '').toLowerCase().includes('blocked')
+                ).length;
+                const noNewToolCalls = toolResults.length === toolResultsBeforeIteration;
+                isPunt = isClarification && noNewToolCalls && clarificationCount >= 3;
+                puntReason = isPunt ? 'behavioral: stuck clarification loop' : 'single clarification (not punting)';
               }
 
               if (isPunt) {
@@ -3345,6 +3699,176 @@ export class InteractionService {
       // 2b. Execute the planned tool call
       if (plan.action === 'call_tool') {
         let toolName = plan.tool || 'bash';
+
+        // ── `think` tool handler ──
+        // When the model calls think, it's opting into reasoning.
+        // We call the free thoughts endpoint and store the result as freeThoughts
+        // for the next planner iteration. The model re-evaluates with fresh reasoning.
+        if (toolName === 'think') {
+          const reason = (plan as any).reason || (plan as any).PARAM_REASON || '';
+          this.logger.log(`Model requested explicit thinking: "${reason.slice(0, 200)}"`);
+          try {
+            const thinkingResult = await this.generateStreamingThoughts(
+              sessionId,
+              req.user_message,
+              { ...semanticStructure, interactionId, iteration, think_prompt: reason },
+              chatHistory,
+              interactionId,
+              clientMessageId,
+              toolResults.slice(-5),
+              observerFeedback,
+              signal,
+            );
+            freeThoughts = thinkingResult;
+            // Also store back-front so the client can display thinking
+            await this.events.publish('Thinking', sessionId, {
+              thoughts: freeThoughts,
+              iteration,
+              client_message_id: clientMessageId,
+            });
+          } catch (err: any) {
+            this.logger.warn(`think tool failed: ${err.message}`);
+            freeThoughts = '';
+          }
+          // Trigger re-evaluation with the new reasoning
+          toolResults.push({
+            tool: '_system',
+            success: true,
+            output: `Thinking complete. ${freeThoughts ? 'Reasoning injected for re-evaluation.' : 'No new reasoning generated.'}`,
+            blocked: false,
+          });
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── JIT get_rule handler ──
+        // When the model calls get_rule, inject the matching rule pack into the
+        // next plan iteration and skip execution (the model re-evaluates with rules).
+        // But only if the model tier supports get_rule (not available for ≤4B).
+        if (toolName === 'get_rule') {
+          if (!modelCaps.canGetRule) {
+            // Safety net: model shouldn't see get_rule, but if it somehow outputs it
+            this.logger.warn(`Model attempted get_rule but tier does not support it (≤4B) — ignoring`);
+            toolResults.push({
+              tool: '_system',
+              success: true,
+              output: `get_rule is not available for this model tier. Rules are already injected as needed by the system.`,
+              blocked: false,
+            });
+            updateThoughtsOnlyStreak();
+            continue;
+          }
+          const topic = (plan as any).topic || (plan as any).PARAM_TOPIC || '';
+          if (topic && RULE_PACK_NAMES.has(topic)) {
+            rulePacksToInject = [topic];
+            this.logger.log(`Model requested rule pack "${topic}" — injecting for next iteration`);
+          } else {
+            rulePacksToInject = ['tool_rules'];  // fallback
+            this.logger.warn(`Unknown rule pack "${topic}", injecting tool_rules`);
+          }
+          // Add a system-level result that triggers re-evaluation with the injected rules
+          toolResults.push({
+            tool: '_system',
+            success: true,
+            output: `Rule pack "${topic}" will be injected for re-evaluation. Continue planning with the new rules.`,
+            blocked: false,
+          });
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── Discovery: search_mcp handler ──
+        // Queries the MCP server's internal tool catalog by keyword.
+        if (toolName === 'search_mcp') {
+          const query = (plan as any).query || (plan as any).PARAM_QUERY || '';
+          if (!query) {
+            toolResults.push({
+              tool: '_system',
+              success: true,
+              output: 'No search query provided. Use PARAM_QUERY to describe what you\'re looking for (e.g. "github create issue").',
+              blocked: false,
+            });
+            updateThoughtsOnlyStreak();
+            continue;
+          }
+          try {
+            const res = await axios.post(`${MCP_SERVER_URL}/internal/tools/search`, { query, max_results: 10 }, { timeout: 5000 });
+            const data = res.data as { tools: Array<{ name: string; description: string; category: string }>; count: number };
+            if (!data.tools || data.tools.length === 0) {
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `No MCP tools found matching "${query}". Try a different query or use the built-in tools.`,
+                blocked: false,
+              });
+            } else {
+              const formatted = data.tools.map(t => `  • ${t.name} — ${t.description} (${t.category})`).join('\n');
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `Found ${data.count} MCP tool(s) matching "${query}":\n${formatted}\n\nUse these tools in subsequent tool plans.`,
+                blocked: false,
+              });
+            }
+          } catch (err: any) {
+            this.logger.warn(`search_mcp failed: ${err.message}`);
+            toolResults.push({
+              tool: '_system',
+              success: false,
+              output: `Failed to search MCP tools: ${err.message}. The MCP server may be unavailable.`,
+              blocked: false,
+            });
+          }
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── Discovery: search_skills handler ──
+        // Queries the MCP server's internal skill catalog by goal/query.
+        if (toolName === 'search_skills') {
+          const query = (plan as any).query || (plan as any).PARAM_QUERY || '';
+          if (!query) {
+            toolResults.push({
+              tool: '_system',
+              success: true,
+              output: 'No search query provided. Use PARAM_QUERY to describe your goal (e.g. "facebook post", "debug nodejs").',
+              blocked: false,
+            });
+            updateThoughtsOnlyStreak();
+            continue;
+          }
+          try {
+            const res = await axios.post(`${MCP_SERVER_URL}/internal/skills/search`, { query, max_results: 10 }, { timeout: 5000 });
+            const data = res.data as { skills: Array<{ id: string; name: string; description: string; categories: string[] }>; count: number };
+            if (!data.skills || data.skills.length === 0) {
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `No skills found matching "${query}". Try a different query or proceed with general capabilities.`,
+                blocked: false,
+              });
+            } else {
+              const formatted = data.skills.map(s => `  • ${s.name} — ${s.description} [${s.categories.join(', ')}]`).join('\n');
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `Found ${data.count} skill(s) matching "${query}":\n${formatted}\n\nReview the relevant skill guidance and follow the recommended approach.`,
+                blocked: false,
+              });
+            }
+          } catch (err: any) {
+            this.logger.warn(`search_skills failed: ${err.message}`);
+            toolResults.push({
+              tool: '_system',
+              success: false,
+              output: `Failed to search skills: ${err.message}. The skill catalog may be unavailable.`,
+              blocked: false,
+            });
+          }
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
         const command = plan.command || '';
         const path = plan.path || '';
         const pattern = plan.pattern || '';
@@ -3386,6 +3910,8 @@ export class InteractionService {
                 'PARAM_KEYS: array of keys (for hotkey, e.g. ["command","c"])\n' +
                 'PARAM_DIRECTION: up|down (for scroll)\n' +
                 'PARAM_AMOUNT: scroll amount (default 3)',
+              search_mcp: 'PARAM_QUERY: <natural language query describing what tool you need, e.g. "github create issue">',
+              search_skills: 'PARAM_QUERY: <natural language query describing your goal, e.g. "debug nodejs" or "facebook post">',
             };
             const suggested = extractToolFromProse(toolName);
             const hintBlock = suggested
@@ -3484,7 +4010,8 @@ export class InteractionService {
         // otherwise the 2nd+ edit to the same file is wrongly blocked as "duplicate".
         const normCmd = (command || '').replace(/\s+/g, ' ').trim();
         const skipDuplicateCheck =
-          toolName === 'edit_file' || toolName === 'write_file' || toolName === 'apply_patch' || toolName === 'computer_action';
+          toolName === 'edit_file' || toolName === 'write_file' || toolName === 'apply_patch' || toolName === 'computer_action' ||
+          (plan as any)._forced_recovery === true;  // forced recovery calls are exempt
 
         // For read tools: skip duplicate check if the same path was edited since the last read.
         // Re-reading after an edit is mandatory (file content changed), not a duplicate.
@@ -4659,6 +5186,13 @@ export class InteractionService {
       } catch (obsErr: any) {
         this.logger.warn(`Observer validate failed: ${obsErr.message} — continuing`);
         observerFeedback = 'Observer unavailable. If you have exhausted options, explain to the user and give final_answer.';
+      }
+
+      // Track the tool the model planned to execute (for JIT auto-injection on next iteration)
+      if (plan?.action === 'call_tool' && plan?.tool) {
+        lastPlannedTool = plan.tool;
+      } else {
+        lastPlannedTool = null;
       }
     }
 

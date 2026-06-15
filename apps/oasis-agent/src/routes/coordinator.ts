@@ -67,6 +67,25 @@ export function createCoordinatorRouter(
     }
   });
 
+  // GET /api/v1/coordinator/jobs/:id/results — get aggregated task results
+  router.get('/jobs/:id/results', async (req: Request, res: Response) => {
+    try {
+      const results = await service.getTaskResults(req.params.id);
+      const job = await service.getJob(req.params.id);
+      res.json({
+        ok: true,
+        job_id: req.params.id,
+        job_status: job?.status ?? 'unknown',
+        tasks_completed: Object.values(results).filter(r => r.status === 'completed').length,
+        tasks_failed: Object.values(results).filter(r => r.status === 'failed').length,
+        tasks_total: Object.keys(results).length,
+        results,
+      });
+    } catch (err: any) {
+      res.status(404).json({ error: err.message });
+    }
+  });
+
   // POST /api/v1/coordinator/jobs/:id/cancel — cancel job
   router.post('/jobs/:id/cancel', async (req: Request, res: Response) => {
     try {

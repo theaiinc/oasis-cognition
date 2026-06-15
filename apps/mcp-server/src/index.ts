@@ -17,6 +17,8 @@ import express, { type Request, type Response } from 'express';
 import { randomUUID } from 'node:crypto';
 import { createOasisMcpServer } from './server.js';
 import { GATEWAY_URL } from './lib/gateway.js';
+import { searchToolCatalog, getToolCategories } from './internal/tool-catalog.js';
+import { searchSkillCatalog } from './internal/skill-catalog.js';
 
 const MCP_PORT = parseInt(process.env.MCP_PORT || '8020', 10);
 const MCP_TRANSPORT = (process.env.MCP_TRANSPORT || '').toLowerCase();
@@ -54,6 +56,33 @@ async function runHttp() {
 
   app.get('/health', (_req, res) => {
     res.json({ ok: true, service: 'oasis-mcp-server', gateway: GATEWAY_URL });
+  });
+
+  // ── Internal tool discovery endpoints (not MCP, for the planner) ──────
+  app.post('/internal/tools/search', (req: Request, res: Response) => {
+    const { query = '', max_results = 10 } = req.body || {};
+    if (!query || typeof query !== 'string') {
+      res.json({ tools: [] });
+      return;
+    }
+    const tools = searchToolCatalog(query, max_results);
+    res.json({ tools, count: tools.length, query });
+  });
+
+  app.get('/internal/tools/categories', (_req: Request, res: Response) => {
+    const categories = getToolCategories();
+    res.json({ categories, count: categories.length });
+  });
+
+  // ── Internal skill discovery endpoint ─────────────────────────
+  app.post('/internal/skills/search', (req: Request, res: Response) => {
+    const { query = '', max_results = 10 } = req.body || {};
+    if (!query || typeof query !== 'string') {
+      res.json({ skills: [] });
+      return;
+    }
+    const skills = searchSkillCatalog(query, max_results);
+    res.json({ skills, count: skills.length, query });
   });
 
   /* ── Streamable HTTP (modern) ──────────────────────────────────────────

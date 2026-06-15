@@ -120,6 +120,13 @@ export interface EventPayload {
   data: Record<string, unknown>;
 }
 
+export interface TaskResult {
+  status: string;
+  final_message: string;
+  model: string | null;
+  tokens: { input: number; output: number };
+}
+
 export const JOB_REDIS_KEY = 'oasis:job';
 export const JOB_BUDGET_KEY = 'oasis:job_budget';
 export const JOB_USAGE_KEY = 'oasis:job_usage';

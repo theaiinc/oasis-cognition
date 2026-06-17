@@ -35,10 +35,38 @@ class LLMClient:
         self._anthropic_client: Any = None
         self._openai_client: Any = None
         self._ollama_client: Any = None
+        self._leyline_client: Any = None
 
     @property
     def provider(self) -> str:
+        """Effective provider.
+        
+        When the Leyline proxy is configured, all traffic is routed through
+        Leyline's OpenAI-compatible endpoint, so the effective provider is "openai".
+        """
+        if self._is_routed_via_leyline():
+            return "openai"
         return self._settings.llm_provider
+
+    def _leyline_base_url(self) -> str | None:
+        """Return Leyline proxy URL if configured, else None."""
+        url = (self._settings.leyline_base_url or "").strip().rstrip("/")
+        return url if url else None
+
+    def _effective_openai_base_url(self) -> str:
+        """Return the base URL for OpenAI-compatible calls.
+        
+        If the Leyline proxy is configured, all traffic routes through it.
+        Otherwise falls back to the configured openai_base_url.
+        """
+        leyline = self._leyline_base_url()
+        if leyline:
+            return leyline
+        return (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+
+    def _is_routed_via_leyline(self) -> bool:
+        """Whether all LLM calls go through the Leyline proxy."""
+        return self._leyline_base_url() is not None
 
     # ------------------------------------------------------------------
     # Lazy client construction
@@ -59,8 +87,7 @@ class LLMClient:
             import openai
 
             kwargs: dict[str, Any] = {"api_key": self._settings.openai_api_key}
-            if self._settings.openai_base_url:
-                kwargs["base_url"] = self._settings.openai_base_url
+            kwargs["base_url"] = self._effective_openai_base_url()
             self._openai_client = openai.OpenAI(**kwargs, timeout=self._timeout)
         return self._openai_client
 
@@ -214,6 +241,8 @@ class LLMClient:
         model: str | None = None,
         max_tokens: int | None = None,
         history: list[dict[str, str]] | None = None,
+        stop: list[str] | None = None,
+        temperature: float | None = None,
     ) -> str:
         """Async chat — uses httpx.AsyncClient so the HTTP connection to the
         LLM backend is cancellable when the caller task is cancelled."""
@@ -221,7 +250,7 @@ class LLMClient:
         max_tokens = max_tokens or self._settings.llm_max_tokens
 
         if self.provider == "openai":
-            return await self._call_openai_async(system, user_message, model, max_tokens, history)
+            return await self._call_openai_async(system, user_message, model, max_tokens, history, stop, temperature)
         if self.provider == "ollama":
             return await self._call_ollama_async(system, user_message, model, max_tokens, history)
         return await self._call_anthropic_async(system, user_message, model, max_tokens, history)
@@ -451,6 +480,8 @@ class LLMClient:
     async def _call_openai_async(
         self, system: str, user_message: str, model: str, max_tokens: int,
         history: list[dict[str, str]] | None = None,
+        stop: list[str] | None = None,
+        temperature: float | None = None,
     ) -> str:
         """Cancellable async non-streaming OpenAI call via httpx.AsyncClient.
         When the caller task is cancelled (e.g. gateway aborted the HTTP request),
@@ -459,12 +490,16 @@ class LLMClient:
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
 
-        base_url = (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        base_url = self._effective_openai_base_url()
         headers = {
             "Authorization": f"Bearer {self._settings.openai_api_key}",
             "Content-Type": "application/json",
         }
-        body = {"model": model, "max_tokens": max_tokens, "messages": messages, "stream": False}
+        body: dict = {"model": model, "max_tokens": max_tokens, "messages": messages, "stream": False}
+        if stop:
+            body["stop"] = stop
+        if temperature is not None:
+            body["temperature"] = temperature
 
         data = await self._async_llm_call_with_retry(
             f"{base_url}/chat/completions", body, headers,
@@ -485,7 +520,7 @@ class LLMClient:
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
 
-        base_url = (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        base_url = self._effective_openai_base_url()
         headers = {
             "Authorization": f"Bearer {self._settings.openai_api_key}",
             "Content-Type": "application/json",
@@ -586,7 +621,7 @@ class LLMClient:
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
-        base_url = (self._settings.ollama_base_url or "http://localhost:11434").rstrip("/")
+        base_url = (self._settings.ollama_host or "http://localhost:11434").rstrip("/")
 
         data = await self._async_llm_call_with_retry(
             f"{base_url}/api/chat",
@@ -609,7 +644,7 @@ class LLMClient:
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
-        base_url = (self._settings.ollama_base_url or "http://localhost:11434").rstrip("/")
+        base_url = (self._settings.ollama_host or "http://localhost:11434").rstrip("/")
 
         body: dict = {
             "model": model,
@@ -716,7 +751,7 @@ class LLMClient:
             "max_tokens": max_tokens,
             "stream": True,
         }
-        base_url = (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        base_url = self._effective_openai_base_url()
 
         with httpx.Client(timeout=self._timeout) as http:
             with http.stream("POST", f"{base_url}/chat/completions", json=body, headers=headers) as resp:
@@ -800,7 +835,7 @@ class LLMClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
-        base_url = (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        base_url = self._effective_openai_base_url()
 
         # Accumulators for tool call deltas (tool calls arrive in pieces across chunks)
         tool_calls: dict[int, dict] = {}
@@ -923,9 +958,9 @@ class LLMClient:
             "max_tokens": max_tokens,
             "stream": True,
         }
-        base_url = (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        base_url = self._effective_openai_base_url()
 
-        async with httpx.AsyncClient(timeout=None) as http:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(600, connect=30, read=600)) as http:
             async with http.stream("POST", f"{base_url}/chat/completions", json=body, headers=headers) as resp:
                 async for line in resp.aiter_lines():
                     if not line.startswith("data: "):
@@ -958,7 +993,7 @@ class LLMClient:
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
-        base_url = (self._settings.ollama_base_url or "http://localhost:11434").rstrip("/")
+        base_url = (self._settings.ollama_host or "http://localhost:11434").rstrip("/")
 
         async with httpx.AsyncClient(timeout=None) as http:
             async with http.stream(
@@ -1041,7 +1076,7 @@ class LLMClient:
             body["tools"] = tools
             body["tool_choice"] = "auto"
 
-        base_url = (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+        base_url = self._effective_openai_base_url()
 
         tool_calls: dict[int, dict] = {}
         finished_tool_calls: set[int] = set()
@@ -1114,7 +1149,7 @@ class LLMClient:
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
-        base_url = (self._settings.ollama_base_url or "http://localhost:11434").rstrip("/")
+        base_url = (self._settings.ollama_host or "http://localhost:11434").rstrip("/")
 
         async with httpx.AsyncClient(timeout=None) as http:
             async with http.stream(

@@ -70,12 +70,13 @@ services:
       - "8001:8001"
     environment:
       - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
-      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:8b}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:4b}
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
       - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
       - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LEYLINE_BASE_URL=${OASIS_LEYLINE_BASE_URL:-}
       - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
@@ -188,16 +189,20 @@ services:
       - ./.oasis-context.md:/workspace/.oasis-context.md:ro
       - ${HOME:-/Users}:/host-home:ro
     environment:
+      - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-google/gemma-4-e2b}
       - OASIS_RESPONSE_LLM_PROVIDER=${OASIS_RESPONSE_LLM_PROVIDER:-ollama}
-      - OASIS_RESPONSE_LLM_MODEL=${OASIS_RESPONSE_LLM_MODEL:-qwen3:8b}
+      - OASIS_RESPONSE_LLM_MODEL=${OASIS_RESPONSE_LLM_MODEL:-qwen3:4b}
       - OASIS_TOOL_PLAN_LLM_PROVIDER=${OASIS_TOOL_PLAN_LLM_PROVIDER:-ollama}
-      # Default aligns with packages/shared_utils/config.py — pull: ollama pull qwen3:8b
-      - OASIS_TOOL_PLAN_LLM_MODEL=${OASIS_TOOL_PLAN_LLM_MODEL:-qwen3:8b}
+      # Default aligns with packages/shared_utils/config.py — pull: ollama pull qwen3:4b
+      - OASIS_TOOL_PLAN_LLM_MODEL=${OASIS_TOOL_PLAN_LLM_MODEL:-qwen3:4b}
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
       - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
       - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LEYLINE_BASE_URL=${OASIS_LEYLINE_BASE_URL:-}
+      - OASIS_ROUTER_MODEL=${OASIS_ROUTER_MODEL:-}
       - OASIS_VISION_LLM_MODEL=${OASIS_VISION_LLM_MODEL:-}
       - OASIS_COMPUTER_USE_LLM_MODEL=${OASIS_COMPUTER_USE_LLM_MODEL:-}
       - OASIS_COMPUTER_USE_LLM_BASE_URL=${OASIS_COMPUTER_USE_LLM_BASE_URL:-}
@@ -220,12 +225,13 @@ services:
       - "8006:8006"
     environment:
       - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
-      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:8b}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:4b}
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
       - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
       - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LEYLINE_BASE_URL=${OASIS_LEYLINE_BASE_URL:-}
       - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
       - OASIS_WEB_SEARCH_PROVIDER=${OASIS_WEB_SEARCH_PROVIDER:-duckduckgo}
     healthcheck:
@@ -336,6 +342,11 @@ services:
       - LANGFUSE_HOST=http://langfuse:3000
       - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}
       - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-oasis}
+      # Model tier overrides for resolveTierModel
+      - OASIS_MODEL_2B=${OASIS_MODEL_2B:-google/gemma-4-e2b}
+      - OASIS_MODEL_4B=${OASIS_MODEL_4B:-google/gemma-4-e2b}
+      - OASIS_MODEL_12B=${OASIS_MODEL_12B:-google/gemma-4-12b}
+      - OASIS_ROUTER_MODEL=${OASIS_ROUTER_MODEL:-}
       # Frequent NDJSON chunks during long tool_use so proxies don’t see an idle POST
       - OASIS_INTERACTION_KEEPALIVE_MS=${OASIS_INTERACTION_KEEPALIVE_MS:-12000}
       # Optional: set to 1 to also abort on res/socket stream "close" (can false-positive with NDJSON)

@@ -42,6 +42,7 @@ PROJECT_OVERRIDABLE_FIELDS: set[str] = {
     "context_output_reserve",
     "embedding_model",
     "log_level",
+    "leyline_base_url",
 }
 
 
@@ -53,8 +54,8 @@ class Settings(BaseSettings):
 
     # LLM provider: "anthropic", "openai" (also works with any OpenAI-compatible
     # endpoint like DeepSeek / LLM API / vLLM / LM Studio), or "ollama"
-    llm_provider: str = "openai"
-    llm_model: str = "google/gemma-4-26b-a4b-qat"
+    llm_provider: str = "ollama"
+    llm_model: str = "qwen3:4b"
     llm_max_tokens: int = 8192
 
     # Anthropic
@@ -64,16 +65,20 @@ class Settings(BaseSettings):
     openai_api_key: str = "lm-studio"
     openai_base_url: str = "http://localhost:1234/v1"
 
-    # Ollama (legacy, replaced by LM Studio)
+    # Ollama
     ollama_host: str = "http://localhost:11434"
+    # Alias for backward-compatibility (LLMClient reads ollama_host)
+    @property
+    def ollama_base_url(self) -> str:
+        return self.ollama_host
 
     # Response model (separate from interpreter model)
-    response_llm_provider: str = "openai"
-    response_llm_model: str = "google/gemma-4-26b-a4b-qat"
+    response_llm_provider: str = "ollama"
+    response_llm_model: str = "qwen3:4b"
 
     # Tool-plan model (separate for prompt-following / JSON reliability)
-    tool_plan_llm_provider: str = "openai"
-    tool_plan_llm_model: str = "google/gemma-4-26b-a4b-qat"
+    tool_plan_llm_provider: str = "ollama"
+    tool_plan_llm_model: str = "qwen3:4b"
 
     # Vision (screen-share / multimodal). OpenAI-compatible APIs: same base_url + key as text.
     # Empty: Ollama falls back to llava:13b in response-generator; OpenAI-compatible uses llm_model.
@@ -90,6 +95,16 @@ class Settings(BaseSettings):
 
     # Router model (tiny/fast model for intent routing)
     router_model: str = ""  # empty = use llm_model as fallback
+
+    # Leyline proxy — when set, all LLM calls route through the Leyline gateway
+    # (https://github.com/theaiinc/leyline). Leyline handles provider failover,
+    # model routing, load balancing, and prompt compression. Cognition no longer
+    # needs to worry about which provider/model to use — just send the request
+    # and Leyline decides.
+    #
+    # Expected format: "http://leyline:3000"
+    # When empty, LLC calls go directly to the configured provider as before.
+    leyline_base_url: str = ""
 
     # Output token limits per model tier (0 = unlimited)
     max_output_tokens_2b: int = 128
@@ -142,7 +157,7 @@ class Settings(BaseSettings):
     weight_rule_match: float = 0.25
     weight_contradiction_penalty: float = 0.1
 
-    model_config = {"env_prefix": "OASIS_", "env_file": ".env"}
+    model_config = {"env_prefix": "OASIS_", "env_file": ".env", "extra": "ignore"}
 
 
 def _load_active_project_overrides() -> dict[str, Any]:

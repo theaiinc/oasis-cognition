@@ -43,6 +43,7 @@ _response_settings = Settings(
     openai_base_url=_settings.openai_base_url,
     ollama_host=_settings.ollama_host,
     vision_llm_model=_settings.vision_llm_model,
+    leyline_base_url=_settings.leyline_base_url,
 )
 _llm = LLMClient(_response_settings)
 
@@ -54,6 +55,7 @@ _tool_plan_settings = Settings(
     openai_api_key=_settings.openai_api_key,
     openai_base_url=_settings.openai_base_url,
     ollama_host=_settings.ollama_host,
+    leyline_base_url=_settings.leyline_base_url,
 )
 _tool_plan_llm = LLMClient(_tool_plan_settings)
 
@@ -226,6 +228,8 @@ class ToolPlanRequest(BaseModel):
     model_override: str | None = None  # model name for prompt-tier selection (e.g. "google/gemma-4-e2b")
     rule_packs_to_inject: list[str] | None = None  # JIT-inject these rule packs (e.g. ["tool_rules", "coding_rules"])
     max_tokens: int | None = None  # model-tier-specific output token cap
+    context_window_override: int | None = None  # override default context_window (profile > model variant > env)
+    context_output_reserve: float | None = None  # fraction reserved for output (0.0-1.0), e.g. 0.4
 
 class ThoughtGenerateRequest(BaseModel):
     user_message: str
@@ -343,8 +347,8 @@ async def tool_plan_parse_raw(req: ToolPlanParseRawRequest):
 @app.post("/internal/response/tool-plan-stream")
 async def tool_plan_stream(req: ToolPlanRequest):
     """Stream the planning of the next tool call."""
-    def generate():
-        for chunk in generator.stream_tool_plan(
+    async def generate():
+        async for chunk in generator.stream_tool_plan(
             req.user_message,
             tool_results=req.tool_results,
             chat_history=req.chat_history,
@@ -367,6 +371,8 @@ async def tool_plan_stream(req: ToolPlanRequest):
             model_override=req.model_override,
             rule_packs_to_inject=req.rule_packs_to_inject,
             max_tokens=req.max_tokens,
+            context_window_override=req.context_window_override,
+            context_output_reserve=req.context_output_reserve,
         ):
             yield chunk
     return StreamingResponse(generate(), media_type="text/plain")

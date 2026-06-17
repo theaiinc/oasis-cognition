@@ -31,6 +31,12 @@ export interface AgentProfileConfig {
   billing_class?: 'free_local' | 'paid_api' | 'subscription_external' | 'uncertain';
   /** Rough resource footprint for capacity planning. */
   resource_class?: 'light' | 'standard' | 'gpu';
+  /** Override the model's context window (tokens). Defaults to the model variant's context_length.
+   *  Research agents typically need huge windows; coding agents can use moderate; chat agents can use small. */
+  context_window?: number;
+  /** Fraction of context_window reserved for output (0.0–1.0). Default 0.4.
+   *  Higher → more room for thinking/completion tokens, less for input context. */
+  context_output_reserve?: number;
 }
 
 export interface AgentProfile {

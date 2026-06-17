@@ -767,7 +767,7 @@ function buildExplorationEscalationGuidance(
   return null;
 }
 
-const EXPLORATION_GUIDANCE_BROADEN = `[EXPLORATION: BROADEN] You are exploring too much. Use the Knowledge Graph symbols you already have. Stop listing directories and START editing. Next action MUST be create_worktree → edit_file/write_file/apply_patch.`;
+const EXPLORATION_GUIDANCE_BROADEN = `[EXPLORATION: BROADEN] You are exploring too much. Use the Knowledge Graph symbols you already have. Stop listing directories and START editing. Next action MUST be create_worktree → edit_file/write_file.`;
 
 const EXPLORATION_GUIDANCE_IMPLEMENT = `[IMPLEMENTATION: STOP EXPLORING NOW] You have enough context. The Knowledge Graph contains the symbols you need. STOP reading files and START implementing: create_worktree (PARAM_NAME: short id), then edit_file or write_file on the target path, then get_diff. NO MORE EXPLORATION.`;
 
@@ -779,7 +779,7 @@ function autonomousExploreWithoutEditMessage(count: number): string {
   return (
     `[FORCE ACTION: STOP EXPLORING] ${count} read-only tools is TOO MANY. You are stalling. ` +
     `The Knowledge Graph already contains the symbols you need. ` +
-    `NEXT ACTION MUST BE: create_worktree → edit_file/write_file/apply_patch. ` +
+    `NEXT ACTION MUST BE: create_worktree → edit_file/write_file. ` +
     `NO MORE grep. NO MORE list_dir. IMPLEMENT NOW.`
   );
 }
@@ -788,7 +788,7 @@ function autonomousWorktreeButNoEditMessage(readsAfterWt: number): string {
   return (
     `[FORCE ACTION: EDIT NOW] Worktree exists but you did ${readsAfterWt} more read(s) instead of editing. ` +
     `STOP EXPLORING. NEXT ACTION MUST BE edit_file or write_file with the worktree_id. ` +
-    `Use apply_patch for multi-line changes. DO NOT read another file.`
+    `For multi-line changes use edit_file with exact old_string. DO NOT read another file.`
   );
 }
 
@@ -1542,6 +1542,9 @@ export class InteractionService {
       if (preamble) hints.system_preamble = preamble;
       if (profile.config?.model) hints.model_override = profile.config.model;
       if (profile.config?.provider) hints.provider_override = profile.config.provider;
+      // Context window: profile override > model variant > env var default
+      if (profile.config?.context_window != null) hints.context_window_override = profile.config.context_window;
+      if (profile.config?.context_output_reserve != null) hints.context_output_reserve = profile.config.context_output_reserve;
       // Propagate ids so response-generator logs / langfuse can attribute them.
       hints._role_id = roleId || undefined;
       hints._profile_id = profile.profile_id;
@@ -1563,7 +1566,20 @@ export class InteractionService {
    */
   private _setSessionWorktreeId(sessionId: string, worktreeId: string): void {
     this.sessionWorktrees.set(sessionId, worktreeId);
-    void this.sessionWorktree.claim(sessionId, worktreeId).catch((err) => {
+    this.sessionWorktree.claim(sessionId, worktreeId).catch(async (err) => {
+      // If another session claims our freshly-created worktree (stale Redis
+      // entry from an abandoned session), release the stale owner and retry.
+      if (err?.message?.includes('already owned')) {
+        this.logger.warn(`Stale worktree claim for ${worktreeId}: ${err.message} — releasing stale owner`);
+        try {
+          await this.sessionWorktree.releaseWorktree(worktreeId);
+          await this.sessionWorktree.claim(sessionId, worktreeId);
+          this.logger.log(`Reclaimed worktree ${worktreeId} for session ${sessionId} after releasing stale owner`);
+          return;
+        } catch (retryErr: any) {
+          this.logger.warn(`Retry claim also failed: ${retryErr?.message || retryErr}`);
+        }
+      }
       // Roll back the in-memory cache so we don't pretend the claim succeeded.
       const cached = this.sessionWorktrees.get(sessionId);
       if (cached === worktreeId) this.sessionWorktrees.delete(sessionId);
@@ -1723,6 +1739,9 @@ export class InteractionService {
       interpretSpan?.end({ output: { ...semanticStructure, route } });
 
       // ── Route correction ────────────────────────────────────────────
+      let routerResult: { complexity: string; domain: string; reasoning: string } | null = null;
+
+      // Correction 1: Short follow-up after a tool-use turn (e.g. "fix that too")
       if (route === 'casual') {
         const prevAssistantTurn = chatHistory.filter(t => t.role === 'assistant').slice(-1)[0];
         const msgText = (req.user_message || '').trim();
@@ -1740,23 +1759,50 @@ export class InteractionService {
         }
       }
 
-      // If the interpreter classified as "complex" but the intent implies code
-      // inspection or editing, the LLM mis-classified.  Complex route does NOT
-      // run tools — it only generates text.  Redirect to tool_use so the agent
-      // can read files, run commands, and make changes.
+      // Correction 2: Router model intent classification + keyword fallback
+      // The router is a lightweight model (2B) that classifies domain and complexity.
+      // Router KNOWLEDGE: domain=coding|planning|workflow means tool_use route.
+      // Fallback to keywords only when the router call fails.
       if (route === 'complex') {
-        const toolUseIntents = ['implement', 'fix', 'explore', 'execute', 'diagnose', 'compare'];
-        const intent = (semanticStructure?.intent || '').toLowerCase().trim();
-        const msgText = (req.user_message || '').toLowerCase().trim();
-        const looksLikeCodeWork =
-          toolUseIntents.includes(intent) ||
-          /\b(add|fix|change|create|update|enable|implement|remove|refactor|build|make|write|edit|delete|show|find|check|run|investigate|debug|test)\b/i.test(msgText.slice(0, 80));
-        if (looksLikeCodeWork) {
-          this.logger.warn(
-            `Route override: ${route} → tool_use (intent=${intent}, message suggests code work: "${msgText.slice(0, 60)}")`,
-          );
-          route = 'tool_use';
-          semanticStructure.route = 'tool_use';
+        // Try the lightweight router model first
+        if (!curModel) {
+          try {
+            const routerResp = await axios.post(
+              `${RESPONSE_URL}/internal/route`,
+              { user_message: req.user_message, chat_history: chatHistory.slice(-4) },
+              { timeout: 30000 },
+            );
+            routerResult = routerResp.data as { complexity: string; domain: string; reasoning: string };
+
+            // Router domain = coding|planning|workflow → needs tool_use
+            const toolDomains = ['coding', 'planning', 'workflow'];
+            if (toolDomains.includes(routerResult.domain)) {
+              this.logger.warn(
+                `Route override: ${route} → tool_use (router domain=${routerResult.domain})`,
+              );
+              route = 'tool_use';
+              semanticStructure.route = 'tool_use';
+            }
+          } catch (err: any) {
+            this.logger.warn(`Route router call failed: ${err.message} — falling back to keyword/intent heuristic`);
+          }
+        }
+
+        // Keyword fallback: only when router didn't provide an override
+        if (route === 'complex') {
+          const toolUseIntents = ['implement', 'fix', 'explore', 'execute', 'diagnose', 'compare', 'create'];
+          const intent = (semanticStructure?.intent || '').toLowerCase().trim();
+          const msgText = (req.user_message || '').toLowerCase().trim();
+          const looksLikeCodeWork =
+            toolUseIntents.includes(intent) ||
+            /\b(add|fix|change|create|update|enable|implement|remove|refactor|build|make|write|edit|delete|show|find|check|run|investigate|debug|test)\b/i.test(msgText);
+          if (looksLikeCodeWork) {
+            this.logger.warn(
+              `Route override: ${route} → tool_use (keyword fallback — intent=${intent})`,
+            );
+            route = 'tool_use';
+            semanticStructure.route = 'tool_use';
+          }
         }
       }
 
@@ -1772,34 +1818,43 @@ export class InteractionService {
       if (effective.model && effective.model !== curModel && !curModel) {
         req.context = { ...(req.context || {}), model_override: effective.model };
       }
-      // Call the Router Agent (2B) for descriptive classification (not model prediction)
+      // Call the Router Agent only if we haven't already called it above (route was already complex
+      // and router wasn't called, e.g. curModel was set). If curModel is set we skip the model
+      // router too — profile overrides take full control.
       if (!curModel) {
         try {
-          const routerResp = await axios.post(
-            `${RESPONSE_URL}/internal/route`,
-            { user_message: req.user_message, chat_history: chatHistory.slice(-4) },
-            { timeout: 5000 },
-          );
-          const routerResult = routerResp.data as { complexity: string; domain: string; reasoning: string };
+          // Use cached routerResult from route correction if available to avoid a duplicate call
+          const routerResp = routerResult
+            ? { data: routerResult }
+            : await axios.post(
+                `${RESPONSE_URL}/internal/route`,
+                { user_message: req.user_message, chat_history: chatHistory.slice(-4) },
+                { timeout: 30000 },
+              );
+          const finalRouterResult = routerResp.data as { complexity: string; domain: string; reasoning: string };
           // Apply code-based policy: the router describes, this function decides
-          const selectedTier = selectModelByRouter(routerResult);
+          const baseTier = selectModelByRouter(finalRouterResult);
+          // For tool_use routes (which involve coding/implementation), enforce
+          // at minimum the 12B tier — the router model is too small to reliably
+          // distinguish "simple chat" from "implement an app".
+          const selectedTier = route === 'tool_use' ? '12b' : baseTier;
           const selectedModel = resolveTierModel(selectedTier);
           if (selectedModel && selectedModel !== effective.model) {
             this.logger.log(
               `Router agent → policy override: ${effective.model} → ${selectedModel} ` +
-              `(complexity=${routerResult.complexity}, domain=${routerResult.domain}, reasoning=${routerResult.reasoning})`,
+              `(complexity=${finalRouterResult.complexity}, domain=${finalRouterResult.domain}, reasoning=${finalRouterResult.reasoning})`,
             );
             req.context = { ...(req.context || {}), model_override: selectedModel };
           } else {
             this.logger.log(
               `Router agent confirmed: ${effective.model || selectedModel} ` +
-              `(complexity=${routerResult.complexity}, domain=${routerResult.domain})`,
+              `(complexity=${finalRouterResult.complexity}, domain=${finalRouterResult.domain})`,
             );
           }
           // Publish routing telemetry
           this.events
             .publish('ModelRoutingTelemetry', sessionId, {
-              ...routerResult,
+              ...finalRouterResult,
               selected_tier: selectedTier,
               selected_model: selectedModel,
               default_tier: effective.routing,
@@ -1933,8 +1988,8 @@ export class InteractionService {
     req: InteractionRequest,
     _semanticStructure: any,
     trace: any,
-    _interactionId: string,
-    _clientMessageId: string | undefined,
+    interactionId: string,
+    clientMessageId: string | undefined,
     chatHistory: Array<{ role: string; content: string }> = [],
     signal?: AbortSignal,
   ): Promise<InteractionResponse> {
@@ -1975,8 +2030,8 @@ export class InteractionService {
     await this.events.publish('LlmCallStarted', sessionId, {
       service: 'response-generator',
       route: 'casual',
-      interaction_id: _interactionId,
-      client_message_id: _clientMessageId,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
     });
     const chatContext = {
       ...(req.context || {}),
@@ -1995,16 +2050,25 @@ export class InteractionService {
       service: 'response-generator',
       route: 'casual',
       duration_ms: Date.now() - llmStart,
-      interaction_id: _interactionId,
-      client_message_id: _clientMessageId,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
     });
     const responseText = chatRes.data.response_text;
     chatSpan?.end({ output: { response_length: responseText.length } });
 
+    // Publish response as a thinking chunk too so the thinking overlay shows content
+    // even on the casual route (which has no separate reasoning token stream).
+    await this.events.publish('ThinkingChunkGenerated', sessionId, {
+      chunk: responseText,
+      full_reasoning: responseText,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
+    }).catch(err => this.logger.warn(`Failed to publish thinking chunk: ${err.message}`));
+
     await this.events.publish('ResponseGenerated', sessionId, {
       response_length: responseText.length,
-      interaction_id: _interactionId,
-      client_message_id: _clientMessageId,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
     });
 
     trace?.update({ output: { response: responseText, route: 'casual' } });
@@ -2067,7 +2131,7 @@ export class InteractionService {
         }, undefined, { timeout: FAST_TIMEOUT_MS }),
         // Also fetch foundational graph nodes for grounded reasoning
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/nodes-by-tier`, {
-          params: { tier: 'foundational', session_id: sessionId, limit: 10 },
+          params: { tier: 'foundational', session_id: sessionId, project_id: projectId, limit: 10 },
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => ({ data: { nodes: [] } })),
         // Use project-scoped rules when a project is active, otherwise global rules
         projectId
@@ -2206,6 +2270,7 @@ export class InteractionService {
       await axiosWithRetry('post', `${MEMORY_URL}/internal/memory/store`, {
         reasoning_graph: decisionTree.graph || reasoningGraph,
         user_id: 'default',
+        session_id: sessionId,
         project_id: req.context?.project_id,
       }, undefined, { timeout: FAST_TIMEOUT_MS });
       storeSpan?.end({ output: { graph_id: reasoningGraph.id } });
@@ -2449,7 +2514,7 @@ export class InteractionService {
         }, undefined, { timeout: FAST_TIMEOUT_MS }),
         // Fetch foundational graph nodes — these should always inform tool-use planning
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/nodes-by-tier`, {
-          params: { tier: 'foundational', session_id: sessionId, limit: 10 },
+          params: { tier: 'foundational', session_id: sessionId, project_id: projectId, limit: 10 },
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => ({ data: { nodes: [] } })),
         // Use project-scoped rules when a project is active, otherwise global rules
         projectId
@@ -3197,6 +3262,8 @@ export class InteractionService {
           max_tokens: modelCaps.maxOutputTokens > 0 ? modelCaps.maxOutputTokens : undefined,
           // JIT: inject rule packs based on last plan's action or explicit get_rule
           rule_packs_to_inject: rulePacksToInject.length > 0 ? rulePacksToInject : undefined,
+          context_window_override: (req.context as any)?.context_window_override ?? undefined,
+          context_output_reserve: (req.context as any)?.context_output_reserve ?? undefined,
         },
         iteration,
         trace,
@@ -3425,7 +3492,7 @@ export class InteractionService {
                 `You have read files successfully — now ACT on them:\n` +
                 `1. If you haven't created a worktree yet → create_worktree\n` +
                 `2. If the file is too large to read fully → use start_line/end_line for chunked reads\n` +
-                `3. Apply your changes with apply_patch or edit_file\n` +
+                `3. Apply your changes with edit_file or apply_patch (prefer edit_file)\n` +
                 `4. Show the diff with get_diff\n` +
                 `Do NOT tell the user to do it. DO IT YOURSELF.`,
               blocked: false,
@@ -3499,7 +3566,7 @@ export class InteractionService {
                 );
                 observerFeedback =
                   'The observer accepted your answer but you are PUNTING the task to the user. ' +
-                  'You MUST implement it yourself: create_worktree → read the file with chunked reads (start_line/end_line) → apply_patch/edit_file → get_diff. ' +
+                  'You MUST implement it yourself: create_worktree → read the file with chunked reads (start_line/end_line) → edit_file/apply_patch → get_diff. ' +
                   'Do NOT tell the user how to do it — DO IT.';
                 taskGraph = obsRes.data.updated_graph || taskGraph;
                 updateThoughtsOnlyStreak();
@@ -5120,7 +5187,7 @@ export class InteractionService {
             try {
               const [memRes, rulesRefresh] = await Promise.all([
                 axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-                  params: { q: semanticStructure?.problem || req.user_message, limit: 5, session_id: sessionId },
+                  params: { q: semanticStructure?.problem || req.user_message, limit: 5, session_id: sessionId, project_id: req.context?.project_id },
                 }, undefined, { timeout: FAST_TIMEOUT_MS }),
                 axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
               ]);
@@ -5630,7 +5697,9 @@ export class InteractionService {
 
       const stream = response.data;
       const MAX_THOUGHT_CHARS = 30_000; // increased — modern LLMs can output 10k+ reasoning chars
-      const IDLE_TIMEOUT_MS = 60_000; // kill if no data for 60s
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // kill if no data for 5 min (slow 12B models)
       let aborted = false;
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -5859,7 +5928,9 @@ export class InteractionService {
         let thoughts = '';
         let toolCall: any = null;
         let lineBuffer = '';
-        const IDLE_TIMEOUT_MS = 60_000;
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // 5 min for slow models
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
         const resetIdle = () => {
@@ -5990,7 +6061,8 @@ export class InteractionService {
     const execPayload: Record<string, any> = { tool: toolName };
 
     if (isDevAgentTool) {
-      execPayload.path = args.path || undefined;
+      const normalized = args.path ? normalizeDevAgentFilePath(args.path) || args.path : '';
+      execPayload.path = normalized ? repairAmbiguousDevPath(normalized) : undefined;
       execPayload.content = args.content || undefined;
       execPayload.old_string = args.old_string || undefined;
       execPayload.new_string = args.new_string || undefined;
@@ -6041,7 +6113,9 @@ export class InteractionService {
       const stream = response.data;
 
       return new Promise((resolve) => {
-        const IDLE_TIMEOUT_MS = 60_000;
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // 5 min for slow models
         let idleTimer: ReturnType<typeof setTimeout> | null = null;
         const resetIdle = () => {
           if (idleTimer) clearTimeout(idleTimer);
@@ -6110,7 +6184,9 @@ export class InteractionService {
       });
 
       const stream = response.data;
-      const IDLE_TIMEOUT_MS = 60_000;
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // 5 min for slow models
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
       const resetIdle = () => {
         if (idleTimer) clearTimeout(idleTimer);
@@ -6207,6 +6283,11 @@ export class InteractionService {
   ): Promise<any> {
     let fullJsonText = '';
     let lastReasoning = '';
+    // NDJSON accumulators (FC path)
+    let isNdjson = false;
+    let ndjsonPlan: any | null = null;
+    let ndjsonContent = '';
+    let ndjsonReasoning = '';
     const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
 
     try {
@@ -6220,7 +6301,9 @@ export class InteractionService {
       });
 
       const stream = response.data;
-      const IDLE_TIMEOUT_MS = 60_000;
+      const IDLE_TIMEOUT_MS = process.env.TOOL_PLAN_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.TOOL_PLAN_IDLE_TIMEOUT_MS, 10)
+        : 300_000;  // 5 min — 12B model can be 2-3 min between chunks
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
 
       return new Promise((resolve) => {
@@ -6232,33 +6315,78 @@ export class InteractionService {
           const text = chunk.toString();
           fullJsonText += text;
 
-          // Prefer flat `REASONING:` line (tool-plan prompt); fall back to partial JSON "reasoning" string.
-          let currentReasoning = '';
-          // Multi-line: capture from REASONING: until the next recognized key or end of text.
-          const multiLineRe = /^\s*REASONING:\s*([\s\S]*?)(?=\n\s*(?:DECISION|ACTION|ANSWER|QUESTION|ANSWER_DIRECTLY|NEED_MORE_INFO|OPTIONS)\s*:|\n*$)/gim;
-          let mlMatch;
-          while ((mlMatch = multiLineRe.exec(fullJsonText)) !== null) {
-            currentReasoning = (mlMatch[1] ?? '').trimEnd();
-          }
-          if (!currentReasoning) {
-            const reasoningMatch = fullJsonText.match(/"reasoning":\s*"([^"]*)/);
-            if (reasoningMatch?.[1]) {
-              currentReasoning = reasoningMatch[1];
+          // Detect NDJSON mode from first data event
+          if (!isNdjson) {
+            const trimmed = text.trim();
+            if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+              try {
+                JSON.parse(trimmed);
+                isNdjson = true;
+              } catch {
+                isNdjson = false;
+              }
             }
           }
-          if (currentReasoning !== lastReasoning) {
-            const delta = currentReasoning.slice(lastReasoning.length);
-            if (delta) {
-              this.events
-                .publish('ToolReasoningChunkGenerated', sessionId, {
-                  chunk: delta,
-                  full_reasoning: currentReasoning,
-                  interaction_id: interactionId,
-                  client_message_id: clientMessageId,
-                  iteration,
-                })
-                .catch(err => this.logger.warn(`Failed to publish tool reasoning chunk: ${err.message}`));
-              lastReasoning = currentReasoning;
+
+          if (isNdjson) {
+            // ── NDJSON / FC mode: parse each line ──
+            const rawLines = text.split('\n');
+            for (let li = 0; li < rawLines.length - 1; li++) {
+              const line = rawLines[li].trim();
+              if (!line) continue;
+              try {
+                const item = JSON.parse(line);
+                if (item.type === 'reasoning') {
+                  ndjsonReasoning += item.text;
+                  if (item.text) {
+                    this.events
+                      .publish('ToolReasoningChunkGenerated', sessionId, {
+                        chunk: item.text,
+                        full_reasoning: ndjsonReasoning,
+                        interaction_id: interactionId,
+                        client_message_id: clientMessageId,
+                        iteration,
+                      })
+                      .catch(err => this.logger.warn(`Failed to publish tool reasoning chunk: ${err.message}`));
+                  }
+                  lastReasoning = ndjsonReasoning;
+                } else if (item.type === 'content') {
+                  ndjsonContent += item.text;
+                } else if (item.type === 'plan') {
+                  ndjsonPlan = item.plan;
+                }
+              } catch {
+                // skip unparseable lines (partial chunks)
+              }
+            }
+          } else {
+            // ── Flat-text (fallback): extract reasoning via regex ──
+            let currentReasoning = '';
+            const multiLineRe = /^\s*REASONING:\s*([\s\S]*?)(?=\n\s*(?:DECISION|ACTION|ANSWER|QUESTION|ANSWER_DIRECTLY|NEED_MORE_INFO|OPTIONS)\s*:|\n*$)/gim;
+            let mlMatch;
+            while ((mlMatch = multiLineRe.exec(fullJsonText)) !== null) {
+              currentReasoning = (mlMatch[1] ?? '').trimEnd();
+            }
+            if (!currentReasoning) {
+              const reasoningMatch = fullJsonText.match(/"reasoning":\s*"([^"]*)/);
+              if (reasoningMatch?.[1]) {
+                currentReasoning = reasoningMatch[1];
+              }
+            }
+            if (currentReasoning !== lastReasoning) {
+              const delta = currentReasoning.slice(lastReasoning.length);
+              if (delta) {
+                this.events
+                  .publish('ToolReasoningChunkGenerated', sessionId, {
+                    chunk: delta,
+                    full_reasoning: currentReasoning,
+                    interaction_id: interactionId,
+                    client_message_id: clientMessageId,
+                    iteration,
+                  })
+                  .catch(err => this.logger.warn(`Failed to publish tool reasoning chunk: ${err.message}`));
+                lastReasoning = currentReasoning;
+              }
             }
           }
         });
@@ -6294,9 +6422,7 @@ export class InteractionService {
           });
 
           const endToolPlanObs = (output: Record<string, unknown>) => {
-            if (!toolPlanObs) {
-              return;
-            }
+            if (!toolPlanObs) return;
             try {
               toolPlanObs.end({ output });
             } catch (lfErr: any) {
@@ -6304,6 +6430,21 @@ export class InteractionService {
             }
           };
 
+          // ═══ NDJSON fast path: plan was pre-parsed by the service ═══
+          if (ndjsonPlan) {
+            const out: Record<string, unknown> = {
+              raw_len: fullJsonText.length,
+              parse_path: 'ndjson-fc',
+              action: ndjsonPlan.action,
+              tool: ndjsonPlan.tool,
+              raw_preview: this.collapseWhitespacePreview(fullJsonText, 1200),
+            };
+            endToolPlanObs(out);
+            resolve(ndjsonPlan);
+            return;
+          }
+
+          // ═══ Flat-text fallback: parse the raw text ═══
           try {
             let result: any;
             let parsePath: string = 'parse-raw';
@@ -6379,8 +6520,6 @@ export class InteractionService {
                 ? { model_output_truncated: fullJsonText.slice(0, OASIS_DEBUG_TOOL_PLAN_MAX_CHARS) }
                 : {}),
             });
-            // Render the raw (non-parsable) tool-plan output in the thoughts UI so it
-            // doesn't feel like a silent failure.
             await this.events.publish('ThoughtChunkGenerated', sessionId, {
               chunk:
                 `⚠️ Tool-plan output not parsable. Rendering raw output as thought:\n` +
@@ -6390,7 +6529,6 @@ export class InteractionService {
               client_message_id: clientMessageId,
               iteration,
             }).catch(err => this.logger.warn(`Failed to publish thought chunk on parse failure: ${err.message}`));
-            // Non-fatal: keep the tool loop moving with a deterministic fallback tool call.
             const userMsg = typeof payload?.user_message === 'string' ? payload.user_message : String(payload?.user_message || '');
             const tokenMatch = userMsg.match(/[A-Za-z0-9_]{4,}/);
             const fallbackPattern = tokenMatch ? tokenMatch[0] : 'pattern';

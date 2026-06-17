@@ -194,6 +194,9 @@ class MemoryService:
             session.run("CREATE INDEX IF NOT EXISTS FOR (p:Project) ON (p.name)")
             session.run("CREATE INDEX IF NOT EXISTS FOR (e:Embedding) ON (e.artifact_id)")
 
+            # Memory session_id index for project-scoped queries
+            session.run("CREATE INDEX IF NOT EXISTS FOR (m:Memory) ON (m.session_id)")
+
             # Code knowledge graph schema
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (f:CodeFile) REQUIRE f.path IS UNIQUE")
             session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (s:CodeSymbol) REQUIRE s.id IS UNIQUE")
@@ -238,6 +241,14 @@ class MemoryService:
             logger.info("Memory stored (fallback): %s (%s)", entry.memory_id, entry.memory_type.value)
             return
 
+        # Extract session_id from content or tags for top-level Neo4j property
+        session_id_val = entry.content.get("session_id", "") if isinstance(entry.content, dict) else ""
+        if not session_id_val:
+            for tag in entry.tags:
+                if tag.startswith("session:"):
+                    session_id_val = tag[8:]
+                    break
+
         with self._driver.session() as session:
             session.run(
                 """
@@ -247,6 +258,7 @@ class MemoryService:
                     m.graph_reference = $graph_reference,
                     m.user_reference = $user_reference,
                     m.tags = $tags,
+                    m.session_id = $session_id,
                     m.created_at = $created_at
                 """,
                 memory_id=entry.memory_id,
@@ -255,6 +267,7 @@ class MemoryService:
                 graph_reference=entry.graph_reference or "",
                 user_reference=entry.user_reference or "",
                 tags=json.dumps(entry.tags),
+                session_id=session_id_val,
                 created_at=entry.created_at.isoformat() if isinstance(entry.created_at, datetime) else str(entry.created_at),
             )
         logger.info("Memory stored (Neo4j): %s (%s)", entry.memory_id, entry.memory_type.value)
@@ -999,10 +1012,17 @@ class MemoryService:
                         break
             return results
 
+        # SAFETY: Without a project_id or session_id, we cannot know which
+        # project's memories to return.  Unfiltered queries leak data across
+        # projects.  Callers must always pass at least one scope filter.
+        if not project_id and not session_id:
+            logger.warning("retrieve() called without project_id or session_id — returning empty (prevents cross-project leak)")
+            return []
+
         params: dict[str, Any] = {"q": query, "limit": limit}
         where_extra = ""
         if session_id:
-            where_extra += " AND (m.content CONTAINS $session_id OR m.tags CONTAINS $session_tag)"
+            where_extra += " AND (m.session_id = $session_id OR m.tags CONTAINS $session_tag)"
             params["session_id"] = session_id
             params["session_tag"] = f"session:{session_id}"
         if project_id:
@@ -1038,10 +1058,22 @@ class MemoryService:
         self,
         tier: str,
         session_id: str | None = None,
+        project_id: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        """Retrieve ReasoningNode entries filtered by graph tier (foundational / active)."""
+        """Retrieve ReasoningNode entries filtered by graph tier (foundational / active).
+
+        At least one of session_id or project_id must be provided to prevent
+        cross-project data leakage.  ReasoningNodes do not carry project_id
+        directly, so project-scoped queries resolve through Memory tags.
+        """
         if self._use_fallback:
+            return []
+
+        # SAFETY: Without a project_id or session_id we cannot scope the
+        # query and would leak nodes from every project.
+        if not project_id and not session_id:
+            logger.warning("retrieve_nodes_by_tier() called without project_id or session_id — returning empty (prevents cross-project leak)")
             return []
 
         params: dict[str, Any] = {"tier": tier, "limit": limit}
@@ -1049,6 +1081,17 @@ class MemoryService:
         if session_id:
             session_filter = " AND n.session_id = $session_id"
             params["session_id"] = session_id
+        elif project_id:
+            # When scoping by project, find all sessions that belong to this project
+            # via memory tags, then filter nodes by those sessions.
+            project_sessions = self._get_sessions_for_project(project_id)
+            if project_sessions:
+                session_filter = f" AND n.session_id IN $project_sessions"
+                params["project_sessions"] = project_sessions
+            else:
+                # No sessions found for this project — no nodes can leak
+                logger.info("No sessions found for project %s; returning empty nodes", project_id)
+                return []
 
         with self._driver.session() as session:
             result = session.run(
@@ -1073,6 +1116,52 @@ class MemoryService:
                         pass
                 nodes.append(node)
             return nodes
+
+    def _get_sessions_for_project(self, project_id: str) -> list[str]:
+        """Return all session_ids that have Memory entries tagged with this project.
+
+        Uses the top-level `m.session_id` property when available (new entries),
+        and falls back to extracting from content JSON for backward compatibility
+        with pre-existing entries.
+        """
+        if self._use_fallback or not self._driver:
+            return []
+        ids: list[str] = []
+        with self._driver.session() as session:
+            # Try the indexed property first (new entries)
+            result = session.run(
+                """
+                MATCH (m:Memory)
+                WHERE m.tags CONTAINS $project_tag
+                  AND m.session_id IS NOT NULL AND m.session_id <> ''
+                RETURN DISTINCT m.session_id AS sid
+                """,
+                project_tag=f"project:{project_id}",
+            )
+            ids = [record["sid"] for record in result if record.get("sid")]
+
+            # Fall back to extracting from content JSON for pre-migration entries
+            # that don't have a top-level session_id property
+            orphan_result = session.run(
+                """
+                MATCH (m:Memory)
+                WHERE m.tags CONTAINS $project_tag
+                  AND (m.session_id IS NULL OR m.session_id = '')
+                RETURN m.content AS content
+                """,
+                project_tag=f"project:{project_id}",
+            )
+            for record in orphan_result:
+                raw = record.get("content")
+                if raw:
+                    try:
+                        content = json.loads(raw) if isinstance(raw, str) else raw
+                        sid = content.get("session_id", "") if isinstance(content, dict) else ""
+                        if sid and sid not in ids:
+                            ids.append(sid)
+                    except (json.JSONDecodeError, TypeError):
+                        pass
+            return ids
 
     async def set_pending_teaching(self, session_id: str, payload: dict[str, Any]) -> None:
         """Store a pending teaching flow for a session (clarifying Q follow-up)."""

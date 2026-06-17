@@ -2,10 +2,6 @@ import { Controller, Post, Body, Logger, Req, Res, HttpException, HttpStatus } f
 import { Request, Response } from 'express';
 import { InteractionService, InteractionRequest } from './interaction.service';
 
-const KEEPALIVE_MS = parseInt(process.env.OASIS_INTERACTION_KEEPALIVE_MS || '12000', 10);
-/** When 1, also treat res/socket stream 'close' as abort (can false-positive with chunked NDJSON on some stacks). */
-const STRICT_STREAM_CLOSE_ABORT = process.env.OASIS_STRICT_STREAM_CLOSE_ABORT === '1';
-
 @Controller('interaction')
 export class InteractionController {
   private readonly logger = new Logger(InteractionController.name);
@@ -15,82 +11,31 @@ export class InteractionController {
   @Post()
   async createInteraction(
     @Body() req: InteractionRequest,
-    @Req() expressReq: Request,
-    @Res() expressRes: Response,
-  ): Promise<void> {
-    this.logger.log(`New interaction: session=${req.session_id || 'auto'}`);
+    @Req() _expressReq: Request,
+    @Res({ passthrough: true }) expressRes: Response,
+  ): Promise<{ session_id: string }> {
+    const sessionId = req.session_id || 'auto';
+    this.logger.log(`New interaction: session=${sessionId}`);
 
-    // Abort detection: prefer explicit socket/message teardown only. Do NOT use req.on('close') (fires
-    // after body read). res.on('close') / socket.on('close') can also fire during normal chunked
-    // responses on some Node/Docker stacks — false "stopped by client" right after RulesSnapshot.
-    let streamCloseAbort = false;
-    const markDisconnectedIfResponsePending = () => {
-      if (!expressRes.writableEnded) {
-        streamCloseAbort = true;
-      }
-    };
-    if (STRICT_STREAM_CLOSE_ABORT) {
-      expressRes.on('close', markDisconnectedIfResponsePending);
-      expressReq.socket?.on('close', markDisconnectedIfResponsePending);
-    }
+    // Accept immediately — pipeline runs in the background.
+    // All events (ThinkingChunkGenerated, ResponseGenerated, etc.) are
+    // published to Redis Streams. Consumers should use the SSE endpoint:
+    //
+    //   GET /events/timeline?session_id={session_id}
+    //
+    // This decouples the HTTP request lifecycle from potentially long
+    // model inference (minutes), so curl / CLI / any HTTP client works
+    // without holding the connection open.
 
-    const isAborted = () => {
-      if (STRICT_STREAM_CLOSE_ABORT) {
-        if (streamCloseAbort || expressReq.destroyed) return true;
-      }
-      const sock = expressReq.socket;
-      return sock != null && sock.destroyed;
-    };
+    expressRes.status(HttpStatus.ACCEPTED);
+    expressRes.json({ session_id: sessionId });
 
-    expressRes.setHeader('Content-Type', 'application/x-ndjson; charset=utf-8');
-    expressRes.setHeader('Cache-Control', 'no-cache');
-    expressRes.setHeader('X-Content-Type-Options', 'nosniff');
-    expressRes.status(200);
+    // Fire the pipeline in the background (no await).
+    // Errors are published as PipelineFailed events to the stream.
+    this.interactionService.execute(req, () => false).catch((err) => {
+      this.logger.error(`Background pipeline failed: ${err?.message || err}`);
+    });
 
-    const writeKeepalive = () => {
-      if (expressRes.writableEnded) return;
-      try {
-        expressRes.write(JSON.stringify({ _oasis_keepalive: true }) + '\n');
-      } catch {
-        /* client gone */
-      }
-    };
-
-    if (typeof (expressRes as any).flushHeaders === 'function') {
-      (expressRes as any).flushHeaders();
-    }
-
-    writeKeepalive();
-    const hb = setInterval(writeKeepalive, KEEPALIVE_MS);
-
-    const finishError = (e: unknown) => {
-      if (expressRes.writableEnded) return;
-      const status = e instanceof HttpException ? e.getStatus() : HttpStatus.INTERNAL_SERVER_ERROR;
-      const body = e instanceof HttpException ? e.getResponse() : { error: 'Reasoning pipeline failed', detail: (e as Error)?.message };
-      try {
-        expressRes.write(JSON.stringify({ _oasis_error: true, status, body }) + '\n');
-        expressRes.end();
-      } catch {
-        /* ignore */
-      }
-    };
-
-    try {
-      const result = await this.interactionService.execute(req, isAborted);
-      clearInterval(hb);
-      if (!expressRes.writableEnded) {
-        expressRes.write(JSON.stringify(result) + '\n');
-        expressRes.end();
-      }
-    } catch (e: unknown) {
-      clearInterval(hb);
-      finishError(e);
-    } finally {
-      clearInterval(hb);
-      if (STRICT_STREAM_CLOSE_ABORT) {
-        expressRes.off('close', markDisconnectedIfResponsePending);
-        expressReq.socket?.off('close', markDisconnectedIfResponsePending);
-      }
-    }
+    return { session_id: sessionId };
   }
 }

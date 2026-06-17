@@ -68,6 +68,35 @@ class LLMClient:
         """Whether all LLM calls go through the Leyline proxy."""
         return self._leyline_base_url() is not None
 
+    def _leyline_budget_headers(self) -> dict[str, str]:
+        """Return budget-constraint headers for Leyline cost-aware routing."""
+        headers: dict[str, str] = {}
+        max_budget = self._settings.leyline_max_budget_usd
+        daily_budget = self._settings.leyline_daily_budget_usd
+        if max_budget > 0:
+            headers["X-Leyline-Max-Budget-USD"] = str(max_budget)
+        if daily_budget > 0:
+            headers["X-Leyline-Daily-Budget-USD"] = str(daily_budget)
+        return headers
+
+    def _openai_headers(self, extra: dict[str, str] | None = None) -> dict[str, str]:
+        """Build headers for OpenAI-compatible HTTP calls.
+
+        When routed through Leyline, budget-constraint headers are injected so
+        Leyline can do cost-aware model selection.
+
+        *extra* — additional headers merged on top (e.g. Accept for streaming).
+        """
+        headers: dict[str, str] = {
+            "Authorization": f"Bearer {self._settings.openai_api_key}",
+            "Content-Type": "application/json",
+        }
+        if self._is_routed_via_leyline():
+            headers.update(self._leyline_budget_headers())
+        if extra:
+            headers.update(extra)
+        return headers
+
     # ------------------------------------------------------------------
     # Lazy client construction
     # ------------------------------------------------------------------
@@ -86,8 +115,13 @@ class LLMClient:
         if self._openai_client is None:
             import openai
 
-            kwargs: dict[str, Any] = {"api_key": self._settings.openai_api_key}
-            kwargs["base_url"] = self._effective_openai_base_url()
+            kwargs: dict[str, Any] = {
+                "api_key": self._settings.openai_api_key,
+                "base_url": self._effective_openai_base_url(),
+            }
+            budget_hdrs = self._leyline_budget_headers()
+            if budget_hdrs:
+                kwargs["default_headers"] = budget_hdrs
             self._openai_client = openai.OpenAI(**kwargs, timeout=self._timeout)
         return self._openai_client
 
@@ -491,10 +525,7 @@ class LLMClient:
         messages.append({"role": "user", "content": user_message})
 
         base_url = self._effective_openai_base_url()
-        headers = {
-            "Authorization": f"Bearer {self._settings.openai_api_key}",
-            "Content-Type": "application/json",
-        }
+        headers = self._openai_headers()
         body: dict = {"model": model, "max_tokens": max_tokens, "messages": messages, "stream": False}
         if stop:
             body["stop"] = stop
@@ -521,16 +552,8 @@ class LLMClient:
         messages.append({"role": "user", "content": user_message})
 
         base_url = self._effective_openai_base_url()
-        headers = {
-            "Authorization": f"Bearer {self._settings.openai_api_key}",
-            "Content-Type": "application/json",
-        }
-        body: dict = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "messages": messages,
-            "stream": False,
-        }
+        headers = self._openai_headers()
+        body: dict = {"model": model, "max_tokens": max_tokens, "messages": messages, "stream": False}
         if tools:
             body["tools"] = tools
             body["tool_choice"] = "auto"
@@ -740,11 +763,7 @@ class LLMClient:
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
 
-        headers = {
-            "Authorization": f"Bearer {self._settings.openai_api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        headers = self._openai_headers({"Accept": "text/event-stream"})
         body = {
             "model": model,
             "messages": messages,
@@ -820,11 +839,7 @@ class LLMClient:
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
 
-        headers = {
-            "Authorization": f"Bearer {self._settings.openai_api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        headers = self._openai_headers({"Accept": "text/event-stream"})
         body: dict = {
             "model": model,
             "messages": messages,
@@ -947,11 +962,7 @@ class LLMClient:
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
 
-        headers = {
-            "Authorization": f"Bearer {self._settings.openai_api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        headers = self._openai_headers({"Accept": "text/event-stream"})
         body = {
             "model": model,
             "messages": messages,
@@ -1061,11 +1072,7 @@ class LLMClient:
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
 
-        headers = {
-            "Authorization": f"Bearer {self._settings.openai_api_key}",
-            "Content-Type": "application/json",
-            "Accept": "text/event-stream",
-        }
+        headers = self._openai_headers({"Accept": "text/event-stream"})
         body: dict = {
             "model": model,
             "messages": messages,

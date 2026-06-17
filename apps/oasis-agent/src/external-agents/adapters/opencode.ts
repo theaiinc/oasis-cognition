@@ -1,8 +1,8 @@
 /**
- * OpenCode adapter — external coding agent adapter for OpenCode.
+ * OpenCode adapter — external coding agent adapter for OpenCode v1.17+.
  *
  * OpenCode is an open-source AI coding agent: https://opencode.ai
- * CLI: `opencode --prompt "prompt"` with support for `--output-format json`,
+ * CLI: `opencode run "prompt"` with support for `--format json`,
  * `--cwd`, `--model`, and `--quiet` flags.
  *
  * Env:
@@ -21,7 +21,8 @@ function baseArgs(
   extraArgs: string[] = [],
 ): string[] {
   const args: string[] = [
-    '--output-format', 'json',
+    'run',
+    '--format', 'json',
     '--quiet',
     '--cwd', session.worktree_path,
   ];
@@ -43,14 +44,14 @@ export const openCodeAdapter: AgentAdapter = {
   buildInitialCommand(session, _mcpConfigPath, extraArgs): AgentCommand {
     return {
       cmd: OPENCODE_BIN,
-      args: [...baseArgs(session, extraArgs), '--prompt', withPreamble(session, session.goal)],
+      args: [...baseArgs(session, extraArgs), withPreamble(session, session.goal)],
     };
   },
 
   buildFollowUpCommand(session, message, _mcpConfigPath, extraArgs): AgentCommand {
     return {
       cmd: OPENCODE_BIN,
-      args: [...baseArgs(session, extraArgs), '--prompt', withPreamble(session, message)],
+      args: [...baseArgs(session, extraArgs), withPreamble(session, message)],
     };
   },
 
@@ -77,12 +78,13 @@ export const openCodeAdapter: AgentAdapter = {
       };
     }
 
-    // OpenCode outputs JSON events with a "type" field or a "msg" field
-    // Depending on OpenCode version, output may include:
+    // OpenCode v1.17 JSON output events:
     // - { "type": "result", "data": { "output": "..." } }
     // - { "type": "error", "error": "..." }
-    // - { "msg": "...", ... }
-    // - raw text fallback
+    // - { "type": "text", "text": "...", ... }
+    // - { "type": "tool_use", "name": "...", "input": {...}, ... }
+    // - { "type": "tool_result", "name": "...", "output": "...", ... }
+    // - { "type": "reasoning", "content": "...", ... }
 
     if (evt?.type === 'result' || evt?.type === 'final') {
       const output = evt.data?.output || evt.output || evt.text || '';
@@ -94,11 +96,11 @@ export const openCodeAdapter: AgentAdapter = {
       };
     }
 
-    if (evt?.type === 'thinking' || level === 'thinking') {
+    if (evt?.type === 'reasoning' || evt?.type === 'thinking' || level === 'thinking') {
       return {
         kind: 'system',
         at: isoNow(),
-        text: msg || 'thinking',
+        text: evt.content || evt.text || msg || 'thinking',
         meta: evt,
       };
     }
@@ -123,7 +125,7 @@ export const openCodeAdapter: AgentAdapter = {
       };
     }
 
-    // Assistant text output
+    // Assistant text output (OpenCode v1.17 uses "text" events for streaming)
     if (evt?.type === 'assistant' || evt?.type === 'text' || typeof evt?.text === 'string') {
       return {
         kind: 'assistant_text',
@@ -133,7 +135,6 @@ export const openCodeAdapter: AgentAdapter = {
       };
     }
 
-    // If we have a message key, treat it as assistant text
     if (msg) {
       return {
         kind: 'assistant_text',
@@ -149,7 +150,6 @@ export const openCodeAdapter: AgentAdapter = {
   summarise(events): Partial<Pick<ExternalAgentSession, 'final_message' | 'cost_usd' | 'tokens' | 'child_session_id'>> {
     const out: Partial<Pick<ExternalAgentSession, 'final_message' | 'cost_usd' | 'tokens' | 'child_session_id'>> = {};
 
-    // Extract final message (last result or assistant_text)
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
       if (e.kind === 'result' && e.text) {
@@ -162,7 +162,6 @@ export const openCodeAdapter: AgentAdapter = {
       }
     }
 
-    // Extract cost and token usage from result meta
     for (let i = events.length - 1; i >= 0; i--) {
       const e = events[i];
       if (e.kind === 'result' && e.meta) {
@@ -176,7 +175,6 @@ export const openCodeAdapter: AgentAdapter = {
             output: usage.output_tokens ?? usage.output ?? usage.completion_tokens ?? 0,
           };
         }
-        // OpenCode doesn't have a session-like child_session_id concept in single-shot mode
         break;
       }
     }

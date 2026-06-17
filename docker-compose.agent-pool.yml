@@ -97,8 +97,11 @@ services:
       - REDIS_URL=${REDIS_URL:-redis://redis:6379}
       - YGGDRASIL_URL=${YGGDRASIL_URL:-http://yggdrasil:3100}
       - YGGDRASIL_API_KEY=${YGGDRASIL_API_KEY:-}
-      - DEV_AGENT_URL=${DEV_AGENT_URL:-http://dev-agent:8008}
+      - DEV_AGENT_URL=${DEV_AGENT_URL:-http://host.docker.internal:8008}
+      - OPENCODE_BIN=${OPENCODE_BIN:-opencode}
       - HOST_CAPACITY_CACHE_TTL_MS=${HOST_CAPACITY_CACHE_TTL_MS:-30000}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       yggdrasil:
         condition: service_healthy

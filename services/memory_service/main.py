@@ -164,9 +164,10 @@ async def query_memory(
 async def query_nodes_by_tier(
     tier: str = Query(..., description="Graph tier: foundational or active"),
     session_id: str | None = Query(None, description="Filter by session"),
+    project_id: str | None = Query(None, description="Filter by project (resolved to sessions)"),
     limit: int = Query(50, ge=1, le=200),
 ):
-    nodes = await memory.retrieve_nodes_by_tier(tier, session_id=session_id, limit=limit)
+    nodes = await memory.retrieve_nodes_by_tier(tier, session_id=session_id, project_id=project_id, limit=limit)
     return {"tier": tier, "count": len(nodes), "nodes": nodes}
 
 

@@ -43,6 +43,8 @@ PROJECT_OVERRIDABLE_FIELDS: set[str] = {
     "embedding_model",
     "log_level",
     "leyline_base_url",
+    "leyline_max_budget_usd",
+    "leyline_daily_budget_usd",
 }
 
 
@@ -98,13 +100,19 @@ class Settings(BaseSettings):
 
     # Leyline proxy — when set, all LLM calls route through the Leyline gateway
     # (https://github.com/theaiinc/leyline). Leyline handles provider failover,
-    # model routing, load balancing, and prompt compression. Cognition no longer
-    # needs to worry about which provider/model to use — just send the request
-    # and Leyline decides.
+    # model routing, load balancing, prompt compression, and cost-aware selection.
+    # Cognition only needs to set the budget — Leyline picks the cheapest capable
+    # model within that constraint.
     #
     # Expected format: "http://leyline:3000"
     # When empty, LLC calls go directly to the configured provider as before.
     leyline_base_url: str = ""
+
+    # Budget constraints forwarded to Leyline for cost-aware model selection.
+    # Leyline picks the cheapest capable model within these limits.
+    # 0 = no cap (Leyline uses its own default).
+    leyline_max_budget_usd: float = 0.0  # max cost per request
+    leyline_daily_budget_usd: float = 0.0  # max cost per rolling day
 
     # Output token limits per model tier (0 = unlimited)
     max_output_tokens_2b: int = 128

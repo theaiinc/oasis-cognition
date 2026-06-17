@@ -539,12 +539,38 @@ def _fc_response_to_plan(response: dict) -> dict[str, Any]:
 
 
 def _format_tool_list(tool_names: list[str]) -> str:
-    """Format tool names + descriptions for the flat-text CORE prompt."""
+    """Format tool names + descriptions + required params for the flat-text prompt."""
+    # Build a compact param hint for each tool from its schema
+    _PARAM_HINTS: dict[str, str] = {}
+    for t, schema in _TOOL_PARAM_SCHEMAS.items():
+        required = schema.get("required", [])
+        props = schema.get("properties", {})
+        if not required:
+            _PARAM_HINTS[t] = ""
+            continue
+        param_names = []
+        for r in required:
+            ptype = props.get(r, {}).get("type", "string")
+            pname = "PARAM_" + r.upper()
+            param_names.append(f"{pname}")
+            # Also show commonly-expected optional params for key tools
+        extras = []
+        if t in ("write_file", "edit_file", "apply_patch", "read_worktree_file", "bash"):
+            extras.append("PARAM_WORKTREE_ID")
+        if t == "edit_file":
+            pass  # old_string/new_string already covered
+        all_params = param_names + extras
+        _PARAM_HINTS[t] = " Params: " + ", ".join(all_params) + "."
+
     lines: list[str] = []
     for t in sorted(tool_names):
         desc = _TOOL_DESCRIPTIONS.get(t, "")
+        hint = _PARAM_HINTS.get(t, "")
         if desc:
-            lines.append(f"  {t} — {desc}")
+            line = f"  {t} — {desc}"
+            if hint:
+                line += hint
+            lines.append(line)
         else:
             lines.append(f"  {t}")
     return "\n".join(lines)
@@ -566,6 +592,7 @@ Read-only tools run in a container at `/workspace`.
 - Be truthful. Use tools when needed. Complete the task.
 - Use `think` only when you need to plan, debug, analyze, or decide between approaches.
   For simple actions (read a file, search, run bash), just call the tool directly.
+- **PREFER `edit_file` OVER `apply_patch`.** `edit_file` uses old_string→new_string replacement (simple, reliable). `apply_patch` requires correct unified diffs which models often get wrong. Only use `apply_patch` as a last resort if `edit_file` fails repeatedly.
 """
 
 
@@ -629,6 +656,8 @@ async def route_request(
             user_message=combined,
             model=model_override if router_model else settings.llm_model,
             max_tokens=64,
+            stop=["\n\n"],   # cut off at first blank line — router only needs 3 lines
+            temperature=0,
         )
     except Exception as e:
         logger.warning("Route request LLM call failed: %s", e)
@@ -665,11 +694,12 @@ RULE_PACKS: dict[str, str] = {}
 
 # ── TOOL_RULES: tool selection, patch format, chunked reads, worktree discipline ──
 TOOL_RULES = """\
-Tool priority: apply_patch >> write_file (new files only) >> edit_file (last resort).
+Tool priority: edit_file >> write_file (new files only) >> apply_patch (last resort — models struggle with unified diffs).
 Path: repo-relative for worktree tools (e.g. apps/foo/bar.tsx), /workspace/ prefix for read-only (read_file, grep, list_dir).
 read_worktree_file MANDATORY before every edit. Use chunked reads (start_line/end_line).
 If truncated at N of M lines, immediately read next chunk (start_line=N+1).
-PATCH FORMAT:
+edit_file: use old_string→new_string with EXACT text copied from read_worktree_file output.
+apply_patch (last resort): unified diff format:
 --- a/<repo-relative-path>
 +++ b/<repo-relative-path>
 @@ -START,COUNT +START,COUNT @@
@@ -715,9 +745,9 @@ NEVER give up because a command was blocked; find another way.
 
 # ── RECOVERY_RULES: what to do when tools fail ──
 RECOVERY_RULES = """\
-apply_patch failed: read_worktree_file target section with start_line/end_line, regenerate diff with EXACT context lines, retry.
+edit_file failed: read_worktree_file target section with start_line/end_line, copy EXACT old_string from output, retry.
 File not found: find_files or list_dir to discover correct path. Do NOT retry same path.
-old_string not found: switch to apply_patch with unified diff after fresh read.
+old_string not found: double-check indentation and whitespace. Read the exact lines again and copy character-for-character.
 No grep results: try different keywords, broader path, or find_files instead.
 Blocked command: try different approach (e.g., edit package.json instead of npm install).
 WALLS list = paths that already failed; do NOT retry.
@@ -735,12 +765,12 @@ NEVER give instructions for the user to do something themselves.
 
 # ── CODING_RULES: apply_patch format, edit ordering ──
 CODING_RULES = """\
-Edit workflow: grep → read_file → create_worktree → read_worktree_file → apply_patch → verify → get_diff.
-apply_patch is DEFAULT. write_file for new files only. edit_file last resort after 2 patch failures.
+Edit workflow: grep → read_file → create_worktree → read_worktree_file → edit_file → verify → get_diff.
+edit_file is DEFAULT. write_file for new files only. apply_patch last resort (models often generate corrupt diffs).
 Chunked reads ALWAYS. Never full-file read files over 100 lines.
 Phase 1 (before worktree): read_file from /workspace. Phase 2 (after worktree): read_worktree_file.
 CRITICAL: Copy context lines EXACTLY from read output — indentation matters.
-@@ header: OLD_COUNT = context lines + removed lines. NEW_COUNT = context lines + added lines.
+For edit_file: old_string must match EXACTLY (including whitespace). Copy-paste from read_worktree_file output.
 MAXIMUM 2 read-only tools before creating worktree and editing.
 """
 
@@ -1305,7 +1335,8 @@ def _normalize_tool_plan_output(parsed: dict[str, Any]) -> dict[str, Any]:
                     "answer": (
                         "[INTERNAL: apply_patch requires patch: a unified diff string (---/+++ hunks). "
                         "Use repo-relative paths like apps/foo.tsx (not /workspace/...). "
-                        "Prefer apply_patch over edit_file for multi-line or multi-file edits.]"
+                        "Prefer edit_file over apply_patch — models often generate corrupt unified diffs. "
+                        "For multi-line edits, use edit_file with exact old_string copied from read_worktree_file output.]"
                     ),
                     "_retry_hint": True,
                 }
@@ -1755,6 +1786,244 @@ def _memory_to_str(m: dict) -> str:
     return str(m)[:500]
 
 
+def _categorize_walls(walls: list[str]) -> str:
+    """Group walls by tool category and path pattern — a table of contents with drill-down instructions."""
+    if not walls:
+        return ""
+    from collections import Counter
+    by_tool: dict[str, list[str]] = {}
+    for w in walls:
+        w_lower = w.lower()
+        if w_lower.startswith("path does not exist"):
+            by_tool.setdefault("MISSING PATHS", []).append(w)
+        elif w_lower.startswith("path/pattern not found"):
+            by_tool.setdefault("BASH NOT FOUND", []).append(w)
+        elif w_lower.startswith("grep for"):
+            by_tool.setdefault("GREP NO MATCH", []).append(w)
+        elif w_lower.startswith("edit_file"):
+            by_tool.setdefault("EDIT FAILED", []).append(w)
+        elif w_lower.startswith("apply_patch"):
+            by_tool.setdefault("PATCH FAILED", []).append(w)
+        elif w_lower.startswith("blocked"):
+            by_tool.setdefault("BLOCKED", []).append(w)
+        else:
+            by_tool.setdefault("OTHER", []).append(w)
+    lines: list[str] = [
+        "═══ WALLS TOC (grouped failures — DO NOT RETRY blindly) ═══",
+        f"Total: {len(walls)} failure(s). To inspect any failed path, use read_worktree_file or list_dir with the exact path to see its current state.",
+    ]
+    for category in ("EDIT FAILED", "PATCH FAILED", "MISSING PATHS", "GREP NO MATCH", "BASH NOT FOUND", "BLOCKED", "OTHER"):
+        entries = by_tool.pop(category, [])
+        if not entries:
+            continue
+        counts: Counter[str] = Counter()
+        retrieve_instructions: list[str] = []
+        for e in entries:
+            path_part = e.split(":", 1)[-1].strip() if ":" in e else e[:60]
+            counts[path_part] += 1
+            if path_part not in retrieve_instructions and not path_part.startswith("'") and len(path_part) < 100:
+                retrieve_instructions.append(path_part)
+        if retrieve_instructions:
+            drill = "; ".join(f"read_worktree_file {p}" for p in retrieve_instructions[:3])
+            drill_hint = f" | drill down: {drill}"
+        else:
+            drill_hint = ""
+        if len(entries) <= 2:
+            detail = "; ".join(e.split(":", 1)[-1].strip()[:80] if ":" in e else e[:80] for e in entries)
+            lines.append(f"  {category} ({len(entries)}x): {detail}{drill_hint}")
+        else:
+            counts_str = ", ".join(f"'{p[:60]}' x{c}" for p, c in counts.most_common(3))
+            lines.append(f"  {category} ({len(entries)}x): {counts_str}{drill_hint}")
+    leftover = by_tool.pop("OTHER", [])
+    if leftover:
+        lines.append(f"  OTHER ({len(leftover)}x): {'; '.join(e[:80] for e in leftover[:3])}")
+    return "\n".join(lines)
+
+
+def _format_rule(r: dict) -> str:
+    """Format a single rule as IF/THEN so the model knows when to activate it."""
+    cond = (r.get("condition") or "").strip()
+    concl = (r.get("conclusion") or r.get("assertion") or "").strip()
+    if not concl:
+        return str(r)
+    if cond and not cond.lower().startswith("general"):
+        return f"- IF {cond[:120]} → {concl[:160]}"
+    return f"- {concl[:180]}"
+
+
+def _format_rules_list(rules: list[dict]) -> str:
+    """Format multiple rules with IF/THEN triggers."""
+    return "\n".join(_format_rule(r) for r in rules)
+
+
+def _summarize_knowledge(
+    memory: list[dict] | None,
+    rules: list[dict] | None,
+    knowledge_summary: str | None,
+    walls_count: int,
+) -> str:
+    """Condense into a table of contents with drill-down instructions.
+
+    Each rule is shown as "IF <condition> THEN <conclusion>" so the model
+    knows the trigger. The summary is a compact digest; the model can drill
+    down via ``get_rule`` if it needs the full text.
+    """
+    from collections import Counter
+    parts: list[str] = [
+        "═══ KNOWLEDGE TOC (compact summary — drill down if you need more detail) ═══",
+        "  Drill-down tools: `get_rule` for rules, `search_artifacts` for documents, `read_worktree_file` for files.",
+    ]
+    if walls_count:
+        parts.append(f"  Walls: {walls_count} hit this session (see WALLS TOC above for drill-down paths).")
+    rule_count = len(rules) if rules else 0
+    if rule_count:
+        themes: Counter[str] = Counter()
+        rule_keywords: list[str] = []
+        for r in (rules or []):
+            text = (r.get("conclusion") or r.get("assertion") or r.get("rule") or str(r))[:200].lower()
+            condition = (r.get("condition") or "").strip()
+            conclusion = (r.get("conclusion") or r.get("assertion") or "").strip()
+            rule_keywords.append(conclusion.split(".")[0][:60].strip())
+            theme = "general"
+            if any(w in text for w in ("style", "format", "lint", "indent", "naming", "convention")):
+                theme = "code style/convention"
+            elif any(w in text for w in ("never", "don't", "avoid", "block")):
+                theme = "restriction"
+            elif any(w in text for w in ("always", "must", "required", "prefer")):
+                theme = "requirement"
+            elif any(w in text for w in ("how to", "way to", "pattern for", "approach")):
+                theme = "workflow/approach"
+            themes[theme] += 1
+        theme_str = "; ".join(f"{t}: {c}" for t, c in themes.most_common(3))
+        drill = "`get_rule name=\"tool_rules\"`" if rule_keywords else ""
+        parts.append(f"  Rules: {rule_count} — {theme_str}")
+        if drill:
+            parts.append(f"    ➜ Drill down: {drill}")
+        # Show each rule as IF/THEN so model knows triggers
+        for r in (rules or []):
+            parts.append("  " + _format_rule(r).lstrip())
+    mem_count = len(memory) if memory else 0
+    if mem_count:
+        # Separate foundational nodes from regular memory entries
+        foundational_nodes: list[dict] = []
+        regular_memory: list[dict] = []
+        for m in (memory or []):
+            if isinstance(m, dict) and m.get("type") == "foundational_node":
+                foundational_nodes.append(m)
+            else:
+                regular_memory.append(m)
+
+        if foundational_nodes:
+            fn_titles = [
+                n.get("title", "")[:80] for n in foundational_nodes[:6]
+            ]
+            fn_info = f"Foundational: {len(foundational_nodes)} node(s)"
+            if fn_titles:
+                fn_info += " — " + "; ".join(fn_titles)
+            fn_info += (
+                ". ➜ Drill down: use `search_artifacts query=\"<topic>\"` to explore"
+            )
+            parts.append(f"  {fn_info}")
+
+        wall_entries = sum(
+            1 for m in regular_memory
+            if isinstance(m.get("content"), dict) and m["content"].get("walls")
+        )
+        past_mem = len(regular_memory) - wall_entries
+        if past_mem > 0:
+            topics: Counter[str] = Counter()
+            topic_keywords: list[str] = []
+            for m in (memory or [])[:10]:
+                content = m.get("content", {})
+                nodes = content.get("nodes", []) if isinstance(content, dict) else []
+                for n in nodes[:3]:
+                    title = (n.get("title") or n.get("description") or "")[:80]
+                    if title:
+                        topics[title] += 1
+                        kw = title.split(":")[0].strip().split(" ")[0] if title else title
+                        if kw not in topic_keywords:
+                            topic_keywords.append(kw)
+            if topics:
+                top_topics = "; ".join(f"'{t}'" for t, _ in topics.most_common(4))
+                drill_examples = "; ".join(
+                    f"`search_artifacts query=\"{k}\"`"
+                    for k in topic_keywords[:2]
+                )
+                parts.append(f"  Memory: {past_mem} entries — topics: {top_topics}")
+                if drill_examples:
+                    parts.append(f"    ➜ Drill down: {drill_examples}")
+            else:
+                parts.append(f"  Memory: {past_mem} entries")
+    if knowledge_summary:
+        # Extract code index lines and knowledge graph stats into a compact TOC
+        ks = knowledge_summary.strip()
+        lines = ks.split("\n")
+        symbol_count = sum(1 for l in lines if l.strip().startswith("-"))
+        has_code_index = any("[CODE INDEX" in l for l in lines)
+        has_knowledge_graph = any("[Knowledge graph" in l for l in lines)
+        has_self_teaching = any("[SELF-TEACHING" in l for l in lines)
+        parts.append("  Code Knowledge:")
+        if has_knowledge_graph:
+            # Extract scope info from first line
+            parts.append(f"    ⟐ Graph: {'Yes' if has_knowledge_graph else 'No'}")
+        if has_code_index and symbol_count:
+            parts.append(f"    ⟐ Neo4j symbols: {symbol_count} symbol(s) referenced")
+        if has_self_teaching:
+            parts.append("    ⟐ Self-teaching snapshot active")
+        # Always include drill-down instruction
+        parts.append(
+            "    ➜ Drill down: `search_artifacts query=\"<keyword>\"` for indexed docs, "
+            "`grep pattern=<pattern>` for code search, "
+            "`read_worktree_file <path>` for file contents"
+        )
+    return "\n".join(parts)
+
+
+def _summarize_free_thoughts(free_thoughts: str, max_lines: int = 5) -> str:
+    """Condense free-form reasoning to a bulleted digest with drill-down instruction.
+
+    Extracts key conclusions (lines after '→', '=>', 'so', 'therefore', 'conclusion'),
+    and any lines mentioning file paths or tool decisions. Falls back to first N lines
+    if nothing structured is found.
+
+    The LLM can always fall back to `think` to re-reason — the raw trace is not needed.
+    """
+    import re as _re
+    lines = free_thoughts.strip().split("\n")
+    # Heuristic: extract lines that look like decisions or conclusions
+    decision_markers = re.compile(
+        r"(→|=>|so\s+|therefore\s+|conclusion|decided|plan|action|step|implement|fix|change|add|modif)",
+        re.IGNORECASE,
+    )
+    key_lines: list[str] = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        if decision_markers.search(stripped[:80]):
+            key_lines.append(stripped[:120])
+        elif stripped.startswith("# ") or stripped.startswith("## "):
+            key_lines.append(stripped[:80])
+        elif "[File:" in stripped or stripped.startswith("- `"):
+            key_lines.append(stripped[:100])
+
+    if not key_lines:
+        key_lines = [lines[0][:120]] if lines else ["(no structured reasoning found)"]
+
+    summary = "\n".join(f"  • {l}" for l in key_lines[:max_lines])
+    extra = len(key_lines) - max_lines
+    if extra > 0:
+        summary += f"\n  ... and {extra} more reasoning line(s)."
+
+    return (
+        "═══ REASONING SUMMARY (prior analysis — drill down with `think` if you need full context) ═══\n"
+        f"{summary}\n"
+        "  ➜ Drill down: use the `think` tool to re-reason if this summary is insufficient.\n"
+    )
+
+
 SYSTEM_PROMPT = """\
 You are Oasis Cognition, a helpful AI assistant. You are chatting with a software developer working on a codebase.
 
@@ -1811,6 +2080,7 @@ OPTIONS: <2-4 short options separated by " | ">
 - Be truthful. Use tools when needed. Complete the task.
 - Use `think` only when you need to plan, debug, analyze, or decide between approaches.
   For simple actions (read a file, search, run bash), just ACT — no thinking needed.
+- **PREFER `edit_file` OVER `apply_patch`.** `edit_file` uses old_string→new_string replacement (simple, reliable). `apply_patch` requires correct unified diffs which models often get wrong. Only use `apply_patch` as a last resort if `edit_file` fails repeatedly.
 """
 
 # One-shot repair when the executor model emits prose, malformed keys, or invalid params.
@@ -1981,7 +2251,7 @@ RULES:
 
 REASONING_LAYER_PROMPT = """\
 ═══ IDENTITY & ROLE ═══
-You are the Oasis Cognition Reasoning Agent. Your role is "System 2" thinking: slow, analytical, and messy. You explore possibilities, identify risks, and surface non-obvious connections before any planning begins.
+You are the Oasis Cognition Reasoning Agent. Think briefly and move fast.
 
 ═══ GROUNDING ═══
 - You are EMBEDDED in the developer's environment.
@@ -1989,26 +2259,26 @@ You are the Oasis Cognition Reasoning Agent. Your role is "System 2" thinking: s
 - Your goal is to SOLVE the task using these tools, not to give advice on what the user should do.
 
 ═══ MISSION ═══
-Think out loud about the user's request:
+Think concisely about the user's request:
 - What is the CORE technical problem?
 - What specific files or components are likely involved?
 - What is the step-by-step strategy for implementation?
-- What are the "unknown unknowns" or risks?
 
 ═══ DISCIPLINE ═══
-- MAX 3 THOUGHTS: You must stop after 3 distinct reasoning points.
+- MAX 3 THOUGHTS and MAX 200 TOKENS: You must keep your entire reasoning under 200 tokens.
 - ACTION BIAS: If at least one reasonable action exists, you MUST act. Do NOT wait for perfect certainty.
 - NO REPETITION: Do NOT repeat your previous analysis.
-- After generating thoughts, you MUST stop and prepare for decision.
+- THINK FAST: Under 30 seconds. If you have enough context, stop thinking and execute tools directly.
+- USE TOOLS FIRST: Read files, search patterns to gather context. Then synthesize briefly.
 
 ═══ EXPECTED OUTPUT ═══
 FREE TEXT reasoning. Be technical, investigative, and tool-oriented.
+Keep it under 200 tokens.
 
 ═══ TOOL USE ═══
 You have access to tools during thinking. Use them to explore the codebase, read files,
 search for patterns, and gather context. Tool calls execute in real-time and results
-feed back into your reasoning. This is a loop — you can call multiple tools sequentially.
-Use tools FIRST, then synthesize your findings into final thoughts.
+feed back into your reasoning.
 You are NOT required to use tools — only use them when you need more information.
 """
 
@@ -2526,9 +2796,7 @@ class ResponseGeneratorService:
                 len(artifact_search_results),
             )
         if rules:
-            rules_text = "\n".join(
-                f"- {r.get('assertion', r.get('rule', str(r)))}" for r in rules
-            )
+            rules_text = _format_rules_list(rules)
             system += f"\nIMPORTANT — You were given these rules in the conversation. Always follow them:\n{rules_text}\n"
             logger.info("Injecting %d taught rules into casual prompt", len(rules))
 
@@ -3064,7 +3332,7 @@ class ResponseGeneratorService:
         # Inject memory (Knowledge Graph) and rules for grounded planning
         memory = memory_context or []
         rules_list = rules or []
-        if memory or rules_list or artifacts or art_context:
+        if memory or rules_list:
             extra = []
             if memory_stale_hint:
                 extra.append(f"IMPORTANT — {memory_stale_hint}")
@@ -3521,12 +3789,11 @@ class ResponseGeneratorService:
             user_input += f"\n\nOBSERVER FEEDBACK:\n{observer_feedback}"
 
         logger.info("Streaming free-form thoughts for: %s", user_message[:80])
-        # Cap thoughts at 500 tokens to prevent hallucination/repetition loops.
-        # The prompt says "MAX 3 THOUGHTS" but without a hard token cap the LLM
-        # can ramble or repeat indefinitely.
+        # Cap thoughts at 200 tokens to prevent rambling.
+        # The prompt says "MAX 200 TOKENS" — this enforces it.
         async for chunk in self._tool_plan_llm.stream_chat_async(
             system=system, user_message=user_input, history=chat_history,
-            max_tokens=500,
+            max_tokens=200,
         ):
             yield chunk
 
@@ -3672,6 +3939,8 @@ class ResponseGeneratorService:
         model_override: str | None = None,
         rule_packs_to_inject: list[str] | None = None,  # JIT-inject these rule packs
         use_fc: bool | None = None,  # True=FC prompt, False=flat-text prompt, None=auto
+        context_window_override: int | None = None,  # per-request override for context window
+        context_output_reserve: float | None = None,  # per-request override for output reserve
         **kwargs,  # accept but ignore legacy artifact params
     ) -> tuple[str, str, str]:
         """Shared context for tool-plan — budget-aware to stay within context window.
@@ -3687,13 +3956,25 @@ class ResponseGeneratorService:
         Returns (assembled_user_message, prompt_tier, system_text) so the caller
         can use the configured system prompt directly.
         """
-        budget = ContextBudget(self._settings)
+        # Per-request overrides: profile > model variant > env default.
+        # Clone settings so we don't mutate the global object.
+        effective_settings = self._settings.model_copy()
+        if context_window_override is not None:
+            effective_settings.context_window = context_window_override
+        if context_output_reserve is not None:
+            effective_settings.context_output_reserve = context_output_reserve
+        budget = ContextBudget(effective_settings)
 
         # Select prompt variant: FC (function calling) for OpenAI/Ollama,
         # flat-text for Anthropic. Caller can override.
         if use_fc is None:
             fc_providers = {"openai", "ollama"}
-            use_fc = self._tool_plan_llm.provider in fc_providers
+            model_name = self._tool_plan_llm.model or ""
+            # Local models rarely support native function calling properly — force flat-text for them
+            if any(kw in model_name.lower() for kw in ("coder", "fable", "gguf", "qwen")):
+                use_fc = False
+            else:
+                use_fc = self._tool_plan_llm.provider in fc_providers
         prompt_text = CORE_TOOL_PLAN_PROMPT_FC if use_fc else CORE_TOOL_PLAN_PROMPT
 
         # Inject the model-appropriate tool list based on model_override (only relevant for flat-text path).
@@ -3733,7 +4014,7 @@ class ResponseGeneratorService:
 
         parts: list[str] = []
 
-        # ── Walls (max 5% of budget) ────────────────────────────────────
+        # ── Walls (max 5% of budget) — summarized ──────────────────────
         walls = list(walls_hit or [])
         memory = memory_context or []
         for m in memory:
@@ -3741,12 +4022,7 @@ class ResponseGeneratorService:
             if isinstance(content, dict) and content.get("walls"):
                 walls.extend(content["walls"])
         if walls:
-            walls_str = "\n".join(f"  - {w}" for w in walls[:15])
-            walls_block = (
-                "⚠️ FAILED ATTEMPTS / WALLS HIT — DO NOT RETRY THESE. Use different paths or approaches:\n"
-                f"{walls_str}\n"
-                "Note: /workspace/X and /X refer to the same path. Before any read_file/list_dir/grep, check the path is NOT in the list above.\n"
-            )
+            walls_block = _categorize_walls(walls) + "\n"
             parts.append(budget.allocate("walls", walls_block, max_share=0.05))
             parts.append("")
 
@@ -3768,22 +4044,13 @@ class ResponseGeneratorService:
             budget.record("task_graph", tg_summary)
             parts.append("")
 
-        # ── Memory + rules (max 10% of budget) ─────────────────────────
+        # ── Memory + rules (max 10% of budget) — summarized ─────────────
         rules_list = rules or []
         if memory_stale_hint:
             parts.append(f"IMPORTANT — {memory_stale_hint}")
             parts.append("")
-        if memory or rules_list:
-            mem_block = ""
-            if memory:
-                memory_str = "\n".join(f"- {_memory_to_str(m)}" for m in memory[:5])
-                mem_block += f"Relevant past context (memory):\n{memory_str}\n"
-            if rules_list:
-                rules_str = "\n".join(
-                    f"- {r.get('assertion', r.get('rule', str(r)))}"
-                    for r in rules_list[:5]
-                )
-                mem_block += f"User-taught rules (apply these):\n{rules_str}\n"
+        if memory or rules_list or knowledge_summary or walls:
+            mem_block = _summarize_knowledge(memory, rules_list, knowledge_summary, len(walls))
             parts.append(budget.allocate("memory_rules", mem_block, max_share=0.10))
             parts.append("")
 
@@ -3799,16 +4066,13 @@ class ResponseGeneratorService:
             )
             parts.append(budget.allocate("validated_thoughts", block, max_share=0.10))
 
-        # ── Free thoughts — deferred to after tool results (recency matters) ──
+        # ── Free thoughts (max 8%) — summarized TOC with drill-down ──────
         _free_thoughts_block = None
         if free_thoughts:
-            header = (
-                "═══ REASONING CONTEXT (observations & implementation ideas — useful context, but the PLAN above is authoritative) ═══\n"
-                if upfront_plan
-                else "═══ YOUR REASONING (follow this — your next ACTION must be the next unfinished step below) ═══\n"
+            block = _summarize_free_thoughts(free_thoughts)
+            _free_thoughts_block = budget.allocate(
+                "free_thoughts", block, max_share=0.08,
             )
-            block = header + f"{free_thoughts}\n"
-            _free_thoughts_block = budget.allocate("free_thoughts", block, max_share=0.10)
 
         # ── User request (max 5%) ──────────────────────────────────────
         user_block = f"User request: {user_message}"
@@ -3818,18 +4082,18 @@ class ResponseGeneratorService:
         _upfront_plan_block = None
         if upfront_plan:
             steps = upfront_plan.get("steps", [])
+            n_steps = len(steps)
             if steps and isinstance(steps[0], dict):
-                steps_str = "\n".join(
-                    f"  {i+1}. {s.get('description', s)}" for i, s in enumerate(steps)
-                )
+                step_descs = [s.get('description', s) for s in steps]
             else:
-                steps_str = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(steps))
+                step_descs = [str(s) for s in steps]
             criteria = upfront_plan.get("success_criteria", [])
             criteria_str = (
                 "\n".join(f"  - {c}" for c in criteria)
                 if criteria
                 else "  (none specified)"
             )
+
             focus_desc = active_step_description
             if (
                 not focus_desc
@@ -3848,24 +4112,36 @@ class ResponseGeneratorService:
                     focus_desc = str(step_at)
 
             if focus_desc:
-                plan_block = (
-                    f"\n═══ ACTIVE PLAN STEP (THIS IS YOUR PRIMARY DIRECTIVE — execute this step now) ═══\n"
-                    f"  → {focus_desc}\n"
-                    f"Success criteria:\n{criteria_str}"
-                )
+                # Show active step only + TOC of remaining
+                remaining_steps = n_steps - (active_step_index + 1) if isinstance(active_step_index, int) else max(0, n_steps - 1)
+                toc_lines = [
+                    f"\n═══ ACTIVE PLAN STEP (THIS IS YOUR PRIMARY DIRECTIVE — execute this step now) ═══"
+                    f"\n  → {focus_desc}"
+                    f"\nSuccess criteria:\n{criteria_str}"
+                ]
+                if n_steps > 1:
+                    toc_lines.append(
+                        f"\n  📋 Plan: {n_steps} step(s) total — you are on step {(active_step_index or 0) + 1}/{n_steps}. "
+                        f"{remaining_steps} step(s) remain after this."
+                    )
+                if remaining_steps > 0:
+                    remaining_titles = step_descs[active_step_index + 1:] if isinstance(active_step_index, int) else step_descs[1:]
+                    toc_lines.append("  Remaining steps:")
+                    for i, title in enumerate(remaining_titles[:4], (active_step_index or 0) + 2):
+                        toc_lines.append(f"    {i}. {title[:100]}")
+                    if len(remaining_titles) > 4:
+                        toc_lines.append(f"    ... and {len(remaining_titles) - 4} more step(s).")
+                plan_block = "\n".join(toc_lines)
             else:
+                # No active step — show all step titles as TOC
+                step_titles = "\n".join(
+                    f"  {i+1}. {d[:100]}" for i, d in enumerate(step_descs)
+                )
                 plan_block = (
                     f"\n═══ PLAN (follow these steps in order — this is your PRIMARY DIRECTIVE) ═══\n"
-                    f"{steps_str}\nSuccess criteria:\n{criteria_str}"
+                    f"{step_titles}\nSuccess criteria:\n{criteria_str}"
                 )
             _upfront_plan_block = budget.allocate("upfront_plan", plan_block, max_share=0.08)
-
-        # ── Knowledge summary (max 8%) ─────────────────────────────────
-        if knowledge_summary:
-            block = (
-                f"\nKnowledge Graph Summary (historical context):\n{knowledge_summary}"
-            )
-            parts.append(budget.allocate("knowledge_summary", block, max_share=0.08))
 
         # Note: artifacts are no longer auto-injected here. The LLM uses
         # the `search_artifacts` tool to query documents on demand.
@@ -4223,7 +4499,10 @@ class ResponseGeneratorService:
 
         # Check if FC is supported
         fc_providers = {"openai", "ollama"}
-        use_fc = self._tool_plan_llm.provider in fc_providers
+        model_name = self._tool_plan_llm.model or ""
+        # Local models rarely support native function calling properly — force flat-text for them
+        if any(kw in model_name.lower() for kw in ("coder", "fable", "gguf", "qwen")):
+            use_fc = False
 
         max_retries = 3
         last_error: Exception | None = None
@@ -4318,7 +4597,7 @@ class ResponseGeneratorService:
             "answer": f"I had trouble planning tool calls after {max_retries} attempts. Could you rephrase your request?",
         }
 
-    def stream_tool_plan(
+    async def stream_tool_plan(
         self,
         user_message: str,
         tool_results: list[dict[str, Any]] | None = None,
@@ -4339,11 +4618,18 @@ class ResponseGeneratorService:
         model_override: str | None = None,
         tool_history_digest: list[str] | None = None,
         rule_packs_to_inject: list[str] | None = None,
+        context_window_override: int | None = None,
+        context_output_reserve: float | None = None,
+        max_tokens: int | None = None,
         **kwargs,  # accept but ignore legacy artifact params
     ):
-        """Stream tool-plan generation (flat lines; server parses full buffer when stream ends).
-        Intentionally uses flat-text format (not FC) since the gateway needs to stream
-        intermediate tokens for the reasoning UI.
+        """Async generator for tool-plan generation.
+
+        Uses flat-text format with built-in tool descriptions that include
+        required parameter hints. The full output is parsed by the gateway.
+
+        Yields:
+            str — plain text chunks from the LLM.
         """
         base_combined, prompt_tier, system = self._build_tool_plan_combined_message(
             user_message=user_message,
@@ -4364,11 +4650,14 @@ class ResponseGeneratorService:
             tool_history_digest=tool_history_digest,
             model_override=model_override,
             rule_packs_to_inject=rule_packs_to_inject,
-            use_fc=False,  # streaming uses flat-text format
+            context_window_override=context_window_override,
+            context_output_reserve=context_output_reserve,
+            use_fc=False,
         )
-        yield from self._tool_plan_llm.stream_chat(
+        async for chunk in self._tool_plan_llm.stream_chat_async(
             system=system, user_message=base_combined, history=chat_history
-        )
+        ):
+            yield chunk
 
     async def summarize_tool_results(
         self, user_message: str, tool_results: list[dict[str, Any]]

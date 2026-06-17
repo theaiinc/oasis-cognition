@@ -70,6 +70,19 @@ def leyline_settings():
     )
 
 
+@pytest.fixture
+def leyline_budget_settings():
+    return _settings(
+        llm_provider="openai",
+        openai_api_key="test-key",
+        openai_base_url="http://host.docker.internal:1234/v1",
+        llm_model="gemma-4-12b-coder",
+        leyline_base_url="http://leyline:3000",
+        leyline_max_budget_usd=0.05,
+        leyline_daily_budget_usd=2.0,
+    )
+
+
 def test_provider_selection_anthropic(anthropic_settings):
     client = LLMClient(anthropic_settings)
     assert client.provider == "anthropic"
@@ -113,6 +126,38 @@ def test_leyline_routing_flag_false(openai_settings):
     """_is_routed_via_leyline is False when leyline is not configured."""
     client = LLMClient(openai_settings)
     assert client._is_routed_via_leyline() is False
+
+
+def test_leyline_budget_headers_no_budget(leyline_settings):
+    """With default (0) budget, no budget headers are produced."""
+    client = LLMClient(leyline_settings)
+    assert client._leyline_budget_headers() == {}
+
+
+def test_leyline_budget_headers_with_budget(leyline_budget_settings):
+    """Budget headers are populated when max_budget is set."""
+    client = LLMClient(leyline_budget_settings)
+    hdrs = client._leyline_budget_headers()
+    assert hdrs["X-Leyline-Max-Budget-USD"] == "0.05"
+    assert hdrs["X-Leyline-Daily-Budget-USD"] == "2.0"
+
+
+def test_leyline_openai_headers_includes_budget(leyline_budget_settings):
+    """_openai_headers includes budget headers when Leyline is active."""
+    client = LLMClient(leyline_budget_settings)
+    hdrs = client._openai_headers()
+    assert hdrs["Authorization"] == "Bearer test-key"
+    assert hdrs["Content-Type"] == "application/json"
+    assert hdrs["X-Leyline-Max-Budget-USD"] == "0.05"
+    assert hdrs["X-Leyline-Daily-Budget-USD"] == "2.0"
+
+
+def test_leyline_openai_headers_no_budget(leyline_settings):
+    """_openai_headers works without budget headers."""
+    client = LLMClient(leyline_settings)
+    hdrs = client._openai_headers()
+    assert hdrs["Authorization"] == "Bearer test-key"
+    assert "X-Leyline-Max-Budget-USD" not in hdrs
 
 
 @patch("packages.shared_utils.llm_client.LLMClient._call_openai", return_value="leyline routed")

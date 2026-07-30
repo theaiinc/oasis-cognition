@@ -123,6 +123,11 @@ class Settings(BaseSettings):
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "oasis-cognition"
+    # Startup connection policy. Keep fallback detection bounded; container
+    # restart policy is responsible for retrying a permanently unavailable DB.
+    neo4j_connection_timeout_seconds: float = 2.0
+    neo4j_init_max_retries: int = 1
+    neo4j_retry_delay_seconds: float = 0.5
 
     # Redis
     redis_url: str = "redis://localhost:6379"

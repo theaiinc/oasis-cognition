@@ -491,10 +491,17 @@ class LLMClient:
         """
         import httpx
 
+        # Use a finite timeout (default 600s) to avoid hanging forever when
+        # lmlink-connector silently drops the TCP connection. Individual callers
+        # can override via the timeout parameter.
+        if timeout is None:
+            timeout = 600.0
+        http_timeout = httpx.Timeout(timeout, connect=30.0)
+
         last_err: Exception | None = None
         for attempt in range(1, max_retries + 2):  # 1 initial + max_retries
             try:
-                async with httpx.AsyncClient(timeout=None) as http:
+                async with httpx.AsyncClient(timeout=http_timeout) as http:
                     return await LLMClient._async_llm_call(http, url, body, headers, timeout)
             except (httpx.HTTPError, RuntimeError, ValueError, KeyError, IndexError) as e:
                 last_err = e

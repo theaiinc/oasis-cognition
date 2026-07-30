@@ -98,5 +98,67 @@ This file is a running devlog/compass for Oasis Cognition agent work. Keep it up
 - **Zero-downtime upgrade**: `OASIS_LEYLINE_BASE_URL` defaults to empty — existing direct-to-provider behavior unchanged. Set to `http://leyline:3000` to enable proxy.
 - **`.env`**: Added commented-out `OASIS_LEYLINE_BASE_URL` entry with docs.
 
+### 2026-06-18 — Cognition evaluation session: Asgard launcher prompt
+- **Scenario**: Tasked Cognition (via POST /api/v1/interaction) to create a unified launcher for daily apps (Cognition, Echo, Missive) with status/up/down/dashboard commands. Clean worktree state, no prior Asgard artifacts on disk.
+- **Pipeline path**: Cold boot (fresh container, remote LM Studio model loading weights). Total time from prompt to first tool call: ~17 minutes (2min thought → 10min tool-plan generation → 4min tool reasoning → 1 tool call → timeout on response thought layer at 60s).
+- **Final artifact**: Pipeline timed out before writing any files. One exploratory tool call (read-only probe) was made, but no worktree created, no files written.
+- **Evaluation rubric**: 2b — do nothing, but due to latency/timeout, not architecture failure.
+- **Architecture choice**: Cognition planned a Python script at `scripts/launcher.py` with a wrapper script. **Correct pattern** is a bash script at `apps/asgard/asgard` (standalone, no runtime deps, follows Makefile's existing native-service patterns). The project convention for CLI tools is `apps/<name>/<name>` as a bash script, not `scripts/*.py`.
+- **Launcher conventions (from prior session, committed in HEAD)**:
+  - Lives at `apps/asgard/asgard` as a bash script with `set -euo pipefail`
+  - Health probes: `curl -sf --max-time 3 http://localhost:$PORT/health`
+  - Colors: `tput` or ANSI escape codes, green/red/yellow
+  - Table: `printf` with columns for App, Port, Status, Description
+  - Makefile integration: `.PHONY` target calls the script, e.g. `asgard: @$(ASGARD) up`
+  - README at `apps/asgard/README.md` with quick-start table
 
+### 2026-06-18 — Cognition evaluation methodology
+- **How to evaluate a Cognition output**: Use a two-axis rubric.
+  - **Axis 1 — Architecture fit**:
+    - Does it follow project conventions? (app placement, service patterns, health probes)
+    - Does it reuse existing primitives? (docker compose, Makefile targets, curl probes)
+    - Does it live in the right directory? (apps/ for end-user tools, services/ for microservices)
+  - **Axis 2 — Execution result**:
+    - 2a: Full running app, few bugs → awesome, just fix bugs
+    - 2b: Do nothing → diagnose why
+      - 2ba: Wrong architecture → suggest better approach
+      - 2bb: Good architecture but bugs in flow → fix systematically
+    - 2c: Hallucinated / broken output → flag and retry with constraints
+- **Pipeline timings matter**: A cold boot (first prompt after docker-compose restart) can take 15-25min due to model weight caching. Warm runs are significantly faster but the thought-layer timeout (default 60s in InteractionService) can still cut off slow models. Factor this into evaluation — don't call "stall" until at least 20min of inactivity.
+- **Common bugs found in prior Asgard run**:
+  1. `cmd_up` uses `2>/dev/null || true` silencing all errors — removes error visibility
+  2. Missing `docker-ensure` (Makefile's docker-ensure handles Docker Desktop startup + stale postmaster.pid cleanup)
+  3. `cmd_up` starts a subset of services (4 of ~20) but `cmd_down` calls `docker compose down` which stops everything — scope mismatch
+  4. No tracking of which services were started vs already running
+  5. Broken worktree file (`launcher.py` was a string literal triple-quoted comment, not executable code)
 
+### 2026-06-18 — Thought-layer timeout bumped + env var override
+- **Problem**: Cold boot (remote LM Studio model loading weights) took ~10min for tool-plan generation but the thought-layer timeout was only 60s for 12B models (`size ≤ 12 → 60_000`). Pipeline produced a tool plan but the follow-up thought layer hit `timeout of 60000ms exceeded` before completing.
+- **Fix**: Changed `resolveThoughtTimeout()` in `interaction.service.ts`:
+  - ≤4B models: 120s → **300s** (5min)
+  - 8-12B models: 60s → **300s** (5min)
+  - >12B models: 30s → **120s** (2min)
+  - Added `OASIS_THOUGHT_TIMEOUT_MS` env var override — bypasses heuristics entirely when set
+- **Infrastructure**: Added `OASIS_THOUGHT_TIMEOUT_MS` to `docker-compose.yml` api-gateway env and `.env` (commented out, default 300000ms).
+- **Lesson**: Don't call "stall" until at least 20min of inactivity. Also add env var overrides for any timeout that hits slow remote models — avoids requiring code changes to tune.
+
+### 2026-06-18 — API-started sessions show no progress in UI (fix clientMessageId gap)
+
+- **Problem**: When a chat starts via `POST /api/v1/interaction` (e.g. curl/CLI), the HTTP caller has no `client_message_id`. The backend set `const clientMessageId = req.context?.client_message_id` which was `undefined`. All pipeline events (ThinkingChunkGenerated, ToolCallStarted, etc.) were published **without** `client_message_id`.
+  - The UI's SSE handler in App.tsx drops every event that lacks `client_message_id` (line 1041: `if (typeof clientId !== 'string' || !clientId) return`).
+  - No timeline, no thinking overlay, no progress = the session looks empty/silent when opened in the UI.
+- **Fix (3 layers)**:
+  1. **Backend — interaction.service.ts**: Changed `const clientMessageId = req.context?.client_message_id` to `const clientMessageId = req.context?.client_message_id || uuidv4()` so API callers always get a valid ID.
+  2. **Backend — redis-event.service.ts**: `pushMessage()` now accepts an optional `options.clientMessageId` parameter, which is stored as `client_message_id` in the message JSON. Both user and assistant `pushMessage` calls pass the generated `clientMessageId`.
+  3. **Frontend — App.tsx**: `loadHistoryPage()` and `loadSession()` detect the stored `client_message_id` from history and use it as the message ID for SSE event correlation. Both functions now also set `activeClientMessageId` + `isThinking` when loading an in-flight API-started session (last message is 'user' with `client_message_id`), so the thinking overlay activates and backlog SSE events match correctly.
+- **Contract**: Every pipeline event published via `this.events.publish()` now carries a defined `client_message_id`. The frontend SSE handler's drop guard no longer silently discards pipeline progress for API-originated sessions.
+
+### 2026-07-29 — Integration boundary audit
+- **Interaction lifecycle**: `POST /api/v1/interaction` is an acceptance endpoint (`202 { session_id }`), not an NDJSON final-response endpoint. Completed responses arrive through `/api/v1/events/timeline`; clients must correlate events/history with `client_message_id`.
+- **Contract drift found**: memory graph storage returns `{ status: "ok", graph_id }`; tool planning returns its action object directly; tool-plan requests include `context_window_override` and `context_output_reserve`. Shared Zod schemas must mirror these live shapes.
+- **Workflow invariants**: `maxConcurrency` must mark only the current batch dispatched, disabled workflows must reject all enqueue paths, and workflow deletion must remove run records, indexes, and per-run streams.
+- **Browser filesystem limitation**: `showDirectoryPicker()` exposes a directory handle/name but not an absolute host path. Never send `handle.name` to the dev-agent as `project_path`; desktop preload or manual entry is required.
+- **Optional platforms**: Leyline is already optional and has focused routing/budget tests. Janus is a Cloudflared tunnel guardian and should remain an operational health boundary. Arcana is a policy/approved-command boundary; never expose secret values, and treat daemon-unavailable as a tested disabled path.
+- **Janus boundary**: Janus v0.1.4 exposes `/api/status`; the gateway's optional `GET /api/v1/health/janus` adapter must return only sanitized disabled/healthy/unavailable state and never make chat execution depend on tunnel supervision.
+- **Arcana boundary**: Arcana uses local Ash/project policy resolution, not HTTP. The optional `GET /api/v1/health/arcana` adapter must use fixed argv, require absolute paths, reject NUL bytes, never accept secret values, and treat missing mapping/daemon as unavailable.
+- **Verification status**: Gateway Jest passes 133 tests and both gateway/UI production builds pass. Python collection passes 56 tests, and the full suite now passes after bounding Neo4j fallback initialization. Playwright Chromium infrastructure now runs the asynchronous interaction smoke test (1/1).

@@ -20,6 +20,9 @@ import { ProjectRolesModule } from './project-roles/project-roles.module';
 import { FilesModule } from './files/files.module';
 import { MissionsModule } from './missions/missions.module';
 import { ModelsModule } from './models/models.module';
+import { CoordinatorModule } from './coordinator/coordinator.module';
+import { JanusModule } from './janus/janus.module';
+import { ArcanaModule } from './arcana/arcana.module';
 
 @Module({
   imports: [
@@ -44,6 +47,9 @@ import { ModelsModule } from './models/models.module';
     FilesModule,
     MissionsModule,
     ModelsModule,
+    CoordinatorModule,
+    JanusModule,
+    ArcanaModule,
   ],
 })
 export class AppModule {}

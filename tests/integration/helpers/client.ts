@@ -17,6 +17,10 @@ export interface InteractionResponse {
   route?: string;
 }
 
+interface AcceptedInteraction {
+  session_id: string;
+}
+
 // Retry config for transient LLM provider hiccups
 const INTERACT_RETRIES = 3;
 const INTERACT_RETRY_DELAY_MS = 5000;
@@ -38,6 +42,7 @@ export class TestClient {
     roleId?: string;
   }): Promise<InteractionResponse> {
     let lastError: Error | undefined;
+    const clientMessageId = `integration-${crypto.randomUUID?.() || Math.random().toString(36).substring(2)}`;
 
     for (let attempt = 1; attempt <= INTERACT_RETRIES; attempt++) {
       try {
@@ -50,6 +55,7 @@ export class TestClient {
             context: {
               source: 'integration-test',
               project_id: options?.projectId,
+              client_message_id: clientMessageId,
             },
             role_id: options?.roleId,
           }),
@@ -60,28 +66,11 @@ export class TestClient {
           throw new Error(`Interaction failed (${response.status}): ${text.slice(0, 500)}`);
         }
 
-        // The gateway responds with NDJSON: keepalive lines {"_oasis_keepalive":true} + final result
-        const text = await response.text();
-        const lines = text.trim().split('\n').filter(Boolean);
-        // Find the last non-keepalive line
-        let data: Record<string, unknown> = {};
-        for (let i = lines.length - 1; i >= 0; i--) {
-          try {
-            const parsed = JSON.parse(lines[i]);
-            if (parsed && !parsed._oasis_keepalive) {
-              data = parsed;
-              break;
-            }
-          } catch { /* skip */ }
+        const accepted = await response.json() as AcceptedInteraction;
+        if (typeof accepted.session_id !== 'string' || accepted.session_id !== this.sessionId) {
+          throw new Error(`Interaction returned unexpected acceptance: ${JSON.stringify(accepted)}`);
         }
-
-        return {
-          response: typeof data.response === 'string' ? data.response : '',
-          confidence: data.confidence as number | undefined,
-          reasoning_graph: data.reasoning_graph as Record<string, unknown> | undefined,
-          reasoning_trace: data.reasoning_trace as string[] | undefined,
-          route: data.route as string | undefined,
-        };
+        return await this.waitForResponse(clientMessageId);
       } catch (err) {
         lastError = err instanceof Error ? err : new Error(String(err));
         const isTransient =
@@ -101,6 +90,27 @@ export class TestClient {
       }
     }
     throw lastError;
+  }
+
+  private async waitForResponse(clientMessageId: string, timeoutMs = 120_000): Promise<InteractionResponse> {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const history = await this.getHistory();
+      const message = [...history.messages].reverse().find((item) =>
+        item.role === 'assistant' && (item as { client_message_id?: string }).client_message_id === clientMessageId,
+      ) as ({ content?: string; confidence?: number; reasoning_graph?: Record<string, unknown>; reasoning_trace?: string[]; route?: string } | undefined);
+      if (message) {
+        return {
+          response: message.content || '',
+          confidence: message.confidence,
+          reasoning_graph: message.reasoning_graph,
+          reasoning_trace: message.reasoning_trace,
+          route: message.route,
+        };
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    throw new Error(`Timed out waiting for assistant response ${clientMessageId}`);
   }
 
   /**

@@ -83,19 +83,28 @@ function resolveContextWindow(provider?: string | null, model?: string | null): 
 
 /**
  * Resolve the thought-layer timeout based on model parameter size.
- * Small models (≤4B) are slow and need more time to reason.
- * Large models (12B+) are fast.
+ * Small models (≤4B) are very slow and need more time to reason.
+ * Mid-size models (8-12B) can also be slow on cold starts or remote hosts.
+ * Large models (12B+) are usually fast but remote latency can vary.
  * Falls back to FAST_TIMEOUT_MS (30s).
+ *
+ * Override with OASIS_THOUGHT_TIMEOUT_MS env var to bypass heuristics.
  */
 function resolveThoughtTimeout(provider?: string | null, model?: string | null): number {
+  // Allow env var override for tuning without code changes
+  const envOverride = process.env.OASIS_THOUGHT_TIMEOUT_MS;
+  if (envOverride) {
+    const parsed = parseInt(envOverride, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
   const variant = lookupVariant(provider, model);
   if (!variant) return FAST_TIMEOUT_MS;
   const size = variant.parameter_size_b;
   // 0 = unknown/proprietary → use default
   if (size <= 0) return FAST_TIMEOUT_MS;
-  if (size <= 4) return 120_000;  // 2B models: 120s (gemma-4-e2b is slow)
-  if (size <= 12) return 60_000;  // 8B models: 60s
-  return FAST_TIMEOUT_MS;          // 12B+: 30s
+  if (size <= 4) return 300_000;   // ≤4B models: 5min (cold boot, remote LM Studio)
+  if (size <= 12) return 300_000;  // 8-12B models: 5min (slow structured output)
+  return 120_000;                   // >12B: 2min (fast but remote latency still real)
 }
 
 /**
@@ -132,6 +141,13 @@ function resolveModelCapabilities(provider?: string | null, model?: string | nul
 type ExecutionMode = 'reactive' | 'guided' | 'deliberative';
 
 function resolveExecutionMode(provider?: string | null, model?: string | null): ExecutionMode {
+  // Environment override — set OASIS_EXECUTION_MODE=reactive|guided|deliberative
+  // to bypass model-size heuristics. Useful for local models where the pipeline
+  // should act immediately rather than spending minutes thinking.
+  const envMode = process.env.OASIS_EXECUTION_MODE as ExecutionMode | undefined;
+  if (envMode && ['reactive', 'guided', 'deliberative'].includes(envMode)) {
+    return envMode;
+  }
   const variant = lookupVariant(provider, model);
   if (!variant) return 'deliberative';
   const size = variant.parameter_size_b;
@@ -1598,7 +1614,7 @@ export class InteractionService {
   async execute(req: InteractionRequest, isAborted: () => boolean = () => false): Promise<InteractionResponse> {
     const sessionId = req.session_id || uuidv4();
     const interactionId = uuidv4();
-    const clientMessageId = req.context?.client_message_id;
+    const clientMessageId = req.context?.client_message_id || uuidv4();
 
     // ── Cancel any in-flight pipeline for this session ──────────────
     // If the user sends a new message while the previous request is still
@@ -1660,8 +1676,8 @@ export class InteractionService {
       req.user_message = `[Feedback on your previous response]\n\n"${preview}"\n\nUser feedback: ${req.user_message}`;
     }
 
-    // Store user message in conversation history
-    await this.events.pushMessage(sessionId, 'user', req.user_message);
+    // Store user message in conversation history (with client_message_id for SSE correlation)
+    await this.events.pushMessage(sessionId, 'user', req.user_message, { clientMessageId });
 
     // Fetch recent conversation history for LLM context
     const recentMessages = await this.events.getRecentMessages(sessionId, 20);
@@ -1890,9 +1906,9 @@ export class InteractionService {
           break;
       }
 
-      // Store assistant response in conversation history
+      // Store assistant response in conversation history (with client_message_id for SSE correlation)
       if (result.response) {
-        await this.events.pushMessage(sessionId, 'assistant', result.response);
+        await this.events.pushMessage(sessionId, 'assistant', result.response, { clientMessageId });
       }
 
       // ── Cumulative session usage accounting ──────────────────────────
@@ -5941,6 +5957,9 @@ export class InteractionService {
           }, IDLE_TIMEOUT_MS);
         };
 
+        // Start idle timer immediately — if no data arrives, it fires and resolves
+        resetIdle();
+
         const processLine = (line: string) => {
           resetIdle();
           try {
@@ -6120,7 +6139,7 @@ export class InteractionService {
         const resetIdle = () => {
           if (idleTimer) clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
-            try { stream.destroy(); } catch {}
+            try { stream.destroy(new Error(`stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
           }, IDLE_TIMEOUT_MS);
         };
 
@@ -6191,7 +6210,7 @@ export class InteractionService {
       const resetIdle = () => {
         if (idleTimer) clearTimeout(idleTimer);
         idleTimer = setTimeout(() => {
-          try { stream.destroy(); } catch {}
+          try { stream.destroy(new Error(`structured-stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
         }, IDLE_TIMEOUT_MS);
       };
 
@@ -6305,12 +6324,22 @@ export class InteractionService {
         ? parseInt(process.env.TOOL_PLAN_IDLE_TIMEOUT_MS, 10)
         : 300_000;  // 5 min — 12B model can be 2-3 min between chunks
       let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      let streamEnded = false;
 
       return new Promise((resolve) => {
+        // Start idle timer immediately to catch silent hangs where no data
+        // ever arrives (e.g. lmlink-connector drops before generating tokens).
+        idleTimer = setTimeout(() => {
+          if (!streamEnded) {
+            try { stream.destroy(new Error(`tool-plan-stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
+          }
+        }, IDLE_TIMEOUT_MS);
         stream.on('data', (chunk: Buffer) => {
           if (idleTimer) clearTimeout(idleTimer);
           idleTimer = setTimeout(() => {
-            try { stream.destroy(); } catch {}
+            if (!streamEnded) {
+              try { stream.destroy(new Error(`tool-plan-stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
+            }
           }, IDLE_TIMEOUT_MS);
           const text = chunk.toString();
           fullJsonText += text;
@@ -6392,6 +6421,7 @@ export class InteractionService {
         });
 
         stream.on('end', async () => {
+          streamEnded = true;
           if (idleTimer) clearTimeout(idleTimer);
           this.logger.log(`Finished streaming tool-plan (${fullJsonText.length} chars)`);
 
@@ -6543,6 +6573,7 @@ export class InteractionService {
         });
 
         stream.on('error', (err: any) => {
+          streamEnded = true;
           if (idleTimer) clearTimeout(idleTimer);
           this.logger.error(`Tool-plan stream error: ${err.message}`);
           try {
@@ -6557,6 +6588,7 @@ export class InteractionService {
           }
           resolve({ action: 'final_answer', answer: `Planning interrupted: ${err.message}` });
         });
+
       });
     } catch (err: any) {
       this.logger.warn(`Streaming tool-plan failed: ${err.message}`);

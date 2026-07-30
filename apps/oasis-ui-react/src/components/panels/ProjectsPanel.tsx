@@ -47,8 +47,14 @@ export function ProjectsPanel({
 
   async function pickFolder(setPath: (p: string) => void): Promise<void> {
     try {
-      const handle = await (window as unknown as { showDirectoryPicker(opts: { mode: string }): Promise<{ name: string }> }).showDirectoryPicker({ mode: 'read' });
-      setPath(handle.name);
+      const handle = await (window as unknown as {
+        showDirectoryPicker(opts: { mode: string }): Promise<{ name: string; path?: string }>;
+      }).showDirectoryPicker({ mode: 'read' });
+      // Browser File System Access intentionally does not expose the host
+      // filesystem path. Never send the directory name as if it were a path;
+      // the host path must be entered manually or supplied by the desktop
+      // preload integration.
+      if (handle.path) setPath(handle.path);
       return;
     } catch { /* user cancelled or API unavailable */ }
   }
@@ -74,6 +80,7 @@ export function ProjectsPanel({
       setNewName(''); setNewDesc(''); setNewPath('');
       setShowCreate(false);
       onActiveProjectChange?.(p.project_id);
+      await activateProject(p.project_id).catch(() => { /* dev-agent may be offline */ });
       await refresh();
     } catch { /* ignore */ }
     setCreating(false);

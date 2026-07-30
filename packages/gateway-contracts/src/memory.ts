@@ -29,7 +29,8 @@ export const StoreGraphRequest = z.object({
 });
 
 export const StoreGraphResponse = z.object({
-  ok: z.boolean(),
+  status: z.literal('ok'),
+  graph_id: z.string(),
 });
 
 // ── Store Not Achievable ───────────────────────────────────────────────

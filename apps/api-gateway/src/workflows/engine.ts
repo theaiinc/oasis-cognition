@@ -309,14 +309,14 @@ export async function executeRun(
     // If no ready nodes and nothing to skip, we're done
     if (readyNodes.length === 0 && toSkip.length === 0) break;
 
-    // Dispatch all ready nodes in parallel
-    for (const n of readyNodes) dispatched.add(n.id);
-
+    // Dispatch only the current batch. Ready nodes beyond the concurrency
+    // limit must remain undispatched so the next round can execute them.
     let batch = readyNodes;
     if (opts.maxConcurrency && opts.maxConcurrency > 0 && batch.length > opts.maxConcurrency) {
       // Limit concurrency: process in chunks
       batch = batch.slice(0, opts.maxConcurrency);
     }
+    for (const n of batch) dispatched.add(n.id);
 
     await Promise.allSettled(batch.map(n => executeNode(n)));
 

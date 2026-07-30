@@ -340,11 +340,11 @@ export class RedisEventService implements OnModuleDestroy {
   }
 
   /** Append a message to the conversation history for this session. */
-  async pushMessage(sessionId: string, role: 'user' | 'assistant', text: string): Promise<void> {
+  async pushMessage(sessionId: string, role: 'user' | 'assistant', text: string, options?: { clientMessageId?: string }): Promise<void> {
     const r = this.redis;
     if (!r || !(await this.ensureRedisReady())) return;
     try {
-      const entry = JSON.stringify({ role, content: text, timestamp: new Date().toISOString() });
+      const entry = JSON.stringify({ role, content: text, timestamp: new Date().toISOString(), client_message_id: options?.clientMessageId || undefined });
       await r.rpush(this.chatKey(sessionId), entry);
       // Keep conversation history bounded (last 100 messages)
       await r.ltrim(this.chatKey(sessionId), -100, -1);
@@ -356,7 +356,7 @@ export class RedisEventService implements OnModuleDestroy {
   }
 
   /** Get full conversation history for a session. */
-  async getHistory(sessionId: string, page = 0, limit = 50): Promise<Array<{ role: string; content: string; timestamp: string }>> {
+  async getHistory(sessionId: string, page = 0, limit = 50): Promise<Array<{ role: string; content: string; timestamp: string; client_message_id?: string }>> {
     const r = this.redis;
     if (!r || !(await this.ensureRedisReady())) return [];
     try {

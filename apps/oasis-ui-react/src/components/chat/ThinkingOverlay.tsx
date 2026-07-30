@@ -37,7 +37,10 @@ export function ThinkingOverlay({
     if (isThinking) {
       startedAtRef.current = Date.now();
       setElapsedMs(0);
-      const timer = setInterval(() => setElapsedMs(Date.now() - startedAtRef.current), 1000);
+      const timer = setInterval(() => {
+        const startedAt = startedAtRef.current;
+        if (startedAt !== null) setElapsedMs(Date.now() - startedAt);
+      }, 1000);
       return () => clearInterval(timer);
     }
   }, [isThinking]);

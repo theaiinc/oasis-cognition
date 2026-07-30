@@ -44,17 +44,17 @@ function AnimatedDots() {
 }
 
 const markdownComponents = {
-  p: ({ children }: { children: ReactNode }) => <p className="mb-1 last:mb-0">{children}</p>,
-  strong: ({ children }: { children: ReactNode }) => <strong className="font-semibold text-slate-100">{children}</strong>,
-  em: ({ children }: { children: ReactNode }) => <em className="italic">{children}</em>,
-  code: ({ children }: { children: ReactNode }) => (
+  p: ({ children }: { children?: ReactNode }) => <p className="mb-1 last:mb-0">{children}</p>,
+  strong: ({ children }: { children?: ReactNode }) => <strong className="font-semibold text-slate-100">{children}</strong>,
+  em: ({ children }: { children?: ReactNode }) => <em className="italic">{children}</em>,
+  code: ({ children }: { children?: ReactNode }) => (
     <code className="bg-slate-800 text-emerald-300/80 px-1 py-0.5 rounded text-[10px] font-mono">{children}</code>
   ),
-  ul: ({ children }: { children: ReactNode }) => <ul className="list-disc list-inside mb-1 space-y-0.5">{children}</ul>,
-  ol: ({ children }: { children: ReactNode }) => <ol className="list-decimal list-inside mb-1 space-y-0.5">{children}</ol>,
-  li: ({ children }: { children: ReactNode }) => <li>{children}</li>,
-  pre: ({ children }: { children: ReactNode }) => <pre className="bg-slate-800 rounded p-1.5 my-1 text-[10px] font-mono overflow-x-auto">{children}</pre>,
-  a: ({ href, children }: { href?: string; children: ReactNode }) => (
+  ul: ({ children }: { children?: ReactNode }) => <ul className="list-disc list-inside mb-1 space-y-0.5">{children}</ul>,
+  ol: ({ children }: { children?: ReactNode }) => <ol className="list-decimal list-inside mb-1 space-y-0.5">{children}</ol>,
+  li: ({ children }: { children?: ReactNode }) => <li>{children}</li>,
+  pre: ({ children }: { children?: ReactNode }) => <pre className="bg-slate-800 rounded p-1.5 my-1 text-[10px] font-mono overflow-x-auto">{children}</pre>,
+  a: ({ href, children }: { href?: string; children?: ReactNode }) => (
     <a href={href} target="_blank" rel="noopener noreferrer" className="text-blue-400 hover:text-blue-300 underline underline-offset-2">{children}</a>
   ),
 };

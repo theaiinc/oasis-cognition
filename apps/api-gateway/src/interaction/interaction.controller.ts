@@ -28,7 +28,6 @@ export class InteractionController {
     // without holding the connection open.
 
     expressRes.status(HttpStatus.ACCEPTED);
-    expressRes.json({ session_id: sessionId });
 
     // Fire the pipeline in the background (no await).
     // Errors are published as PipelineFailed events to the stream.

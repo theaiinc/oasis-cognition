@@ -11,7 +11,7 @@ import { assistantMessageId, cn, getErrorMessage, timelineClientKeyForMessage } 
 import type { Message, TimelineEvent, ProjectConfig, GraphData, RulesGraphData, CodeGraphData, ContextBudget } from '@/lib/types';
 import { computeThoughtStreamRevision } from '@/lib/thoughtStreamRevision';
 import { OASIS_BASE_URL, VOICE_AGENT_URL } from '@/lib/constants';
-import { postInteractionNdjson } from '@/lib/interaction-api';
+import { postInteraction } from '@/lib/interaction-api';
 import { linkChatToProject } from '@/lib/artifact-api';
 import { extractMentionedArtifactIds } from '@/lib/mention-utils';
 import { useQuickUpload } from '@/hooks/useQuickUpload';
@@ -195,6 +195,10 @@ export default function App() {
               }
             }
             _setActiveProjectId(undefined);
+          } else if (devAgentProjectId !== activeProjectId) {
+            // The browser's persisted selection is authoritative for the
+            // session; bring the dev-agent back into sync after a restart.
+            await axios.post(`${OASIS_BASE_URL}/api/v1/project/activate`, { project_id: activeProjectId }, { timeout: 15000 }).catch(() => undefined);
           }
         } else if (devAgentProjectId) {
           // No stored project but dev-agent has one — auto-adopt it
@@ -461,17 +465,32 @@ export default function App() {
       const raw = res.data.messages || [];
       const hasMore = res.data.has_more === true;
       setHasMoreHistory(hasMore);
-      const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
-        id: `hist-${sessionId}-${i}`,
-        text: m.content,
-        sender: m.role === 'user' ? 'user' : 'assistant',
-        timestamp: new Date(m.timestamp),
-      }));
+      let lastClientMsgId: string | undefined;
+      const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string; client_message_id?: string }, i: number) => {
+        const cmId = m.client_message_id;
+        const sender: Message['sender'] = m.role === 'user' ? 'user' : 'assistant';
+        if (sender === 'user' && cmId) {
+          lastClientMsgId = cmId;
+          return { id: cmId, text: m.content, sender, timestamp: new Date(m.timestamp) };
+        }
+        if (sender === 'assistant' && lastClientMsgId) {
+          return { id: assistantMessageId(lastClientMsgId), text: m.content, sender, timestamp: new Date(m.timestamp) };
+        }
+        return { id: `hist-${sessionId}-${i}`, text: m.content, sender, timestamp: new Date(m.timestamp) };
+      });
       setMessages(msgs);
       setHistoryPage(0);
       setTextSessionId(sessionId);
       sessionStorage.setItem('oasis-session-id', sessionId);
       setTimelineByClientMessageId({});
+      // Track in-flight API-started sessions so SSE events & thinking overlay work
+      if (raw.length > 0) {
+        const lastRaw = raw[raw.length - 1] as { role?: string; client_message_id?: string } | undefined;
+        if (lastRaw?.role === 'user' && lastRaw?.client_message_id) {
+          setActiveClientMessageId(lastRaw.client_message_id);
+          setIsThinking(true);
+        }
+      }
       setShowHistoryPanel(false);
       // Reset scroll state so the "New messages" button doesn't persist across sessions
       setIsNearBottom(true);
@@ -506,7 +525,7 @@ export default function App() {
     if (mentionedArtifactIds && mentionedArtifactIds.length > 0) context.mentioned_artifact_ids = mentionedArtifactIds;
     if (attachedArtifactIds && attachedArtifactIds.length > 0) context.attached_artifact_ids = attachedArtifactIds;
 
-    const data = await postInteractionNdjson(
+    return postInteraction(
       `${OASIS_BASE_URL}/api/v1/interaction`,
       {
         user_message: text,
@@ -516,7 +535,6 @@ export default function App() {
       },
       signal,
     );
-    return data;
   }, [textSessionId, autonomousMode, activeProjectId, activeRoleId]);
 
   const handleStopPipeline = useCallback(() => {
@@ -540,23 +558,7 @@ export default function App() {
     setIsThinking(true);
     setActiveClientMessageId(next.clientMessageId);
     try {
-      const data = await sendToApi(next.text, next.clientMessageId, next.replyTo);
-      setIsThinking(false);
-      const assistantReply = typeof data?.response === 'string' ? data.response.trim() : '';
-      if (assistantReply) {
-        upsertAssistantMessage(next.clientMessageId, assistantReply, data.confidence?.toString());
-        if (data?.reasoning_graph && Object.keys(data.reasoning_graph).length > 0) {
-          const g = data.reasoning_graph as { nodes?: Array<{ node_type?: string; title?: string }> };
-          const conclusionNode = g?.nodes?.find((n: { node_type?: string }) => n.node_type === 'ConclusionNode');
-          setGraphsBySessionId(prev => ({ ...prev, [textSessionId]: { graph: data.reasoning_graph, timestamp: new Date().toISOString(), reasoning_trace: data.reasoning_trace, confidence: data.confidence, conclusion: data.conclusion ?? conclusionNode?.title ?? assistantReply.slice(0, 200) } }));
-        }
-      } else if (data) {
-        upsertAssistantMessage(
-          next.clientMessageId,
-          '_(Empty reply from the pipeline — open the timeline for this message or try again.)_',
-          data.confidence?.toString(),
-        );
-      }
+      await sendToApi(next.text, next.clientMessageId, next.replyTo);
     } catch (e: unknown) {
       setIsThinking(false);
       if (isUserAbort(e)) return;
@@ -565,7 +567,6 @@ export default function App() {
       toast({ title: "Reasoning Pipeline Error", description: detail, variant: "destructive" });
     } finally {
       isSendingRef.current = false;
-      if (queueRef.current.length > 0) queueMicrotask(() => { void flushQueueIfIdle(); });
     }
   }, [addMessage, sendToApi, toast, textSessionId, upsertAssistantMessage]);
 
@@ -676,13 +677,23 @@ export default function App() {
       setHasMoreHistory(hasMore);
 
       if (page === 0 && !append) {
-        // Initial load: assign IDs and handle in-flight interaction
-        const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
-          id: '',
-          text: m.content,
-          sender: m.role === 'user' ? 'user' : 'assistant',
-          timestamp: new Date(m.timestamp),
-        }));
+        // Initial load: assign IDs from stored client_message_id when available,
+        // so SSE events can correlate properly (critical for API-started sessions).
+        let lastClientMsgId: string | undefined;
+        const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string; client_message_id?: string }, i: number) => {
+          const cmId = m.client_message_id;
+          const sender = m.role === 'user' ? 'user' as const : 'assistant' as const;
+          if (sender === 'user' && cmId) {
+            lastClientMsgId = cmId;
+            return { id: cmId, text: m.content, sender, timestamp: new Date(m.timestamp) };
+          }
+          // For assistant messages right after a user message with known client_message_id,
+          // derive the SSE-compatible ID so ResponseChunkGenerated events can find them.
+          if (sender === 'assistant' && lastClientMsgId) {
+            return { id: assistantMessageId(lastClientMsgId), text: m.content, sender, timestamp: new Date(m.timestamp) };
+          }
+          return { id: '', text: m.content, sender, timestamp: new Date(m.timestamp) };
+        });
 
         // If the last interaction was in-flight, reconstruct rows with SSE-compatible IDs
         if (storedClientId && msgs.length >= 1) {
@@ -698,12 +709,21 @@ export default function App() {
           }
         }
 
-        setMessages(msgs.map((m, i) => (m.id ? m : { ...m, id: `hist-${sid}-${i}` })));
-
-        if (msgs.length > 0 && msgs[msgs.length - 1].sender === 'user') {
-          if (storedClientId) setActiveClientMessageId(storedClientId);
-          setIsThinking(true);
+        // For the last in-flight user message, track it for SSE correlation.
+        // Use storedClientId from sessionStorage when the UI sent the message,
+        // or fall back to the stored client_message_id for API-started sessions.
+        const lastRaw = raw.length > 0 ? raw[raw.length - 1] as { role?: string; client_message_id?: string } : undefined;
+        if (lastRaw?.role === 'user') {
+          if (storedClientId) {
+            setActiveClientMessageId(storedClientId);
+          } else if (lastRaw?.client_message_id) {
+            setActiveClientMessageId(lastRaw.client_message_id);
+          }
         }
+        if (lastRaw?.role === 'user') setIsThinking(true);
+
+        // Fill in synthetic IDs for any messages that still lack them
+        setMessages(msgs.map((m, i) => (m.id ? m : { ...m, id: `hist-${sid}-${i}` })));
       } else {
         // Append older messages at the beginning (prepend)
         const olderMsgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
@@ -1178,25 +1198,7 @@ export default function App() {
     isSendingRef.current = true;
     setIsThinking(true);
     try {
-      const data = await sendToApi(trimmed, clientMessageId, replyTo, mentionedIds, attachedIds);
-      setIsThinking(false);
-      // Clear the stored client message id since the response completed
-      sessionStorage.removeItem('oasis-last-client-msg');
-      const assistantReply = typeof data?.response === 'string' ? data.response.trim() : '';
-      if (assistantReply) {
-        upsertAssistantMessage(clientMessageId, assistantReply, data.confidence?.toString());
-        if (data?.reasoning_graph && Object.keys(data.reasoning_graph).length > 0) {
-          const g = data.reasoning_graph as { nodes?: Array<{ node_type?: string; title?: string }> };
-          const conclusionNode = g?.nodes?.find((n: { node_type?: string }) => n.node_type === 'ConclusionNode');
-          setGraphsBySessionId(prev => ({ ...prev, [textSessionId]: { graph: data.reasoning_graph, timestamp: new Date().toISOString(), reasoning_trace: data.reasoning_trace, confidence: data.confidence, conclusion: data.conclusion ?? conclusionNode?.title ?? assistantReply.slice(0, 200) } }));
-        }
-      } else if (data) {
-        upsertAssistantMessage(
-          clientMessageId,
-          '_(Empty reply from the pipeline — open the timeline for this message or try again.)_',
-          data.confidence?.toString(),
-        );
-      }
+      await sendToApi(trimmed, clientMessageId, replyTo, mentionedIds, attachedIds);
     } catch (e: unknown) {
       setIsThinking(false);
       if (isUserAbort(e)) return;
@@ -1205,7 +1207,6 @@ export default function App() {
       toast({ title: "Reasoning Pipeline Error", description: detail, variant: "destructive" });
     } finally {
       isSendingRef.current = false;
-      queueMicrotask(() => { void flushQueueIfIdle(); });
     }
   }, [replyToMessageId, replyToMessageText, isThinking, addMessage, sendToApi, flushQueueIfIdle, toast, upsertAssistantMessage, textSessionId, quickUpload]);
 
@@ -1247,29 +1248,13 @@ export default function App() {
     addMessage(option, 'user', undefined, false, false, clientMessageId);
     isSendingRef.current = true;
     setIsThinking(true);
-    sendToApi(option, clientMessageId).then((data) => {
-      setIsThinking(false);
-      const assistantReply = typeof data?.response === 'string' ? data.response.trim() : '';
-      if (assistantReply) {
-        upsertAssistantMessage(clientMessageId, assistantReply, data.confidence?.toString());
-        if (data?.reasoning_graph && Object.keys(data.reasoning_graph as object).length > 0) {
-          const g = data.reasoning_graph as { nodes?: Array<{ node_type?: string; title?: string }> };
-          const conclusionNode = g?.nodes?.find((n: { node_type?: string }) => n.node_type === 'ConclusionNode');
-          setGraphsBySessionId(prev => ({ ...prev, [textSessionId]: { graph: data.reasoning_graph as Record<string, unknown>, timestamp: new Date().toISOString(), reasoning_trace: data.reasoning_trace, confidence: data.confidence, conclusion: data.conclusion ?? conclusionNode?.title ?? assistantReply.slice(0, 200) } }));
-        }
-      } else if (data) {
-        upsertAssistantMessage(
-          clientMessageId,
-          '_(Empty reply from the pipeline — open the timeline for this message or try again.)_',
-          data.confidence?.toString(),
-        );
-      }
+    sendToApi(option, clientMessageId).then(() => {
     }).catch((e: unknown) => {
       setIsThinking(false);
       if (isUserAbort(e)) return;
       const detail = axios.isAxiosError(e) ? (e.response?.data as { error?: string } | undefined)?.error || e.message : getErrorMessage(e);
       addMessage(`Error: ${detail}`, 'system');
-    }).finally(() => { isSendingRef.current = false; queueMicrotask(() => { void flushQueueIfIdle(); }); });
+    }).finally(() => { isSendingRef.current = false; });
   }, [addMessage, sendToApi, flushQueueIfIdle, textSessionId, upsertAssistantMessage]);
 
   return (

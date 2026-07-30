@@ -125,6 +125,7 @@ export class WorkflowsService implements OnModuleInit {
     // Cascade: triggers + runs
     const triggers = await this.store.listTriggers(id);
     for (const t of triggers) await this.store.deleteTrigger(t.trigger_id);
+    await this.store.deleteRunsForWorkflow(id);
     await this.store.deleteWorkflow(id);
   }
 
@@ -136,6 +137,9 @@ export class WorkflowsService implements OnModuleInit {
     opts: { trigger_id?: string; trigger_type?: RunJobData['trigger_type']; context?: Record<string, any> } = {},
   ): Promise<WorkflowRun> {
     const wf = await this.getWorkflow(workflowId);
+    if (!wf.enabled) {
+      throw new HttpException('workflow is disabled', HttpStatus.CONFLICT);
+    }
     const run: WorkflowRun = {
       run_id: uuidv4(),
       workflow_id: wf.workflow_id,

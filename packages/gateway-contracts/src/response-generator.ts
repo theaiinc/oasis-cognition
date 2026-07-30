@@ -64,11 +64,13 @@ export const ToolPlanRequest = z.object({
   model_override: z.string().nullable().optional(),
   rule_packs_to_inject: z.array(z.string()).nullable().optional(),
   max_tokens: z.number().int().nullable().optional(),
+  context_window_override: z.number().int().nullable().optional(),
+  context_output_reserve: z.number().min(0).max(1).nullable().optional(),
 });
 
-export const ToolPlanResponse = z.object({
-  plan: z.record(z.unknown()),
-});
+// The endpoint returns the planner's action object directly, e.g.
+// { action: "tool_call", tool: "...", arguments: {...} }.
+export const ToolPlanResponse = z.record(z.unknown());
 
 // ── Plan Tool Use ──────────────────────────────────────────────────────
 
@@ -86,9 +88,8 @@ export const PlanToolUseRequest = z.object({
   artifact_context: z.string().nullable().optional(),
 });
 
-export const PlanToolUseResponse = z.object({
-  plan: z.record(z.unknown()),
-});
+// /internal/plan/tool-use also returns the plan object directly.
+export const PlanToolUseResponse = z.record(z.unknown());
 
 // ── Thought Generate ───────────────────────────────────────────────────
 

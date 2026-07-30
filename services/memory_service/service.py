@@ -40,14 +40,15 @@ class MemoryService:
 
     def _init_driver(self) -> None:
         import time as _time
-        max_retries = 10
-        retry_delay = 3  # seconds
+        max_retries = max(1, self._settings.neo4j_init_max_retries)
+        retry_delay = max(0.0, self._settings.neo4j_retry_delay_seconds)
         for attempt in range(1, max_retries + 1):
             try:
                 from neo4j import GraphDatabase
                 self._driver = GraphDatabase.driver(
                     self._settings.neo4j_uri,
                     auth=(self._settings.neo4j_user, self._settings.neo4j_password),
+                    connection_timeout=self._settings.neo4j_connection_timeout_seconds,
                 )
                 self._driver.verify_connectivity()
                 self._ensure_schema()
@@ -56,8 +57,9 @@ class MemoryService:
                 return
             except Exception as e:
                 if attempt < max_retries:
-                    logger.warning("Neo4j unavailable (attempt %d/%d: %s), retrying in %ds...", attempt, max_retries, e, retry_delay)
-                    _time.sleep(retry_delay)
+                    logger.warning("Neo4j unavailable (attempt %d/%d: %s), retrying in %.1fs...", attempt, max_retries, e, retry_delay)
+                    if retry_delay > 0:
+                        _time.sleep(retry_delay)
                 else:
                     logger.warning("Neo4j unavailable after %d attempts (%s), using in-memory fallback", max_retries, e)
                     self._use_fallback = True

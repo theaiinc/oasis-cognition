@@ -8,19 +8,21 @@ import * as http from 'http';
 const GATEWAY_URL = process.env.GATEWAY_URL || 'http://localhost:8000';
 const MEMORY_URL = process.env.MEMORY_URL || 'http://localhost:8004';
 const RESPONSE_URL = process.env.RESPONSE_URL || 'http://localhost:8005';
-const POLL_INTERVAL_MS = 2000;
-const MAX_WAIT_MS = 60_000;
+const POLL_INTERVAL_MS = Number(process.env.INTEGRATION_POLL_INTERVAL_MS || 500);
+const MAX_WAIT_MS = Number(process.env.INTEGRATION_SETUP_TIMEOUT_MS || 10_000);
 
 interface HealthEndpoint {
   name: string;
   url: string;
 }
 
-const services: HealthEndpoint[] = [
+export function getHealthEndpoints(): HealthEndpoint[] {
+  return [
   { name: 'api-gateway', url: `${GATEWAY_URL}/api/v1/health` },
   { name: 'memory-service', url: `${MEMORY_URL}/health` },
   { name: 'response-generator', url: `${RESPONSE_URL}/health` },
-];
+  ];
+}
 
 function httpGet(url: string): Promise<{ status: number }> {
   return new Promise((resolve, reject) => {
@@ -31,7 +33,7 @@ function httpGet(url: string): Promise<{ status: number }> {
   });
 }
 
-async function waitForService(endpoint: HealthEndpoint): Promise<void> {
+export async function waitForService(endpoint: HealthEndpoint): Promise<void> {
   const deadline = Date.now() + MAX_WAIT_MS;
   while (Date.now() < deadline) {
     try {
@@ -45,11 +47,15 @@ async function waitForService(endpoint: HealthEndpoint): Promise<void> {
     }
     await new Promise(r => setTimeout(r, POLL_INTERVAL_MS));
   }
-  throw new Error(`Service ${endpoint.name} did not become ready within ${MAX_WAIT_MS}ms`);
+  throw new Error(
+    `Service ${endpoint.name} did not become ready within ${MAX_WAIT_MS}ms. ` +
+    'Start the stack with: docker compose -f docker-compose.yml ' +
+    '-f tests/integration/docker-compose.test.yml up -d',
+  );
 }
 
 export default async function setup(): Promise<void> {
   console.log('[setup] Waiting for services...');
-  await Promise.all(services.map(waitForService));
+  await Promise.all(getHealthEndpoints().map(waitForService));
   console.log('[setup] All services are ready.');
 }

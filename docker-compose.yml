@@ -361,6 +361,16 @@ services:
       - OASIS_CONTEXT_WINDOW_TOOL_PLAN=${OASIS_CONTEXT_WINDOW_TOOL_PLAN:-131072}
       - OASIS_CODE_KNOWLEDGE_IN_TOOL_PLAN=${OASIS_CODE_KNOWLEDGE_IN_TOOL_PLAN:-true}
       - OASIS_CODE_KNOWLEDGE_TIMEOUT_MS=${OASIS_CODE_KNOWLEDGE_TIMEOUT_MS:-2500}
+      # Thought-layer timeout (ms) — bump for slow remote models or cold starts
+      - OASIS_THOUGHT_TIMEOUT_MS=${OASIS_THOUGHT_TIMEOUT_MS:-300000}
+      # Execution mode: reactive (act only), guided (think when stuck), deliberative (full reasoning)
+      - OASIS_EXECUTION_MODE=${OASIS_EXECUTION_MODE:-}
+      # Optional Janus health boundary; empty keeps the adapter disabled
+      - JANUS_BASE_URL=${JANUS_BASE_URL:-}
+      - JANUS_HEALTH_TIMEOUT_MS=${JANUS_HEALTH_TIMEOUT_MS:-2000}
+      # Optional Arcana Ash policy boundary; disabled unless explicitly enabled
+      - ARCANA_ENABLED=${ARCANA_ENABLED:-false}
+      - ARCANA_ASH_PATH=${ARCANA_ASH_PATH:-ash}
     depends_on:
       interpreter:
         condition: service_healthy

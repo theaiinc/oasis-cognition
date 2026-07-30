@@ -1,28 +1,26 @@
-import { parseNdjsonPayload } from '@oasis/ui-kit';
-import type { InteractionResponsePayload } from '@oasis/ui-kit';
-
-export type { InteractionResponsePayload };
-
 /**
- * POST /api/v1/interaction streams newline-delimited JSON: keepalive lines
- * {"_oasis_keepalive":true} and a final InteractionResponse object (or _oasis_error).
+ * POST /api/v1/interaction accepts work and returns immediately. The response
+ * is completed asynchronously on the session timeline SSE stream.
  */
-export async function postInteractionNdjson(
+export interface InteractionAccepted {
+  session_id: string;
+}
+
+export async function postInteraction(
   url: string,
   body: unknown,
   signal?: AbortSignal,
-): Promise<InteractionResponsePayload> {
+): Promise<InteractionAccepted> {
   const res = await fetch(url, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
-      Accept: 'application/x-ndjson, application/json',
+      Accept: 'application/json',
     },
     body: JSON.stringify(body),
     signal,
   });
 
-  const ct = res.headers.get('content-type') || '';
   const text = await res.text();
 
   if (!res.ok) {
@@ -40,9 +38,9 @@ export async function postInteractionNdjson(
     throw new Error(msg);
   }
 
-  if (!ct.includes('ndjson')) {
-    return JSON.parse(text) as InteractionResponsePayload;
+  const data = JSON.parse(text) as Partial<InteractionAccepted>;
+  if (typeof data.session_id !== 'string' || !data.session_id) {
+    throw new Error('Interaction accepted response did not include session_id');
   }
-
-  return parseNdjsonPayload(text);
+  return { session_id: data.session_id };
 }

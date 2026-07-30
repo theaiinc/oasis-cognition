@@ -5,19 +5,20 @@
  * and project roles both reference profiles by id.
  */
 
-export type ProfileAgentType = 'internal' | 'claude-code' | 'cursor-cli';
+export type ProfileAgentType = 'internal' | 'claude-code' | 'cursor-cli' | 'opencode';
 export type PermissionMode = 'plan' | 'acceptEdits' | 'bypassPermissions' | 'default';
 
 export interface AgentProfileConfig {
   /** For internal profiles: the LLM model. For external CLIs: the value
    *  passed as `--model` on the command line. */
   model?: string;
-  /** For internal profiles only — which LLM provider to use. */
+  /** For internal profiles only — which LLM provider to use.
+   *  'openai' → any OpenAI-compatible API (OpenAI, DeepSeek, LLM API, vLLM, etc.) */
   provider?: 'ollama' | 'openai' | 'anthropic';
   /** External-only. Default `acceptEdits`. */
   permission_mode?: PermissionMode;
   /** External-only. Whether the Oasis MCP server should be auto-wired.
-   *  Defaults: true for claude-code, false for cursor-cli (no per-session
+   *  Defaults: true for claude-code, false for cursor-cli and opencode (no per-session
    *  MCP config flag). */
   mcp_enabled?: boolean;
   /** Prepended to every spawn's goal/prompt. Applied after the role
@@ -25,6 +26,17 @@ export interface AgentProfileConfig {
   system_prompt_preamble?: string;
   /** Optional passthrough CLI args for external adapters. */
   extra_args?: string[];
+  /** Billing class for cost estimation and approval gating.
+   *  Inferred from provider/model if not set. */
+  billing_class?: 'free_local' | 'paid_api' | 'subscription_external' | 'uncertain';
+  /** Rough resource footprint for capacity planning. */
+  resource_class?: 'light' | 'standard' | 'gpu';
+  /** Override the model's context window (tokens). Defaults to the model variant's context_length.
+   *  Research agents typically need huge windows; coding agents can use moderate; chat agents can use small. */
+  context_window?: number;
+  /** Fraction of context_window reserved for output (0.0–1.0). Default 0.4.
+   *  Higher → more room for thinking/completion tokens, less for input context. */
+  context_output_reserve?: number;
 }
 
 export interface AgentProfile {

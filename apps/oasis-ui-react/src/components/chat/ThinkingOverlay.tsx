@@ -1,9 +1,8 @@
-import { useMemo } from 'react';
+import { useMemo, useState, useEffect, useRef } from 'react';
 import { PipelineProgress, PlanCard } from '@/components/timeline';
 import { ActivityStream } from './ActivityStream';
 import { ToolCallsScrollContainer } from './ToolCallsScrollContainer';
-import { Button } from '@/components/ui/button';
-import { Square } from 'lucide-react';
+import { StreamingCard } from './StreamingCard';
 import type { TimelineEvent } from '@/lib/types';
 import { computeThoughtStreamRevision } from '@/lib/thoughtStreamRevision';
 import { timelineClientKeyForMessage } from '@/lib/utils';
@@ -15,6 +14,7 @@ interface ThinkingOverlayProps {
   messages: Array<{ id: string; sender: string }>;
   onViewTimeline: (id: string) => void;
   onStop?: () => void;
+  liveReasoning?: string;
 }
 
 export function ThinkingOverlay({
@@ -24,17 +24,28 @@ export function ThinkingOverlay({
   messages,
   onViewTimeline,
   onStop,
+  liveReasoning = '',
 }: ThinkingOverlayProps) {
   const liveEvents = activeClientMessageId ? (timelineByClientMessageId[activeClientMessageId] || []) : [];
   const hasPlan = liveEvents.some(e => e.event_type === 'ToolPlanReady');
   const hasToolUse = liveEvents.some(e => e.event_type === 'ToolCallStarted');
-  const hasThoughts = liveEvents.some(e =>
-    e.event_type === 'ThoughtsValidated' ||
-    e.event_type === 'ThoughtChunkGenerated' ||
-    e.event_type === 'ThoughtLayerGenerated'
-  );
 
-  /** Thought stream / layer text changes → scroll activity wrapper; duplicate layer payloads do not bump. */
+  // ── Elapsed time since the current turn started ──────────────────────
+  const startedAtRef = useRef<number | null>(null);
+  const [elapsedMs, setElapsedMs] = useState(0);
+  useEffect(() => {
+    if (isThinking) {
+      startedAtRef.current = Date.now();
+      setElapsedMs(0);
+      const timer = setInterval(() => {
+        const startedAt = startedAtRef.current;
+        if (startedAt !== null) setElapsedMs(Date.now() - startedAt);
+      }, 1000);
+      return () => clearInterval(timer);
+    }
+  }, [isThinking]);
+
+  /** Thought stream / layer text changes — used for activity auto-scroll */
   const thoughtChunkRevision = useMemo(
     () => computeThoughtStreamRevision(liveEvents),
     [liveEvents],
@@ -44,40 +55,40 @@ export function ThinkingOverlay({
 
   return (
     <div className="flex flex-col gap-3">
-        <div className="flex items-center gap-2">
-          <div
-            className="cursor-pointer flex-1 min-w-0"
-            onClick={() => {
-              const lastAssistant = [...messages].reverse().find(m => m.sender === 'assistant');
-              const targetId = activeClientMessageId
-                || (lastAssistant ? timelineClientKeyForMessage(lastAssistant) : null);
-              if (targetId) onViewTimeline(targetId);
-            }}
-          >
-            <PipelineProgress events={liveEvents} />
-          </div>
-          {onStop && (
-            <Button
-              variant="ghost"
-              size="sm"
-              className="flex-shrink-0 h-8 px-2.5 text-red-400 hover:text-red-300 hover:bg-red-950/30"
-              onClick={(e) => { e.stopPropagation(); onStop(); }}
-              title="Stop pipeline"
-              aria-label="Stop pipeline"
-            >
-              <Square className="w-3.5 h-3.5 fill-current" />
-              <span className="ml-1.5 text-[11px] font-medium">Stop</span>
-            </Button>
-          )}
+      {/* Pipeline progress header (clickable to open timeline) */}
+      <div className="flex items-center gap-2">
+        <div
+          className="cursor-pointer flex-1 min-w-0"
+          onClick={() => {
+            const lastAssistant = [...messages].reverse().find(m => m.sender === 'assistant');
+            const targetId = activeClientMessageId
+              || (lastAssistant ? timelineClientKeyForMessage(lastAssistant) : null);
+            if (targetId) onViewTimeline(targetId);
+          }}
+        >
+          <PipelineProgress events={liveEvents} />
         </div>
-        {(hasPlan || hasToolUse || hasThoughts) && (
+      </div>
+
+      {/* Streaming card for reasoning */}
+      <StreamingCard
+        variant="thinking"
+        content={liveReasoning}
+        streaming={isThinking}
+        autoScroll
+        maxHeight="340px"
+        elapsedMs={elapsedMs}
+        onStop={onStop}
+      >
+        {/* Tool calls and activity below the thinking card */}
+        {(hasPlan || hasToolUse) && (
           <div className="ml-11 max-w-md flex flex-col gap-2">
             {hasPlan && (
               <div className="shrink-0">
                 <PlanCard events={liveEvents} />
               </div>
             )}
-            {(hasThoughts || hasToolUse) && (
+            {hasToolUse && (
               <ToolCallsScrollContainer
                 isStreaming={isThinking}
                 eventCount={liveEvents.length}
@@ -89,6 +100,7 @@ export function ThinkingOverlay({
             )}
           </div>
         )}
+      </StreamingCard>
     </div>
   );
 }

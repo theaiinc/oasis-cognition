@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
@@ -12,9 +13,787 @@ from typing import Any
 from packages.reasoning_schema.models import DecisionTree
 from packages.shared_utils.config import Settings
 from packages.shared_utils.llm_client import LLMClient
-from packages.shared_utils.json_utils import extract_json
 
 logger = logging.getLogger(__name__)
+
+
+# ── Model capability resolver ────────────────────────────────────
+# Instead of tiering prompts, we tier capabilities.
+# The CORE_TOOL_PLAN_PROMPT is identical for all models.
+# We only filter which tools are *listed* as available based on model size.
+# A 2B model simply cannot see delegate_tasks, mission_create, etc.
+#
+# Model size inference (same prefixes as before, kept for capability gating)
+_MODEL_PARAM_HINTS: dict[str, int] = {
+    "google/gemma-4-e2b": 2,
+    "google/gemma-4-4b": 4,
+    "google/gemma-4-12b": 12,
+    "google/gemma-4-26b": 26,
+    "qwen3:8b": 8,
+    "qwen3:14b": 14,
+    "qwen3:32b": 32,
+    "deepseek-v4-flash": 0,
+    "deepseek-v3": 0,
+}
+
+
+def _estimate_model_param_size(model_str: str | None) -> int:
+    """Return estimated parameter size in billions, or 0 for unknown/proprietary."""
+    if not model_str:
+        return 0
+    model_lower = model_str.strip().lower()
+    best = 0
+    best_len = 0
+    for prefix, size in _MODEL_PARAM_HINTS.items():
+        if model_lower.startswith(prefix) and len(prefix) > best_len:
+            best = size
+            best_len = len(prefix)
+    return best
+
+
+def resolve_available_tools(model_override: str | None) -> list[str]:
+    """Return the list of tool names available to this model based on parameter size.
+
+    Tiering:
+      ≤3B  → UTILITY: core only (search, read, edit, bash). NO delegation, NO workflows, NO missions.
+      ≤6B  → OPERATIONAL: core + get_rule + delegate_tasks + delegation tools.
+      >6B  → COGNITIVE: full — standard + workflow_create/update/delete + triggers + computer_action + node_catalog + all missions.
+      0 (unknown) → full (safest default for proprietary models).
+    """
+    param_size = _estimate_model_param_size(model_override)
+
+    # Tools available to ALL models (universal core)
+    universal = [
+        "search_artifacts", "read_artifact",
+        "bash", "read_file", "list_dir", "grep", "find_files",
+        "browse_url", "web_search",
+        "create_worktree", "apply_patch", "write_file", "edit_file",
+        "read_worktree_file", "get_diff",
+        "teach_rule", "update_rule", "delete_rule",
+        "think",
+        # Discovery tools — available to ALL models
+        "search_mcp",
+        "search_skills",
+    ]
+
+    if param_size == 0:
+        return None  # None = use TOOL_PLAN_ALLOWED_TOOLS (full set)
+    if param_size <= 3:
+        return universal  # 2B/2B: utility — core only
+    if param_size <= 6:
+        # 4B/6B: operational — + delegation + get_rule
+        return universal + [
+            "get_rule",
+            "delegate_tasks", "delegate_job_status",
+            "delegate_job_cancel", "delegate_job_results",
+        ]
+    # >6B (12B+): cognitive — full kit
+    return None  # None = use TOOL_PLAN_ALLOWED_TOOLS (full set)
+
+# ── Tool descriptions for prompt injection ──────────────────────
+# Short one-liners so the model understands what each tool does.
+_TOOL_DESCRIPTIONS: dict[str, str] = {
+    "search_artifacts": "Search indexed documents/artifacts by keyword.",
+    "read_artifact": "Read a specific artifact by ID.",
+    "bash": "Run a bash command on the host dev-agent. For installs, MUST use worktree.",
+    "read_file": "Read a file at /workspace/<path>.",
+    "list_dir": "List directory contents at /workspace/<path>.",
+    "grep": "Search file contents by pattern at /workspace/<path>.",
+    "find_files": "Find files by name glob at /workspace/<path>.",
+    "browse_url": "Fetch a URL and return rendered text.",
+    "web_search": "Search the web for information.",
+    "create_worktree": "Create a working directory for edits. Call once per session.",
+    "apply_patch": "Apply a unified diff patch to a file. Preferred edit method.",
+    "write_file": "Create a NEW file (new files only — do NOT use for edits).",
+    "edit_file": "Edit a file via old_string/new_string. Last resort after patch fails.",
+    "read_worktree_file": "Read a file inside the active worktree.",
+    "get_diff": "Show uncommitted diff in the worktree.",
+    "teach_rule": "Teach a persistent rule (condition + conclusion + confidence).",
+    "update_rule": "Update an existing rule by rule_id.",
+    "delete_rule": "Delete a rule by rule_id.",
+    "get_rule": "Request a rule pack by name (tool_rules, coding_rules, delegation_rules, etc.).",
+    "think": "Reason about a complex problem before acting. Call with PARAM_REASON describing what you need to figure out (plan, debug, analyze, decide). Use sparingly — most actions don't need thinking.",
+    "search_mcp": "Discover MCP tools by query (e.g. 'github create issue'). Returns matching tools with names, descriptions, and categories.",
+    "search_skills": "Discover skills by goal/query (e.g. 'facebook post', 'analyze bug'). Returns matching skill guidance.",
+    "computer_action": "Control desktop mouse/keyboard/screen.",
+    # Workflow tools
+    "workflow_list": "List workflows.",
+    "workflow_get": "Get a workflow by ID.",
+    "workflow_create": "Create a new workflow.",
+    "workflow_update": "Update a workflow.",
+    "workflow_delete": "Delete a workflow.",
+    "workflow_run": "Run a workflow.",
+    "workflow_runs_list": "List recent workflow runs.",
+    "workflow_get_run": "Get a specific workflow run.",
+    "workflow_cancel_run": "Cancel a running workflow.",
+    "workflow_add_node": "Add a node to a workflow.",
+    "workflow_add_edge": "Add an edge to a workflow.",
+    "workflow_remove_node": "Remove a node from a workflow.",
+    "node_catalog": "List available workflow node types.",
+    "trigger_create": "Create a trigger for scheduled/reactive execution.",
+    "trigger_list": "List triggers.",
+    "trigger_update": "Update a trigger.",
+    "trigger_delete": "Delete a trigger.",
+    # Mission tools
+    "mission_create": "Create a recurring background mission (auto-heal, monitoring, etc.).",
+    "mission_list": "List missions.",
+    "mission_get": "Get mission details.",
+    "mission_update": "Update a mission.",
+    "mission_delete": "Delete a mission.",
+    "mission_pause": "Pause a mission.",
+    "mission_resume": "Resume a paused mission.",
+    "mission_run": "Trigger an immediate mission run.",
+    # Coordinator tools
+    "delegate_tasks": "Delegate independent sub-tasks to parallel sub-agents.",
+    "delegate_job_status": "Check the status of a delegation job.",
+    "delegate_job_cancel": "Cancel a delegation job.",
+    "delegate_job_results": "Fetch results of a completed delegation job.",
+}
+
+
+# ── Tool parameter schemas for native function calling ──────────────
+# Each tool describes its parameters as JSON Schema so the LLM can emit
+# native tool_calls rather than the flat text format.
+_TOOL_PARAM_SCHEMAS: dict[str, dict] = {
+    # ── Read-only (container) ──
+    "read_file": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path at /workspace/<path>."},
+            "start_line": {"type": "integer", "description": "Optional start line (1-indexed)."},
+            "end_line": {"type": "integer", "description": "Optional end line (inclusive)."},
+        },
+        "required": ["path"],
+    },
+    "list_dir": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "Directory path at /workspace/<path>."},
+            "recursive": {"type": "boolean", "description": "List recursively."},
+        },
+        "required": ["path"],
+    },
+    "grep": {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Regex or text pattern to search."},
+            "path": {"type": "string", "description": "Directory/file to search."},
+        },
+        "required": ["pattern"],
+    },
+    "find_files": {
+        "type": "object",
+        "properties": {
+            "pattern": {"type": "string", "description": "Glob pattern (e.g. '*.tsx', 'CodeBlock*')."},
+            "path": {"type": "string", "description": "Directory to search in."},
+            "file_type": {"type": "string", "description": "Optional type filter."},
+        },
+        "required": ["pattern"],
+    },
+    "browse_url": {
+        "type": "object",
+        "properties": {
+            "url": {"type": "string", "description": "Full URL to fetch."},
+        },
+        "required": ["url"],
+    },
+    "web_search": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query."},
+        },
+        "required": ["query"],
+    },
+    # ── Host / Worktree ──
+    "bash": {
+        "type": "object",
+        "properties": {
+            "command": {"type": "string", "description": "Shell command to run on host."},
+            "worktree_id": {"type": "string", "description": "Optional worktree ID if install inside worktree."},
+        },
+        "required": ["command"],
+    },
+    "create_worktree": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Short name for the worktree."},
+        },
+    },
+    "write_file": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path (repo-relative)."},
+            "content": {"type": "string", "description": "Full file content."},
+            "worktree_id": {"type": "string", "description": "Active worktree ID."},
+        },
+        "required": ["path", "content"],
+    },
+    "edit_file": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path (repo-relative)."},
+            "old_string": {"type": "string", "description": "Exact text to replace."},
+            "new_string": {"type": "string", "description": "Replacement text."},
+            "worktree_id": {"type": "string", "description": "Active worktree ID."},
+        },
+        "required": ["path", "old_string", "new_string"],
+    },
+    "apply_patch": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path (repo-relative)."},
+            "patch": {"type": "string", "description": "Unified diff patch content."},
+            "worktree_id": {"type": "string", "description": "Active worktree ID."},
+        },
+        "required": ["path", "patch"],
+    },
+    "read_worktree_file": {
+        "type": "object",
+        "properties": {
+            "path": {"type": "string", "description": "File path (repo-relative)."},
+            "worktree_id": {"type": "string", "description": "Active worktree ID."},
+            "start_line": {"type": "integer", "description": "Optional start line (1-indexed)."},
+            "end_line": {"type": "integer", "description": "Optional end line (inclusive)."},
+        },
+        "required": ["path"],
+    },
+    "get_diff": {
+        "type": "object",
+        "properties": {
+            "worktree_id": {"type": "string", "description": "Active worktree ID."},
+        },
+    },
+    # ── Knowledge ──
+    "search_artifacts": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Keyword search query."},
+            "limit": {"type": "integer", "description": "Max results."},
+        },
+        "required": ["query"],
+    },
+    "read_artifact": {
+        "type": "object",
+        "properties": {
+            "artifact_id": {"type": "string", "description": "Artifact ID from search results."},
+        },
+        "required": ["artifact_id"],
+    },
+    # ── System actions (special tools) ──
+    "teach_rule": {
+        "type": "object",
+        "properties": {
+            "condition": {"type": "string", "description": "When this rule applies."},
+            "conclusion": {"type": "string", "description": "What to do / believe."},
+            "confidence": {"type": "number", "description": "Confidence 0.0-1.0."},
+        },
+        "required": ["condition", "conclusion"],
+    },
+    "update_rule": {
+        "type": "object",
+        "properties": {
+            "rule_id": {"type": "string", "description": "ID of rule to update."},
+            "condition": {"type": "string", "description": "Updated condition."},
+            "conclusion": {"type": "string", "description": "Updated conclusion."},
+            "confidence": {"type": "number", "description": "Updated confidence 0.0-1.0."},
+        },
+        "required": ["rule_id"],
+    },
+    "delete_rule": {
+        "type": "object",
+        "properties": {
+            "rule_id": {"type": "string", "description": "ID of rule to delete."},
+        },
+        "required": ["rule_id"],
+    },
+    "get_rule": {
+        "type": "object",
+        "properties": {
+            "name": {"type": "string", "description": "Rule pack name (tool_rules, coding_rules, delegation_rules, etc.)."},
+        },
+        "required": ["name"],
+    },
+    "think": {
+        "type": "object",
+        "properties": {
+            "reason": {"type": "string", "description": "What you need to reason about (plan, debug, analyze, decide)."},
+        },
+        "required": ["reason"],
+    },
+    "search_mcp": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Search query (e.g. 'github create issue')."},
+        },
+        "required": ["query"],
+    },
+    "search_skills": {
+        "type": "object",
+        "properties": {
+            "query": {"type": "string", "description": "Describe what you want to accomplish (e.g. 'facebook post', 'analyze bug')."},
+        },
+        "required": ["query"],
+    },
+    # ── Computer use ──
+    "computer_action": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "description": "Action type: type, click, double_click, move, scroll, screenshot, key, etc."},
+            "x": {"type": "integer", "description": "X coordinate for mouse actions."},
+            "y": {"type": "integer", "description": "Y coordinate for mouse actions."},
+            "text": {"type": "string", "description": "Text to type."},
+            "key": {"type": "string", "description": "Key to press."},
+            "keys": {"type": "array", "items": {"type": "string"}, "description": "Multiple keys to press."},
+            "button": {"type": "string", "description": "Mouse button: left, right, middle."},
+            "direction": {"type": "string", "description": "Scroll direction: up, down, left, right."},
+            "amount": {"type": "integer", "description": "Scroll amount in clicks."},
+            "clicks": {"type": "integer", "description": "Number of clicks."},
+        },
+        "required": ["action"],
+    },
+    # ── Coordinator / Delegation ──
+    "delegate_tasks": {
+        "type": "object",
+        "properties": {
+            "goal": {"type": "string", "description": "Overall goal for the delegation."},
+            "tasks": {"type": "string", "description": "JSON array of task objects [{id, goal, depends_on?, resource_class?}]."},
+        },
+        "required": ["goal", "tasks"],
+    },
+    "delegate_job_status": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "description": "Delegation job ID."},
+        },
+        "required": ["job_id"],
+    },
+    "delegate_job_cancel": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "description": "Delegation job ID."},
+        },
+        "required": ["job_id"],
+    },
+    "delegate_job_results": {
+        "type": "object",
+        "properties": {
+            "job_id": {"type": "string", "description": "Delegation job ID."},
+        },
+        "required": ["job_id"],
+    },
+}
+
+# Compat aliases for FC: some models emit slightly different names
+_TOOL_NAME_ALIASES_FC: dict[str, str] = {
+    "edit": "edit_file",
+    "search_replace": "edit_file",
+    "replace": "edit_file",
+    "patch": "apply_patch",
+    "unified_diff": "apply_patch",
+    "listdir": "list_dir",
+    "read_dir": "list_dir",
+    "dir_list": "list_dir",
+    "search_files": "grep",
+    "file_search": "grep",
+    "find": "find_files",
+    "glob": "find_files",
+    "web": "web_search",
+    "internet_search": "web_search",
+    "google": "web_search",
+    "fetch_url": "browse_url",
+    "http_get": "browse_url",
+    "read_url": "browse_url",
+    "open_url": "browse_url",
+    "discover_mcp": "search_mcp",
+    "find_mcp": "search_mcp",
+    "mcp_search": "search_mcp",
+    "discover_skills": "search_skills",
+    "find_skills": "search_skills",
+    "skill_search": "search_skills",
+    "cancel_job": "delegate_job_cancel",
+    "cancel_task": "delegate_job_cancel",
+    "get_results": "delegate_job_results",
+    "job_results": "delegate_job_results",
+    "task_results": "delegate_job_results",
+    "aggregate_results": "delegate_job_results",
+}
+
+
+def _build_tool_definitions(available_tools: list[str]) -> list[dict]:
+    """Build OpenAI-compatible tool/function definitions from available tool names."""
+    definitions: list[dict] = []
+    for name in sorted(available_tools):
+        desc = _TOOL_DESCRIPTIONS.get(name, "")
+        param_schema = _TOOL_PARAM_SCHEMAS.get(name, {
+            "type": "object",
+            "properties": {},
+        })
+        definitions.append({
+            "type": "function",
+            "function": {
+                "name": name,
+                "description": desc,
+                "parameters": param_schema,
+            },
+        })
+    return definitions
+
+
+def _canonicalize_fc_tool_name(raw: str) -> tuple[str | None, str | None]:
+    """Resolve a possibly-aliased FC tool name to canonical name."""
+    if not raw or not str(raw).strip():
+        return None, "Missing tool name."
+    key = str(raw).strip().lower()
+    if key in _TOOL_NAME_ALIASES_FC:
+        key = _TOOL_NAME_ALIASES_FC[key]
+    if key in _TOOL_DESCRIPTIONS or key == "final_answer":
+        return key, None
+    # Check in TOOL_PLAN_ALLOWED_TOOLS
+    if key in TOOL_PLAN_ALLOWED_TOOLS:
+        return key, None
+    allowed = ", ".join(sorted(_TOOL_DESCRIPTIONS.keys()))
+    return None, f"Unknown tool {raw!r}. Must be one of: {allowed}."
+
+
+def _fc_response_to_plan(response: dict) -> dict[str, Any]:
+    """Convert a native function calling response into the standard plan dict.
+
+    ``response`` should be a dict from ``chat_structured_async``:
+      ``{"type": "text", "content": "..."}`` or
+      ``{"type": "tool_calls", "calls": [...], "content": "..."}``
+    """
+    response_type = response.get("type", "text")
+    content = response.get("content", "")
+
+    if response_type != "tool_calls" or not response.get("calls"):
+        # No tool calls = final_answer
+        text = (content or "").strip()
+        if text:
+            return {"action": "final_answer", "answer": text}
+        return {"action": "final_answer", "answer": "Task completed (no tool calls required)."}
+
+    # We only handle the first tool call (system executes one tool at a time)
+    tc = response["calls"][0]
+    raw_name = tc.get("function", {}).get("name", "")
+    canonical, err = _canonicalize_fc_tool_name(raw_name)
+    if err:
+        return {
+            "action": "final_answer",
+            "answer": f"[INTERNAL: INVALID_TOOL] {err}",
+            "_retry_hint": True,
+        }
+
+    raw_args_str = tc.get("function", {}).get("arguments", "{}")
+    try:
+        args = json.loads(raw_args_str) if isinstance(raw_args_str, str) else raw_args_str
+    except json.JSONDecodeError:
+        args = {}
+
+    # Map to param keys matching the existing plan dict convention
+    # FC tools use short param names (path, command, etc.). Map them to plan keys.
+    param_whitelist = {
+        "path", "command", "pattern", "url", "worktree_id", "content",
+        "old_string", "new_string", "patch", "name", "recursive", "file_type",
+        "query", "limit", "artifact_id",
+        "condition", "conclusion", "confidence", "rule_id",
+        "reason",
+        "action", "x", "y", "text", "key", "keys", "button", "direction",
+        "amount", "clicks",
+        "goal", "tasks",
+        "description", "enabled", "input", "workflow_id", "workflow_json",
+        "run_id", "trigger_id", "trigger_type", "trigger_config",
+        "node_id", "node_type", "node_params",
+        "from_node", "from_port", "to_node", "to_port",
+    }
+
+    # Determine action type from the tool name
+    if canonical in ("teach_rule", "update_rule", "delete_rule"):
+        plan: dict[str, Any] = {"action": canonical}
+        # Pass through all relevant params
+        for pk in param_whitelist:
+            if pk in args and args[pk] is not None:
+                plan[pk] = args[pk]
+        return plan
+
+    if canonical == "get_rule":
+        pack_name = args.get("name", "")
+        return {"action": "get_rule", "name": pack_name}
+
+    # Standard call_tool
+    plan = {"action": "call_tool", "tool": canonical, "reasoning": content}
+
+    # Map params from FC args to plan keys
+    for pk in param_whitelist:
+        if pk in args and args[pk] is not None:
+            plan[pk] = args[pk]
+
+    # Defaults (matching existing behavior)
+    if canonical in ("read_file", "list_dir", "grep", "find_files") and "path" not in plan:
+        plan["path"] = "/workspace"
+    if canonical == "grep" and "pattern" not in plan:
+        plan["pattern"] = "pattern"
+    if canonical == "create_worktree" and "name" not in plan:
+        plan["name"] = "workspace"
+
+    return plan
+
+
+def _format_tool_list(tool_names: list[str]) -> str:
+    """Format tool names + descriptions + required params for the flat-text prompt."""
+    # Build a compact param hint for each tool from its schema
+    _PARAM_HINTS: dict[str, str] = {}
+    for t, schema in _TOOL_PARAM_SCHEMAS.items():
+        required = schema.get("required", [])
+        props = schema.get("properties", {})
+        if not required:
+            _PARAM_HINTS[t] = ""
+            continue
+        param_names = []
+        for r in required:
+            ptype = props.get(r, {}).get("type", "string")
+            pname = "PARAM_" + r.upper()
+            param_names.append(f"{pname}")
+            # Also show commonly-expected optional params for key tools
+        extras = []
+        if t in ("write_file", "edit_file", "apply_patch", "read_worktree_file", "bash"):
+            extras.append("PARAM_WORKTREE_ID")
+        if t == "edit_file":
+            pass  # old_string/new_string already covered
+        all_params = param_names + extras
+        _PARAM_HINTS[t] = " Params: " + ", ".join(all_params) + "."
+
+    lines: list[str] = []
+    for t in sorted(tool_names):
+        desc = _TOOL_DESCRIPTIONS.get(t, "")
+        hint = _PARAM_HINTS.get(t, "")
+        if desc:
+            line = f"  {t} — {desc}"
+            if hint:
+                line += hint
+            lines.append(line)
+        else:
+            lines.append(f"  {t}")
+    return "\n".join(lines)
+
+
+# ── FC-optimized prompt (no output format instructions — tools are defined via API) ──
+CORE_TOOL_PLAN_PROMPT_FC = """\
+═══ IDENTITY ═══
+You are Oasis Cognition, an autonomous coding agent. You solve technical tasks by calling the available functions.
+
+═══ SCOPE ═══
+Read-only tools run in a container at `/workspace`.
+**bash** runs on the **host dev-agent** — for `npm install`/`pip install` you MUST have a worktree first (create_worktree).
+
+═══ RULES ═══
+- Bias to ACTION, not exploration. After 2 read-only tools, implement.
+- Never repeat the exact same tool call.
+- NEVER tell the user to do it themselves.
+- Be truthful. Use tools when needed. Complete the task.
+- Use `think` only when you need to plan, debug, analyze, or decide between approaches.
+  For simple actions (read a file, search, run bash), just call the tool directly.
+- **PREFER `edit_file` OVER `apply_patch`.** `edit_file` uses old_string→new_string replacement (simple, reliable). `apply_patch` requires correct unified diffs which models often get wrong. Only use `apply_patch` as a last resort if `edit_file` fails repeatedly.
+"""
+
+
+# ── Router Agent prompt (tiny — 2B model, <20 output tokens) ─────
+ROUTER_PROMPT = """\
+You classify user requests.
+
+Output EXACTLY 3 lines (no extra text):
+
+COMPLEXITY: simple | medium | complex
+DOMAIN: chat | coding | planning | workflow | memory | extraction
+REASONING: true | false
+
+Definitions:
+simple — retrieval, factual questions, extraction, summarization, casual conversation.
+medium — code generation, SQL, transformations, drafting, moderate analysis.
+complex — debugging, architecture, multi-step planning, workflow design, root-cause analysis.
+REASONING=true when the request requires deliberate planning, evaluation of alternatives, debugging, or causal analysis."""
+
+
+async def route_request(
+    user_message: str,
+    chat_history: list[dict[str, str]] | None = None,
+    llm_client: "LLMClient" | None = None,
+) -> dict[str, str]:
+    """Classify a user request using the smallest available model (2B).
+
+    Returns descriptive classification (no model assignment):
+      {"complexity": "simple"|"medium"|"complex",
+       "domain": "chat"|"coding"|"planning"|"workflow"|"memory"|"extraction",
+       "reasoning": "true"|"false"}
+
+    Model selection is done by the calling orchestration layer as a policy decision.
+    """
+    from packages.shared_utils.llm_client import LLMClient
+
+    cl = llm_client
+    if cl is None:
+        from packages.shared_utils.config import get_settings
+        settings = get_settings()
+        router_model = (settings.router_model or "").strip() or None
+        cl = LLMClient(settings)
+        if router_model:
+            model_override = router_model
+        else:
+            model_override = settings.llm_model
+
+    # Build a tiny context with the last user message + recent history
+    context_parts = [user_message]
+    if chat_history:
+        recent = chat_history[-4:]
+        for m in recent:
+            role = m.get("role", "?").upper()
+            content = (m.get("content", "") or "")[:200]
+            context_parts.append(f"{role}: {content}")
+    combined = "\n\n".join(context_parts)
+
+    try:
+        raw = await cl.chat_async(
+            system=ROUTER_PROMPT,
+            user_message=combined,
+            model=model_override if router_model else settings.llm_model,
+            max_tokens=64,
+            stop=["\n\n"],   # cut off at first blank line — router only needs 3 lines
+            temperature=0,
+        )
+    except Exception as e:
+        logger.warning("Route request LLM call failed: %s", e)
+        # Safe fallback — route as simple chat (2B, cheapest)
+        return {"complexity": "simple", "domain": "chat", "reasoning": "false"}
+
+    return _parse_router_output(raw)
+
+
+def _parse_router_output(raw: str) -> dict[str, str]:
+    """Parse the router's 3-line structured output."""
+    result = {"complexity": "simple", "domain": "chat", "reasoning": "false"}
+    for line in (raw or "").splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        key, _, val = line.partition(":")
+        key = key.strip().upper()
+        val = val.strip().lower()
+        if key == "COMPLEXITY" and val in ("simple", "medium", "complex"):
+            result["complexity"] = val
+        elif key == "DOMAIN" and val in ("chat", "coding", "planning", "workflow", "memory", "extraction"):
+            result["domain"] = val
+        elif key == "REASONING" and val in ("true", "false"):
+            result["reasoning"] = val
+    return result
+# Instead of a single monolithic prompt (previously ~500+ lines),
+# we use a ~50-line CORE_PROMPT + injected rule packs.
+# Rule packs are added just-in-time based on the model's planned action,
+# keeping the per-iteration context small—especially for 2B-8B models.
+# Model can also proactively look up rules using the get_rule tool.
+
+RULE_PACKS: dict[str, str] = {}
+
+# ── TOOL_RULES: tool selection, patch format, chunked reads, worktree discipline ──
+TOOL_RULES = """\
+Tool priority: edit_file >> write_file (new files only) >> apply_patch (last resort — models struggle with unified diffs).
+Path: repo-relative for worktree tools (e.g. apps/foo/bar.tsx), /workspace/ prefix for read-only (read_file, grep, list_dir).
+read_worktree_file MANDATORY before every edit. Use chunked reads (start_line/end_line).
+If truncated at N of M lines, immediately read next chunk (start_line=N+1).
+edit_file: use old_string→new_string with EXACT text copied from read_worktree_file output.
+apply_patch (last resort): unified diff format:
+--- a/<repo-relative-path>
++++ b/<repo-relative-path>
+@@ -START,COUNT +START,COUNT @@
+ context line (leading space)
+-removed line
++added line
+Always a/ b/ prefixes. Accurate @@ counts. Leading space on context. End with newline.
+ONE worktree per session. Extract id from create_worktree output. Reuse for ALL edits.
+For bash with npm/pnpm/yarn/pip install: MUST have worktree (create_worktree first), then PARAM_WORKTREE_ID.
+"""
+
+# ── DELEGATION_RULES: when/how to delegate_tasks, missions, workflows ──
+DELEGATION_RULES = """\
+delegate_tasks: use for 3+ independent files/modifications. Each task runs in own sub-agent.
+  PARAM_GOAL: overall goal; PARAM_TASKS: JSON array [{id, goal, depends_on?, resource_class?}]
+  Tasks without depends_on run in parallel.
+  After submit, check delegate_job_status, then delegate_job_results.
+  NOT for: simple single-file edits, tightly-coupled work.
+mission_create: recurring background goal with cron schedule. PARAM_GOAL + PARAM_SCHEDULE (5-field cron).
+  mission_id auto-inherited after creation: omit on subsequent mission_* calls.
+workflow_create: DAG of nodes (input, output, mcp_tool, http, delay, branch, filter, transform).
+  Prefer incremental: workflow_create(PARAM_NAME only) then workflow_add_node / workflow_add_edge.
+  workflow_id auto-inherited after creation.
+"""
+
+# ── MEMORY_RULES: knowledge graph, self-teaching rules ──
+MEMORY_RULES = """\
+Use knowledge graph for code symbols, import relationships, component hierarchies.
+Knowledge graph summary = session memory. Trust it; don't re-explore.
+Self-teaching: teach_rule after discovering facts, after failed attempts, or after successful impl.
+  Atomic: ONE fact per rule. General: not codebase-specific paths. Verifiable from docs.
+update_rule / delete_rule: modify existing rules.
+"""
+
+# ── SAFETY_RULES: destructive ops, approval, protected paths ──
+SAFETY_RULES = """\
+Destructive filesystem operations (rm -rf, sudo, etc.) require alternative approaches.
+Protected directories: /etc, /usr, /bin, /sbin, /var — avoid.
+Blocked commands: try without sudo, use worktree edits instead.
+Read-only sandbox at /workspace; bash runs on host dev-agent.
+NEVER give up because a command was blocked; find another way.
+"""
+
+# ── RECOVERY_RULES: what to do when tools fail ──
+RECOVERY_RULES = """\
+edit_file failed: read_worktree_file target section with start_line/end_line, copy EXACT old_string from output, retry.
+File not found: find_files or list_dir to discover correct path. Do NOT retry same path.
+old_string not found: double-check indentation and whitespace. Read the exact lines again and copy character-for-character.
+No grep results: try different keywords, broader path, or find_files instead.
+Blocked command: try different approach (e.g., edit package.json instead of npm install).
+WALLS list = paths that already failed; do NOT retry.
+Prefer FIX AND RETRY over abandoning mid-edit.
+"""
+
+# ── FINAL_ANSWER_RULES: verification before answering ──
+FINAL_ANSWER_RULES = """\
+Before final_answer: verify completion by checking files, running tests, showing diff.
+Do NOT self-assign additional work beyond the user's request.
+Answer in second person (you/your). Keep concise (2-5 sentences).
+Only answer when: (1) user's request addressed AND (2) no pending observer feedback.
+NEVER give instructions for the user to do something themselves.
+"""
+
+# ── CODING_RULES: apply_patch format, edit ordering ──
+CODING_RULES = """\
+Edit workflow: grep → read_file → create_worktree → read_worktree_file → edit_file → verify → get_diff.
+edit_file is DEFAULT. write_file for new files only. apply_patch last resort (models often generate corrupt diffs).
+Chunked reads ALWAYS. Never full-file read files over 100 lines.
+Phase 1 (before worktree): read_file from /workspace. Phase 2 (after worktree): read_worktree_file.
+CRITICAL: Copy context lines EXACTLY from read output — indentation matters.
+For edit_file: old_string must match EXACTLY (including whitespace). Copy-paste from read_worktree_file output.
+MAXIMUM 2 read-only tools before creating worktree and editing.
+"""
+
+# ── PLANNING_RULES: upfront plan structure, step sequencing ──
+PLANNING_RULES = """\
+Upfront plan is your roadmap. Follow steps sequentially.
+Observer feedback = THE BOSS. If observer is unsatisfied, continue; do NOT final_answer.
+Agent Thoughts = BINDING COMMITMENTS. Execute actions identified in thoughts.
+IMPLEMENT WITH PARTIAL INFO: Better to edit with 80% confidence than explore 5 more times.
+After 2 read-only tools (grep, list_dir, read_file), MUST switch to action (create_worktree → edit).
+"""
+
+# Populate the RULE_PACKS registry so JIT injection can look them up by name.
+RULE_PACKS["tool_rules"] = TOOL_RULES
+RULE_PACKS["delegation_rules"] = DELEGATION_RULES
+RULE_PACKS["memory_rules"] = MEMORY_RULES
+RULE_PACKS["safety_rules"] = SAFETY_RULES
+RULE_PACKS["recovery_rules"] = RECOVERY_RULES
+RULE_PACKS["final_answer_rules"] = FINAL_ANSWER_RULES
+RULE_PACKS["coding_rules"] = CODING_RULES
+RULE_PACKS["planning_rules"] = PLANNING_RULES
+
+from packages.shared_utils.json_utils import extract_json
 
 
 # ---------------------------------------------------------------------------
@@ -233,6 +1012,18 @@ TOOL_PLAN_ALLOWED_TOOLS: tuple[str, ...] = (
     "mission_pause",
     "mission_resume",
     "mission_run",
+    # Coordinator tools — parallel sub-agent delegation.
+    "delegate_tasks",
+    "delegate_job_status",
+    "delegate_job_cancel",
+    "delegate_job_results",
+    # JIT rule retrieval — model can request rule packs on demand
+    "get_rule",
+    # Explicit thinking — model uses this instead of automatic pre-thinking
+    "think",
+    # Tool discovery — search for MCP tools and skills on demand
+    "search_mcp",
+    "search_skills",
 )
 
 
@@ -283,6 +1074,20 @@ _TOOL_NAME_ALIASES: dict[str, str] = {
         "fetch_artifact": "read_artifact",
         "artifact_content": "read_artifact",
         "view_artifact": "read_artifact",
+        "delegate": "delegate_tasks",
+        "parallel_tasks": "delegate_tasks",
+        "parallel": "delegate_tasks",
+        "spawn": "delegate_tasks",
+        "spawn_subagents": "delegate_tasks",
+        "subagent": "delegate_tasks",
+        "job_status": "delegate_job_status",
+        "task_status": "delegate_job_status",
+        "cancel_job": "delegate_job_cancel",
+        "cancel_task": "delegate_job_cancel",
+        "get_results": "delegate_job_results",
+        "job_results": "delegate_job_results",
+        "task_results": "delegate_job_results",
+        "aggregate_results": "delegate_job_results",
     }.items()
 }
 
@@ -530,7 +1335,8 @@ def _normalize_tool_plan_output(parsed: dict[str, Any]) -> dict[str, Any]:
                     "answer": (
                         "[INTERNAL: apply_patch requires patch: a unified diff string (---/+++ hunks). "
                         "Use repo-relative paths like apps/foo.tsx (not /workspace/...). "
-                        "Prefer apply_patch over edit_file for multi-line or multi-file edits.]"
+                        "Prefer edit_file over apply_patch — models often generate corrupt unified diffs. "
+                        "For multi-line edits, use edit_file with exact old_string copied from read_worktree_file output.]"
                     ),
                     "_retry_hint": True,
                 }
@@ -980,6 +1786,244 @@ def _memory_to_str(m: dict) -> str:
     return str(m)[:500]
 
 
+def _categorize_walls(walls: list[str]) -> str:
+    """Group walls by tool category and path pattern — a table of contents with drill-down instructions."""
+    if not walls:
+        return ""
+    from collections import Counter
+    by_tool: dict[str, list[str]] = {}
+    for w in walls:
+        w_lower = w.lower()
+        if w_lower.startswith("path does not exist"):
+            by_tool.setdefault("MISSING PATHS", []).append(w)
+        elif w_lower.startswith("path/pattern not found"):
+            by_tool.setdefault("BASH NOT FOUND", []).append(w)
+        elif w_lower.startswith("grep for"):
+            by_tool.setdefault("GREP NO MATCH", []).append(w)
+        elif w_lower.startswith("edit_file"):
+            by_tool.setdefault("EDIT FAILED", []).append(w)
+        elif w_lower.startswith("apply_patch"):
+            by_tool.setdefault("PATCH FAILED", []).append(w)
+        elif w_lower.startswith("blocked"):
+            by_tool.setdefault("BLOCKED", []).append(w)
+        else:
+            by_tool.setdefault("OTHER", []).append(w)
+    lines: list[str] = [
+        "═══ WALLS TOC (grouped failures — DO NOT RETRY blindly) ═══",
+        f"Total: {len(walls)} failure(s). To inspect any failed path, use read_worktree_file or list_dir with the exact path to see its current state.",
+    ]
+    for category in ("EDIT FAILED", "PATCH FAILED", "MISSING PATHS", "GREP NO MATCH", "BASH NOT FOUND", "BLOCKED", "OTHER"):
+        entries = by_tool.pop(category, [])
+        if not entries:
+            continue
+        counts: Counter[str] = Counter()
+        retrieve_instructions: list[str] = []
+        for e in entries:
+            path_part = e.split(":", 1)[-1].strip() if ":" in e else e[:60]
+            counts[path_part] += 1
+            if path_part not in retrieve_instructions and not path_part.startswith("'") and len(path_part) < 100:
+                retrieve_instructions.append(path_part)
+        if retrieve_instructions:
+            drill = "; ".join(f"read_worktree_file {p}" for p in retrieve_instructions[:3])
+            drill_hint = f" | drill down: {drill}"
+        else:
+            drill_hint = ""
+        if len(entries) <= 2:
+            detail = "; ".join(e.split(":", 1)[-1].strip()[:80] if ":" in e else e[:80] for e in entries)
+            lines.append(f"  {category} ({len(entries)}x): {detail}{drill_hint}")
+        else:
+            counts_str = ", ".join(f"'{p[:60]}' x{c}" for p, c in counts.most_common(3))
+            lines.append(f"  {category} ({len(entries)}x): {counts_str}{drill_hint}")
+    leftover = by_tool.pop("OTHER", [])
+    if leftover:
+        lines.append(f"  OTHER ({len(leftover)}x): {'; '.join(e[:80] for e in leftover[:3])}")
+    return "\n".join(lines)
+
+
+def _format_rule(r: dict) -> str:
+    """Format a single rule as IF/THEN so the model knows when to activate it."""
+    cond = (r.get("condition") or "").strip()
+    concl = (r.get("conclusion") or r.get("assertion") or "").strip()
+    if not concl:
+        return str(r)
+    if cond and not cond.lower().startswith("general"):
+        return f"- IF {cond[:120]} → {concl[:160]}"
+    return f"- {concl[:180]}"
+
+
+def _format_rules_list(rules: list[dict]) -> str:
+    """Format multiple rules with IF/THEN triggers."""
+    return "\n".join(_format_rule(r) for r in rules)
+
+
+def _summarize_knowledge(
+    memory: list[dict] | None,
+    rules: list[dict] | None,
+    knowledge_summary: str | None,
+    walls_count: int,
+) -> str:
+    """Condense into a table of contents with drill-down instructions.
+
+    Each rule is shown as "IF <condition> THEN <conclusion>" so the model
+    knows the trigger. The summary is a compact digest; the model can drill
+    down via ``get_rule`` if it needs the full text.
+    """
+    from collections import Counter
+    parts: list[str] = [
+        "═══ KNOWLEDGE TOC (compact summary — drill down if you need more detail) ═══",
+        "  Drill-down tools: `get_rule` for rules, `search_artifacts` for documents, `read_worktree_file` for files.",
+    ]
+    if walls_count:
+        parts.append(f"  Walls: {walls_count} hit this session (see WALLS TOC above for drill-down paths).")
+    rule_count = len(rules) if rules else 0
+    if rule_count:
+        themes: Counter[str] = Counter()
+        rule_keywords: list[str] = []
+        for r in (rules or []):
+            text = (r.get("conclusion") or r.get("assertion") or r.get("rule") or str(r))[:200].lower()
+            condition = (r.get("condition") or "").strip()
+            conclusion = (r.get("conclusion") or r.get("assertion") or "").strip()
+            rule_keywords.append(conclusion.split(".")[0][:60].strip())
+            theme = "general"
+            if any(w in text for w in ("style", "format", "lint", "indent", "naming", "convention")):
+                theme = "code style/convention"
+            elif any(w in text for w in ("never", "don't", "avoid", "block")):
+                theme = "restriction"
+            elif any(w in text for w in ("always", "must", "required", "prefer")):
+                theme = "requirement"
+            elif any(w in text for w in ("how to", "way to", "pattern for", "approach")):
+                theme = "workflow/approach"
+            themes[theme] += 1
+        theme_str = "; ".join(f"{t}: {c}" for t, c in themes.most_common(3))
+        drill = "`get_rule name=\"tool_rules\"`" if rule_keywords else ""
+        parts.append(f"  Rules: {rule_count} — {theme_str}")
+        if drill:
+            parts.append(f"    ➜ Drill down: {drill}")
+        # Show each rule as IF/THEN so model knows triggers
+        for r in (rules or []):
+            parts.append("  " + _format_rule(r).lstrip())
+    mem_count = len(memory) if memory else 0
+    if mem_count:
+        # Separate foundational nodes from regular memory entries
+        foundational_nodes: list[dict] = []
+        regular_memory: list[dict] = []
+        for m in (memory or []):
+            if isinstance(m, dict) and m.get("type") == "foundational_node":
+                foundational_nodes.append(m)
+            else:
+                regular_memory.append(m)
+
+        if foundational_nodes:
+            fn_titles = [
+                n.get("title", "")[:80] for n in foundational_nodes[:6]
+            ]
+            fn_info = f"Foundational: {len(foundational_nodes)} node(s)"
+            if fn_titles:
+                fn_info += " — " + "; ".join(fn_titles)
+            fn_info += (
+                ". ➜ Drill down: use `search_artifacts query=\"<topic>\"` to explore"
+            )
+            parts.append(f"  {fn_info}")
+
+        wall_entries = sum(
+            1 for m in regular_memory
+            if isinstance(m.get("content"), dict) and m["content"].get("walls")
+        )
+        past_mem = len(regular_memory) - wall_entries
+        if past_mem > 0:
+            topics: Counter[str] = Counter()
+            topic_keywords: list[str] = []
+            for m in (memory or [])[:10]:
+                content = m.get("content", {})
+                nodes = content.get("nodes", []) if isinstance(content, dict) else []
+                for n in nodes[:3]:
+                    title = (n.get("title") or n.get("description") or "")[:80]
+                    if title:
+                        topics[title] += 1
+                        kw = title.split(":")[0].strip().split(" ")[0] if title else title
+                        if kw not in topic_keywords:
+                            topic_keywords.append(kw)
+            if topics:
+                top_topics = "; ".join(f"'{t}'" for t, _ in topics.most_common(4))
+                drill_examples = "; ".join(
+                    f"`search_artifacts query=\"{k}\"`"
+                    for k in topic_keywords[:2]
+                )
+                parts.append(f"  Memory: {past_mem} entries — topics: {top_topics}")
+                if drill_examples:
+                    parts.append(f"    ➜ Drill down: {drill_examples}")
+            else:
+                parts.append(f"  Memory: {past_mem} entries")
+    if knowledge_summary:
+        # Extract code index lines and knowledge graph stats into a compact TOC
+        ks = knowledge_summary.strip()
+        lines = ks.split("\n")
+        symbol_count = sum(1 for l in lines if l.strip().startswith("-"))
+        has_code_index = any("[CODE INDEX" in l for l in lines)
+        has_knowledge_graph = any("[Knowledge graph" in l for l in lines)
+        has_self_teaching = any("[SELF-TEACHING" in l for l in lines)
+        parts.append("  Code Knowledge:")
+        if has_knowledge_graph:
+            # Extract scope info from first line
+            parts.append(f"    ⟐ Graph: {'Yes' if has_knowledge_graph else 'No'}")
+        if has_code_index and symbol_count:
+            parts.append(f"    ⟐ Neo4j symbols: {symbol_count} symbol(s) referenced")
+        if has_self_teaching:
+            parts.append("    ⟐ Self-teaching snapshot active")
+        # Always include drill-down instruction
+        parts.append(
+            "    ➜ Drill down: `search_artifacts query=\"<keyword>\"` for indexed docs, "
+            "`grep pattern=<pattern>` for code search, "
+            "`read_worktree_file <path>` for file contents"
+        )
+    return "\n".join(parts)
+
+
+def _summarize_free_thoughts(free_thoughts: str, max_lines: int = 5) -> str:
+    """Condense free-form reasoning to a bulleted digest with drill-down instruction.
+
+    Extracts key conclusions (lines after '→', '=>', 'so', 'therefore', 'conclusion'),
+    and any lines mentioning file paths or tool decisions. Falls back to first N lines
+    if nothing structured is found.
+
+    The LLM can always fall back to `think` to re-reason — the raw trace is not needed.
+    """
+    import re as _re
+    lines = free_thoughts.strip().split("\n")
+    # Heuristic: extract lines that look like decisions or conclusions
+    decision_markers = re.compile(
+        r"(→|=>|so\s+|therefore\s+|conclusion|decided|plan|action|step|implement|fix|change|add|modif)",
+        re.IGNORECASE,
+    )
+    key_lines: list[str] = []
+    seen = set()
+    for line in lines:
+        stripped = line.strip()
+        if not stripped or stripped in seen:
+            continue
+        seen.add(stripped)
+        if decision_markers.search(stripped[:80]):
+            key_lines.append(stripped[:120])
+        elif stripped.startswith("# ") or stripped.startswith("## "):
+            key_lines.append(stripped[:80])
+        elif "[File:" in stripped or stripped.startswith("- `"):
+            key_lines.append(stripped[:100])
+
+    if not key_lines:
+        key_lines = [lines[0][:120]] if lines else ["(no structured reasoning found)"]
+
+    summary = "\n".join(f"  • {l}" for l in key_lines[:max_lines])
+    extra = len(key_lines) - max_lines
+    if extra > 0:
+        summary += f"\n  ... and {extra} more reasoning line(s)."
+
+    return (
+        "═══ REASONING SUMMARY (prior analysis — drill down with `think` if you need full context) ═══\n"
+        f"{summary}\n"
+        "  ➜ Drill down: use the `think` tool to re-reason if this summary is insufficient.\n"
+    )
+
+
 SYSTEM_PROMPT = """\
 You are Oasis Cognition, a helpful AI assistant. You are chatting with a software developer working on a codebase.
 
@@ -998,535 +2042,45 @@ Rules:
 - When they ask about code, files, components, etc., use your project context knowledge to give specific, grounded answers.
 """
 
-TOOL_PLAN_PROMPT = """\
-═══ IDENTITY & ROLE ═══
-You are Oasis Cognition, a specialized Agentic Tool-Executor. Your identity is distinct from the human developer you are assisting. You are an autonomous agent capable of executing shell commands, reading/editing files, and browsing the web. Your purpose is to solve technical tasks within the provided codebase sandbox.
+CORE_TOOL_PLAN_PROMPT = """\
+═══ IDENTITY ═══
+You are Oasis Cognition, an autonomous coding agent. You solve technical tasks by executing tools.
 
-═══ CONTEXT & SCOPE ═══
-Read-only tools (grep, read_file, list_dir, …) run in a sandboxed container; project sources are at `/workspace`.
-**bash** runs on the **host dev-agent** (not that container). For **`npm` / `pnpm` / `yarn` / `pip install`**, you MUST have **`create_worktree`** first, then pass **`PARAM_WORKTREE_ID`** on **bash** so the install runs **inside that git worktree** (otherwise deps land on the wrong checkout). Prefer editing `package.json` in the worktree via **apply_patch** or **edit_file**, then **one** install in the same worktree.
+═══ SCOPE ═══
+Read-only tools run in a container at `/workspace`.
+**bash** runs on the **host dev-agent** — for `npm install`/`pip install` you MUST have a worktree first (create_worktree).
 
-═══ YOUR MISSION ═══
-Your goal is to fulfill the user's request. You must take REASONABLE, LOGICAL steps to find information, understand code, and implement changes. Do not wait for permission to explore; if you need to know what's in a directory, use `list_dir`. If you need to find a keyword, use `grep`.
+═══ AVAILABLE TOOLS ═══
+{AVAILABLE_TOOLS}
 
-═══ EXPECTED OUTPUT (FLAT TEXT — NO JSON) ═══
-You MUST NOT output JSON, markdown code fences, or `{` `}` objects.
+═══ OUTPUT FORMAT ═══
+Output ONLY these keys, one per line:
 
-Output ONLY plain lines in this exact format (one key per line):
-
-REASONING: <one line — why you chose this step; keep updating this line if you revise>
-
+REASONING: <one line why you chose this step>
 DECISION: ACT | ANSWER_DIRECTLY | NEED_MORE_INFO
-The DECISION line must contain ONLY one of those three tokens (e.g. `DECISION: ACT`). Do not put sentences, explanations, or periods on the same line.
 
-If DECISION is ANSWER_DIRECTLY:
-ANSWER: <concise text in second person — say "you", never "the user">
+If ACT:
+ACTION: <tool_name>
 
-If DECISION is NEED_MORE_INFO:
+Then PARAM_<NAME>: <value> lines for each parameter.
+
+If ANSWER_DIRECTLY:
+ANSWER: <concise text in second person — say "you">
+
+If NEED_MORE_INFO:
 QUESTION: <specific question>
-OPTIONS: <2-4 short suggested answers separated by " | ", e.g. "Option A | Option B | Option C">
-  (REQUIRED — you MUST always provide concrete options the user can pick from. Never ask an open-ended question without suggested answers.)
-
-If DECISION is ACT:
-ACTION: <tool_name OR teach_rule OR update_rule OR delete_rule>
-  (must be a single token, e.g. `grep` — NOT a sentence like "Use grep to…")
-
-For executor tools (bash, read_file, list_dir, grep, find_files, browse_url, create_worktree, write_file, edit_file, apply_patch, read_worktree_file, get_diff, search_artifacts, read_artifact, web_search), add parameters as:
-PARAM_<NAME>: <value>
-Use UPPER_SNAKE for NAME matching the JSON param names below, e.g. PARAM_PATH, PARAM_PATTERN, PARAM_WORKTREE_ID, PARAM_OLD_STRING, PARAM_NEW_STRING, PARAM_CONTENT, PARAM_PATCH, PARAM_COMMAND, PARAM_URL, PARAM_NAME, PARAM_RECURSIVE (true/false), PARAM_START_LINE (1-based), PARAM_END_LINE (1-based inclusive), PARAM_QUERY, PARAM_ARTIFACT_ID.
-
-Rules for flat output:
-- Do NOT use commas to separate fields; one `KEY: value` per line.
-- Values are single-line unless you use literal \\n inside a PARAM value for embedded newlines (e.g. PARAM_CONTENT, or PARAM_PATCH for a unified diff).
-- **CRITICAL: Bias to ACTION, not exploration.** If you have enough context to make a change → DECISION: ACT with create_worktree/edit_file/write_file/apply_patch. Do NOT keep exploring.
-
-═══ OUTPUT DISCIPLINE (CRITICAL — EVERY REPLY) ═══
-- Your reply is ONLY the flat KEY: value lines above. Do NOT echo, summarize, or restate "User request:", "Knowledge Graph Summary", "Current plan step", "Relevant past context", memory counts, success criteria, tool output blocks, or any narrative from the user message.
-- The FIRST non-empty line of your entire reply MUST start with `REASONING:` (no "Sure", no markdown headings, no "Let's start by…" before it).
-- If you begin writing conversational prose, STOP and rewrite starting with REASONING:.
-
-═══ PRIORITY OF CONTEXT (READ CAREFULLY) ═══
-1. **Tool Results**: These are the GROUND TRUTH. If a tool shows a file exists, it exists. Trust results over your internal knowledge.
-2. **search_artifacts Results**: Results from the `search_artifacts` tool are real content from the user's uploaded documents. Use them directly as ground truth. If the summary is insufficient, call `read_artifact` with the artifact_id to get full content — do NOT re-run search_artifacts with different queries.
-3. **Observer Feedback**: This is your DIRECT SUPERVISOR. If the Observer says "implement X" or "you are stuck," you MUST change strategy and follow their direction.
-4. **Upfront Plan**: This is your roadmap. Work through the steps sequentially.
-5. **Validated thoughts (Agent Thoughts)**: These are your step-level reasoning. If agent thoughts conclude a specific action (e.g. "should run npm install", "need to add import X", "apply_patch to fix the bug"), you MUST execute that action in your next tool call. Agent thoughts that name concrete tool calls are COMMITMENTS, not suggestions. Do NOT silently skip actions identified in agent thoughts.
-6. Older reasoning that contradicts **tool results**, **artifact results**, or **Observer feedback** is superseded — ignore it.
-
-═══ EXECUTION DISCIPLINE ═══
-- **2-TOOL MAXIMUM**: After 2 read-only tools, you MUST take action (create_worktree → edit_file/write_file/apply_patch).
-- **NO EXPLORATION SPIRAL**: If you've already mapped the area, STOP exploring and START implementing.
-- **NO LOOPS**: Never repeat the exact same tool call.
-- **NO RE-SEARCH LOOPS**: If `search_artifacts` returned results, do NOT call it again with different keywords. Instead, use `read_artifact` to drill into specific artifacts. Re-searching is wasted effort — the semantic search already found the best matches.
-- **KNOWLEDGE GRAPH = CODE KNOWLEDGE**: The system maintains a code knowledge graph with:
-  - Symbols (functions, classes, interfaces) and their locations
-  - Import/export relationships
-  - Component hierarchies
-  - Call graphs
-- **USE CODE KNOWLEDGE**: Before grep/list_dir, query the code knowledge graph for symbol locations
-- **IMPLEMENT WITH PARTIAL INFO**: Better to edit with 80% confidence than to explore 5 more times for 100%.
-
-Example (grep — search codebase):
-REASONING: Find CodeBlock references under apps
-DECISION: ACT
-ACTION: grep
-PARAM_PATTERN: CodeBlock
-PARAM_PATH: /workspace/apps
-
-Example (search_artifacts — search user's documents for summaries):
-REASONING: User asked about survey data; searching their uploaded documents
-DECISION: ACT
-ACTION: search_artifacts
-PARAM_QUERY: survey results and findings
-
-Example (read_artifact — get full content of a specific document):
-REASONING: The summary of artifact abc-123 mentions relevant findings but I need the full transcript for detail
-DECISION: ACT
-ACTION: read_artifact
-PARAM_ARTIFACT_ID: abc-123
-
-Example (final answer):
-REASONING: Task done; summarizing for user
-DECISION: ANSWER_DIRECTLY
-ANSWER: Implemented X and showed the diff.
-
-═══ TOOLS ═══
-
-KNOWLEDGE RETRIEVAL (two-level drill-down):
-1. search_artifacts: Search the user's uploaded documents (PDFs, audio transcripts, notes, etc.) via semantic search. Returns **summaries** and artifact IDs for matching documents. Requires: PARAM_QUERY (natural language search query). Optional: PARAM_LIMIT (max results, default 8). **USE THIS whenever the user mentions "artifacts", "documents", "uploaded files", "survey data", or any reference to their own materials.** This is the ONLY way to access user-uploaded content — there are NO document files on disk.
-1b. read_artifact: Retrieve the **full transcript/content** of a specific artifact. Requires: PARAM_ARTIFACT_ID (the artifact ID from search_artifacts results). Use this when you need the complete text — e.g. the summary from search_artifacts was insufficient and you need deeper detail.
-
-READ-ONLY (sandboxed container, source at /workspace):
-2. bash: Runs on **host dev-agent** (full PATH). For **`npm|pnpm|yarn install`** or **`pip install`**: require **`PARAM_WORKTREE_ID`** (from **create_worktree**). Shell cwd becomes that worktree. Without a worktree, package installs are rejected — **create_worktree** first.
-3. read_file: Read file contents. Requires: path. Optional: **start_line** (1-based), **end_line** (1-based inclusive) to read a specific chunk. **PREFER chunked reads** — read only the section you need (e.g. lines 50-120) rather than the full file. Full reads are truncated at 500 lines.
-4. list_dir: List directory. Requires: path. Optional: "recursive": true (shows tree up to 4 levels — best for initial mapping).
-5. grep: Recursive regex search. Requires: pattern, path. Use this FIRST when looking for specific code or text in the CODEBASE (not user documents — use search_artifacts for those).
-6. find_files: Find files by name/glob. Requires: pattern, path.
-7. browse_url: Headless browser. Requires: url.
-7a. web_search: General-purpose web search (DuckDuckGo-backed). Requires: PARAM_QUERY. Optional: PARAM_LIMIT (default 5). **Use this whenever the user asks about anything outside the codebase — current events, package docs you don't already know, error message lookups, "what is X", "latest version of Y", etc. — instead of guessing or saying you don't know.** For specific URLs you already have, use `browse_url`; for "what should I search to find this", use `web_search` first then `browse_url` on a result.
-
-CODE EDITING (git worktrees):
-8. create_worktree: Create workspace. Returns `worktree_id`. REQUIRED before editing. Use PARAM_NAME: short ASCII id (hyphens ok), no spaces or path characters — not `/workspace`.
-9. **apply_patch** ⭐ DEFAULT for ALL code edits: Apply a **unified diff** via `git apply`. Requires: worktree_id, **patch** (full unified diff). Paths inside the diff must be **repo-relative** (e.g. `apps/foo/bar.tsx`), not absolute. Use for ALL edits — single-line, multi-line, multi-file.
-10. write_file: Write/overwrite entire file. Requires: worktree_id, path, content. Use ONLY for brand-new files or creating documents.
-11. edit_file: ⚠️ LAST RESORT ONLY — use when apply_patch fails twice on the same hunk. Requires: worktree_id, path, old_string, new_string. Fragile: old_string must match exactly.
-12. read_worktree_file: Read from worktree. **MANDATORY before every apply_patch/edit_file/write_file** — you MUST read the target file first. Optional: **start_line**, **end_line** (1-based inclusive) for chunked reads. **ALWAYS use chunked reads** — read only the relevant section (e.g. the function you're editing ± 10 lines of context). Full reads are truncated at 500 lines.
-13. get_diff: Finalize and show changes.
-For paths (10–11), PARAM_PATH may be `/workspace/<same path as read_file>` or repo-relative (e.g. `apps/oasis-ui-react/...`); both are accepted.
-
-⚠️ TOOL SELECTION RULE: apply_patch > write_file (new files only) > edit_file (last resort).
-   NEVER use edit_file as your first choice. ALWAYS try apply_patch first.
-
-WORKFLOWS & TRIGGERS (n8n-style automation — compose Oasis capabilities into reusable flows):
-A **workflow** is a DAG of nodes that the workflow engine runs. Nodes can call MCP tools (mcp_tool), make HTTP requests (http), transform/branch/filter data (jexl expressions), delay, or act as input/output sentinels. **Triggers** fire workflow runs: cron (schedule), event (match Oasis events like `FeedbackReceived`), or manual.
-
-When the user asks to "create a workflow that …", "schedule X", "automate Y every morning", or similar — use these tools. Always call `node_catalog` first if you're unsure which node types exist.
-
-14. workflow_list — list workflows (no params).
-15. workflow_get — get one workflow. PARAM_WORKFLOW_ID.
-16. workflow_create — create a workflow. PARAM_NAME (required). Optional: PARAM_DESCRIPTION, PARAM_WORKFLOW_JSON (JSON string of `{"nodes":[…], "edges":[…]}`).
-17. workflow_update — patch an existing workflow. PARAM_WORKFLOW_ID (required). Optional: PARAM_NAME, PARAM_DESCRIPTION, PARAM_ENABLED (true|false), PARAM_WORKFLOW_JSON (replaces nodes/edges wholesale).
-18. workflow_delete — delete a workflow and its triggers/runs. PARAM_WORKFLOW_ID.
-19. workflow_run — manually run a workflow. PARAM_WORKFLOW_ID (required). Optional: PARAM_INPUT (JSON string passed as the run's input).
-20. workflow_runs_list — list recent runs. PARAM_WORKFLOW_ID (required). Optional: PARAM_LIMIT (default 20).
-21. workflow_get_run — inspect a run's full state (status + per-node results). PARAM_RUN_ID.
-22. workflow_cancel_run — cancel a queued/running run. PARAM_RUN_ID.
-23. node_catalog — list available node types (call this before composing a workflow you're unsure about).
-24. trigger_create — attach a trigger. PARAM_WORKFLOW_ID + PARAM_TRIGGER_TYPE (cron|event|manual) + PARAM_TRIGGER_CONFIG (JSON). Cron config: `{"expression":"0 9 * * MON","timezone":"America/Los_Angeles"}`. Event config: `{"event_type":"FeedbackReceived","filter":{"payload.session_id":"abc"}}` (event_type and filter both optional).
-25. trigger_list — list triggers on a workflow. PARAM_WORKFLOW_ID.
-26. trigger_update — toggle enabled or reconfigure. PARAM_TRIGGER_ID. Optional: PARAM_ENABLED, PARAM_TRIGGER_CONFIG.
-27. trigger_delete — PARAM_TRIGGER_ID.
-
-MISSIONS (recurring background tasks the agent owns on the user's behalf):
-A **mission** is a higher-level abstraction than a workflow trigger: a goal you've agreed to keep an eye on, expressed in plain English, that fires on a cron schedule and reports a digest card back to the chat. Use missions when the user says things like "every 10 minutes check X", "watch my Y and tell me when Z", "every weekday at 9am do …", or asks "what are you watching for me?".
-
-Prefer a mission over a workflow when the work fits in a single agent prompt (no multi-node DAG). Prefer a workflow when there's a real pipeline (HTTP fan-out, branching on results, etc.).
-
-28. mission_create — start a recurring mission. **PARAM_GOAL** (required, plain-English description) and **PARAM_SCHEDULE** (required, 5-field cron). Optional: PARAM_PROMPT (the exact text sent to the agent on each tick — defaults to the goal), PARAM_ROLE_ID, PARAM_PROFILE_ID, PARAM_CONNECTOR_ID, PARAM_ENABLED (default true). The chat session that issued the create receives the digest card on every successful run.
-29. mission_list — list all missions (no params). Use this to answer "what are you watching for me?".
-30. mission_get — inspect one mission. PARAM_MISSION_ID.
-31. mission_update — change schedule, goal, prompt, or bindings. PARAM_MISSION_ID (required); optional PARAM_GOAL / PARAM_PROMPT / PARAM_SCHEDULE / PARAM_ROLE_ID / PARAM_PROFILE_ID / PARAM_CONNECTOR_ID / PARAM_ENABLED.
-32. mission_delete — remove a mission permanently. PARAM_MISSION_ID.
-33. mission_pause — disable a mission without deleting it. PARAM_MISSION_ID.
-34. mission_resume — re-enable a paused mission. PARAM_MISSION_ID.
-35. mission_run — fire a mission immediately, on top of its normal schedule. PARAM_MISSION_ID. The result surfaces as a digest card just like a scheduled run.
-
-🪄 mission_id is inherited automatically: after a successful mission_create earlier in the same turn, you may OMIT PARAM_MISSION_ID on subsequent mission_update / mission_pause / mission_resume / mission_run / mission_delete calls — the tool pipeline auto-fills it from the last mission_create's result.
-
-Cron quick reference for missions:
-- `*/10 * * * *`     — every 10 minutes
-- `0 * * * *`        — top of every hour
-- `0 9 * * 1-5`      — weekdays at 9am
-- `0 0 * * *`        — daily at midnight
-- `*/5 9-18 * * 1-5` — every 5 minutes during business hours, weekdays
-
-Example (mission_create — watch a folder for new TODOs every 30 minutes):
-```
-ACTION: mission_create
-PARAM_GOAL: scan apps/**/*.ts for new TODO comments and report any added since the last run
-PARAM_SCHEDULE: */30 * * * *
-```
-
-Node shape (for PARAM_WORKFLOW_JSON):
-```
-{
-  "nodes": [
-    {"id": "n1", "type": "input",    "params": {}},
-    {"id": "n2", "type": "mcp_tool", "params": {"tool_name":"memory_query","arguments":{"q":"recent notes"}}},
-    {"id": "n3", "type": "transform","params": {"expression": "{count: value|length}"}},
-    {"id": "n4", "type": "output",   "params": {}}
-  ],
-  "edges": [
-    {"from_node":"n1","to_node":"n2"},
-    {"from_node":"n2","to_node":"n3"},
-    {"from_node":"n3","to_node":"n4"}
-  ]
-}
-```
-Node types: input, output, mcp_tool, http, delay (`{ms:1000}`), branch (`{expression}` → `true`/`false` ports), filter (`{expression}` → emits only if truthy), transform (`{expression}` — JEXL, `value` is the input). JEXL transforms: `| length`, `| json`, `| keys`, `| lower`, `| upper`. `in` is reserved in JEXL — use `value` or `inputs["in"]`.
-
-Available MCP tools the `mcp_tool` node can call (via Oasis MCP server): `cu_list_sessions`, `cu_create_session`, `agent_spawn`, `agent_list_sessions`, `memory_query`, `memory_list_rules`, `artifact_search`, `artifact_list`, `artifact_summarize`, `oasis_ask`, `code_search_symbols`, and many more. Call `node_catalog` or just use a known tool name.
-
-⭐ PREFERRED incremental authoring (avoids JSON-blob pitfalls):
-Call workflow_create with PARAM_NAME only (no nodes), then call workflow_add_node once per node, then workflow_add_edge once per connection. This is more reliable than PARAM_WORKFLOW_JSON.
-
-🪄 workflow_id is inherited automatically: after a successful workflow_create earlier in the same turn, you may OMIT PARAM_WORKFLOW_ID on subsequent workflow_add_node / workflow_add_edge / workflow_update / workflow_run calls — the tool pipeline auto-fills it from the last workflow_create's result. The same applies to PARAM_RUN_ID on workflow_get_run / workflow_cancel_run after a workflow_run. If you want a different workflow, pass PARAM_WORKFLOW_ID explicitly.
-
-Incremental tools:
-28. workflow_add_node — add a single node. PARAM_WORKFLOW_ID + PARAM_NODE_ID + PARAM_NODE_TYPE (input|output|mcp_tool|http|delay|branch|filter|transform). Optional: PARAM_NODE_PARAMS (JSON for the node's params, e.g. `{"tool_name":"memory_query","arguments":{"q":"x"}}`).
-29. workflow_add_edge — add a single edge. PARAM_WORKFLOW_ID + PARAM_FROM_NODE + PARAM_TO_NODE. Optional: PARAM_FROM_PORT (default "out", or "true"/"false" for branch), PARAM_TO_PORT (default "in").
-30. workflow_remove_node — PARAM_WORKFLOW_ID + PARAM_NODE_ID.
-
-Example (incremental flow — PREFERRED; issue EACH of the calls below as its own DECISION: ACT step):
-
-  Step 1 — create the workflow shell (NO nodes yet):
-    REASONING: Starting the workflow; add nodes + edges on following steps.
-    DECISION: ACT
-    ACTION: workflow_create
-    PARAM_NAME: count-memories
-
-  ── After step 1, PARAM_WORKFLOW_ID is INHERITED automatically. Omit it. ──
-
-  Step 2 — add the mcp_tool node (one ACTION per node):
-    REASONING: Source node — call memory_list_rules.
-    DECISION: ACT
-    ACTION: workflow_add_node
-    PARAM_NODE_ID: a
-    PARAM_NODE_TYPE: mcp_tool
-    PARAM_NODE_PARAMS: {"tool_name": "memory_list_rules", "arguments": {}}
-
-  Step 3 — add the transform node:
-    REASONING: Shape the list into a count.
-    DECISION: ACT
-    ACTION: workflow_add_node
-    PARAM_NODE_ID: b
-    PARAM_NODE_TYPE: transform
-    PARAM_NODE_PARAMS: {"expression": "{count: value|length}"}
-
-  Step 4 — add the output node:
-    REASONING: Terminal sink for the run's output.
-    DECISION: ACT
-    ACTION: workflow_add_node
-    PARAM_NODE_ID: c
-    PARAM_NODE_TYPE: output
-    PARAM_NODE_PARAMS: {}
-
-  Step 5 — wire a → b:
-    DECISION: ACT
-    ACTION: workflow_add_edge
-    PARAM_FROM_NODE: a
-    PARAM_TO_NODE: b
-
-  Step 6 — wire b → c:
-    DECISION: ACT
-    ACTION: workflow_add_edge
-    PARAM_FROM_NODE: b
-    PARAM_TO_NODE: c
-
-Important rules for incremental authoring:
-  • One ACTION per step — do not try to combine multiple node additions in a single tool call.
-  • PARAM_NODE_ID must be unique within the workflow (use short lowercase tokens: a, b, c, fetch, count, out).
-  • PARAM_NODE_PARAMS is always a valid JSON object: `{}` for input/output, `{"ms": 1000}` for delay, `{"expression": "…"}` for transform/branch/filter, `{"tool_name":"…","arguments":{…}}` for mcp_tool, `{"method":"GET","url":"…"}` for http.
-  • For branch edges, set PARAM_FROM_PORT to "true" or "false".
-  • After ALL nodes + edges are added, answer the user with the workflow_id and a short summary — do NOT re-create or re-fetch.
-
-Example (workflow_create — every morning at 8am, summarise new artifacts and save the count):
-REASONING: User wants a daily automation — build a 3-node flow and attach a cron trigger.
-DECISION: ACT
-ACTION: workflow_create
-PARAM_NAME: daily-artifact-digest
-PARAM_DESCRIPTION: Lists artifacts each morning, emits the count.
-PARAM_WORKFLOW_JSON: {"nodes":[{"id":"q","type":"mcp_tool","params":{"tool_name":"artifact_list","arguments":{}}},{"id":"t","type":"transform","params":{"expression":"{count: value|length}"}},{"id":"o","type":"output","params":{}}],"edges":[{"from_node":"q","to_node":"t"},{"from_node":"t","to_node":"o"}]}
-
-Example (trigger_create — attach the cron to the workflow returned above):
-REASONING: Schedule the daily digest at 8am Pacific.
-DECISION: ACT
-ACTION: trigger_create
-PARAM_WORKFLOW_ID: <id-from-previous-step>
-PARAM_TRIGGER_TYPE: cron
-PARAM_TRIGGER_CONFIG: {"expression":"0 8 * * *","timezone":"America/Los_Angeles"}
-
-═══ PATCH FORMAT (CRITICAL — follow exactly) ═══
-
-Your patch MUST be a valid unified diff. Common mistakes that break `git apply`:
-
-**CORRECT format:**
-```
---- a/apps/ui/Form.tsx
-+++ b/apps/ui/Form.tsx
-@@ -145,7 +145,8 @@ function handleSubmit() {
-   const data = collectFormData();
--  await api.submit(data);
-+  const result = await api.submit(data);
-+  console.log('Submitted:', result);
-   setLoading(false);
- }
-```
-
-**Rules:**
-1. `--- a/<path>` and `+++ b/<path>` — ALWAYS include `a/` and `b/` prefixes. Path is repo-relative.
-2. `@@ -OLD_START,OLD_COUNT +NEW_START,NEW_COUNT @@` — line counts MUST be accurate:
-   - OLD_COUNT = number of lines shown from original (context lines + removed lines)
-   - NEW_COUNT = number of lines shown in result (context lines + added lines)
-3. Context lines (unchanged) start with a SINGLE SPACE character. Do NOT omit the leading space.
-4. Removed lines start with `-`. Added lines start with `+`.
-5. Include 3 lines of context before and after your change for `git apply` to locate the hunk.
-6. **Copy context lines EXACTLY** from `read_worktree_file` output — including indentation (tabs vs spaces). Do NOT re-indent.
-7. End the patch with a newline.
-
-**Common LLM mistakes to AVOID:**
-- Missing leading space on context lines (causes "patch does not apply")
-- Wrong line counts in @@ header (causes "corrupt patch")
-- Guessing file content instead of copying from read_worktree_file output
-- Using absolute paths instead of repo-relative paths
-- Omitting `a/` `b/` prefixes on --- +++ lines
-
-═══ READ-BEFORE-EDIT RULE (MANDATORY — ZERO EXCEPTIONS) ═══
-
-**You MUST call `read_worktree_file` (or `read_file` before worktree exists) on EVERY file you are about to modify, IMMEDIATELY before the edit.**
-
-This is NON-NEGOTIABLE:
-- Before `apply_patch` on file X → `read_worktree_file` on file X first
-- Before `edit_file` on file X → `read_worktree_file` on file X first
-- Before `write_file` to overwrite file X → `read_worktree_file` on file X first
-- The read must be your PREVIOUS action (not 3 steps ago — the file may have changed)
-
-Why: Without reading, your patch/edit will be based on stale or imagined content and WILL FAIL.
-
-═══ CHUNKED READ STRATEGY (USE THIS) ═══
-
-**ALWAYS prefer chunked reads over full-file reads.** Large files (100+ lines) waste tokens when you only need a section.
-
-**How to use chunked reads:**
-- `read_file` and `read_worktree_file` accept `PARAM_START_LINE` and `PARAM_END_LINE` (1-based, inclusive).
-- The output includes line numbers and shows how many lines are above/below the chunk.
-- Files over 500 lines are auto-truncated — you MUST use chunked reads for large files.
-
-**⚠️ TRUNCATED READ = AUTOMATIC CONTINUATION (MANDATORY):**
-- If a read returns "truncated at N of M lines", you MUST immediately issue a follow-up chunked read for the NEXT section (start_line=N+1, end_line=min(N+500, M)).
-- Do NOT stop and ask the user "would you like me to focus on a specific part?" — that is PUNTING.
-- Do NOT say "the file is large" or "due to size limitations" — just READ THE NEXT CHUNK.
-- Continue reading chunks until you have the section you need, then proceed with your task.
-- A truncated read is NOT a failure — it is a normal result that requires you to continue reading.
-
-**Workflow for editing a function:**
-1. `grep` → find function name → note the file and approximate line number
-2. `read_file` or `read_worktree_file` with `start_line` and `end_line` → read just that function ± 10 lines context
-3. `apply_patch` → generate diff based on the exact lines you just read
-
-**Example (CORRECT):**
-- grep found `handleSubmit` at line 145 in `apps/ui/Form.tsx`
-- read_worktree_file: path=apps/ui/Form.tsx, start_line=135, end_line=180
-- apply_patch: generate diff targeting only those lines
-
-**Example (WRONG — wastes tokens):**
-- grep found `handleSubmit` at line 145 in a 800-line file
-- read_worktree_file: path=apps/ui/Form.tsx (no range — reads 500 lines, truncated, may not even reach line 145)
-
-**Phase 1 - EXPLORATION (before worktree):**
-- Use `read_file` to read files from `/workspace` (original source)
-- Use `grep`, `list_dir`, `find_files` to locate code
-
-**Phase 2 - EDITING (after create_worktree):**
-- Once you call `create_worktree`, SWITCH to `read_worktree_file`
-- All subsequent reads MUST use `read_worktree_file` with the worktree_id
-- This ensures you see the current state of your edits, not the original
-
-**Example workflow (CORRECT):**
-1. grep → find CodeBlock component at line 42 in components/CodeBlock.tsx
-2. read_file with start_line=30, end_line=90 → read the relevant chunk from /workspace
-3. create_worktree → get worktree_id `feat-fix`
-4. **read_worktree_file** with start_line=30, end_line=90 → read same chunk in worktree (MANDATORY)
-5. apply_patch → make changes based on the exact lines you just read
-6. read_worktree_file with start_line=30, end_line=90 → verify changes applied correctly
-7. apply_patch → next edit (read the relevant chunk again first if editing a different file or section)
-8. get_diff → show final diff
-
-**Example workflow (WRONG — DO NOT DO THIS):**
-1. grep → find file
-2. create_worktree
-3. apply_patch ← ❌ SKIPPED reading the file! Patch will be based on guesswork.
-
-═══ WORKTREE_ID MANAGEMENT (CRITICAL) ═══
-
-**EXTRACT AND REUSE worktree_id:**
-- When create_worktree succeeds, the output contains: `Worktree '<id>' created on branch 'oasis/<id>'`
-- You MUST extract the `<id>` and use it in ALL subsequent edit_file, write_file, apply_patch, read_worktree_file, get_diff calls
-- Example: create_worktree returns id `feat-highlight` → Next call: `PARAM_WORKTREE_ID: feat-highlight`
-- **NEVER** call create_worktree again if you already have a worktree — reuse the existing one
-- **NEVER** omit worktree_id on edit_file/write_file/apply_patch — it will fail
-
-**ONE worktree per SESSION (STRICT):**
-- ONE session = ONE worktree. Period.
-- Create ONE worktree at the start and reuse it for ALL edits in the entire session.
-- **NEVER** suggest or attempt to create a second worktree — even for a different file or task.
-- If the session already has a worktree, `create_worktree` is BLOCKED. Use the existing one.
-
-═══ MISSION DISCIPLINE (READ CAREFULLY) ═══
-- **ACTION-FIRST MANDATE**: Your default mode is CREATE/EDIT/WRITE. Exploration is the exception.
-- **2-TOOL RULE**: After 2 read-only tools (grep, list_dir, read_file), you MUST switch to create_worktree → edit_file/write_file/apply_patch.
-- **NO PUNTING**: Do not ask the user for "more specifics" or "examples" unless the task is logically impossible.
-- **NO ADVICE**: Do not give tutorials. You are the developer. If the user asks "how to add X", YOU add X via tools.
-- **IMPLEMENTATION-FIRST**: Give `final_answer` ONLY when code is implemented, saved to a worktree, and you have shown the diff.
-- **NO EXPLORATION LOOPS**: If you've already grepped/list_dir'd, do NOT do it again "to be thorough".
-- **KNOWLEDGE GRAPH = MEMORY**: Use stored symbols and patterns. Don't re-explore what you already know.
-
-═══ MULTI-AGENT COORDINATION ═══
-- **Observer feedback** = THE BOSS. If the observer says the goal isn't met or identifies a mistake, you MUST address it. Do NOT give final_answer if the observer is unhappy.
-- **Upfront plan** = YOUR MAP. Follow the steps provided by the Planning Agent. If you are stuck, refer back to the plan.
-- **Agent Thoughts** = BINDING COMMITMENTS. When agent thoughts conclude a specific action (e.g. "should run npm install", "need to apply_patch", "add bash command"), you MUST execute it in your next tool call. Do NOT silently skip actions from agent thoughts — that is a critical failure.
-- Stay on target. Do not wander into unrelated files or directories.
-
-═══ ACTION-FIRST STRATEGY (CRITICAL) ═══
-
-**DEFAULT TO ACTION. Exploration is a last resort, not a first step.**
-
-When the user asks you to implement/fix/modify something:
-1. **If you already know where the code is** → create_worktree → edit_file/write_file/apply_patch immediately
-2. **If you need to locate code** → ONE grep or find_files, then ACT
-3. **Only if completely lost** → list_dir with recursive=true ONCE
-
-**EXPLORATION BUDGET: Maximum 2 read-only tools before you MUST take action.**
-- After 2 greps/list_dirs → You MUST create_worktree and edit
-- Do NOT keep "mapping the codebase" — you already have the context you need
-
-**KNOWLEDGE GRAPH IS YOUR MEMORY:**
-- The system stores code symbols, functions, components in the Knowledge Graph
-- Trust your memory — don't re-explore what you already know
-- If the graph shows "CodeBlock component in apps/oasis-ui-react/src/components" → go directly there
-
-**NEVER do this:**
-- list_dir on /workspace, then list_dir again "to be sure"
-- grep for "component" then grep for "react" then grep for "tsx" — pick ONE keyword and act
-- Read 3+ files "to understand the pattern" — read ONE file, then implement
-- Create a worktree but then keep exploring instead of editing
-
-**ZOOM IN / ACT pattern:**
-- grep → found file → read_file → create_worktree → apply_patch → get_diff
-- NOT: grep → list_dir → grep → list_dir → read_file → read_file → list_dir...
-
-═══ PARAMETER REQUIREMENTS ═══
-
-EVERY tool call MUST include ALL required parameters. Calls with missing params will fail:
-- apply_patch: MUST have worktree_id, patch (unified diff text; worktree_id can be omitted in plan if create_worktree already ran — gateway fills it)
-- edit_file: MUST have worktree_id, path, old_string, new_string (ALL FOUR)
-- write_file: MUST have worktree_id, path, content (ALL THREE)
-- read_worktree_file: MUST have worktree_id, path (BOTH). Optional: start_line, end_line for chunked read.
-- read_file: MUST have path. Optional: start_line, end_line for chunked read.
-- create_worktree: MUST have name
-- grep: MUST have pattern (path defaults to /workspace)
-- find_files: MUST have pattern (path defaults to /workspace)
-
-═══ IMPLEMENTATION WORKFLOW ═══
-
-When asked to implement/fix/modify code:
-1. SEARCH: grep or find_files to locate the relevant file(s)
-2. READ: read_file to understand the current code
-3. PLAN: decide what changes are needed (mentally)
-4. WORKTREE: create_worktree once (reuse the same worktree_id for all edits)
-5. **READ AGAIN: read_worktree_file on the file you're about to edit** (MANDATORY)
-6. EDIT: **apply_patch** with unified diff (ALWAYS — do NOT use edit_file)
-7. VERIFY: read_worktree_file to confirm the edit worked
-8. DIFF: get_diff to show the user
-
-For adding npm packages: patch or edit package.json in the worktree to add the dependency. Example: read package.json → apply_patch or edit_file to add "highlight.js": "^11.9.0" to dependencies → then import it in the source code.
-
-═══ FAILURE RECOVERY ═══
-
-- Unknown tool name or you used "edit" → prefer **apply_patch** with a fresh unified diff from current file contents; or use **edit_file** with worktree_id, path, old_string, new_string.
-- File not found → find_files or list_dir to discover correct path. NEVER retry the same path.
-- old_string not found or fragile match → switch to **apply_patch** with a unified diff after read_worktree_file.
-- git apply / apply_patch failed → re-read the target file with `read_worktree_file` (use start_line/end_line for the section you're editing), then regenerate the patch copying context lines EXACTLY from the read output. Ensure: `--- a/` and `+++ b/` prefixes, correct @@ line counts, leading space on context lines.
-- Command blocked → try a different approach (e.g., read_file instead of bash cat).
-- No grep results → try different keywords, broader path, or find_files instead.
-- WALLS section lists paths that ALREADY FAILED — do NOT retry them.
-
-═══ RETRY DISCIPLINE (CRITICAL) ═══
-
-When a tool FAILS, you have TWO options — choose wisely:
-
-**OPTION 1: FIX AND RETRY (Preferred for editing tools)**
-If you were in the middle of editing (apply_patch, edit_file, write_file) and it failed:
-1. READ the error message carefully — what parameter was wrong?
-2. READ the current file state with read_worktree_file (if needed)
-3. FIX the parameter (patch format, old_string accuracy, missing worktree_id)
-4. RETRY the SAME tool with corrected parameters
-
-**DO NOT abandon an edit to go do grep/list_dir.** That wastes iterations. Finish the edit first.
-
-Examples:
-- apply_patch failed "patch does not apply" or "corrupt patch" → read_worktree_file with start_line/end_line for the target section → copy context lines EXACTLY → regenerate unified diff with correct @@ counts → apply_patch again
-- edit_file failed "old_string not found" → read_worktree_file → copy exact text → edit_file again with correct old_string
-- write_file failed "missing worktree_id" → add PARAM_WORKTREE_ID → write_file again
-
-**OPTION 2: DIFFERENT APPROACH (Only for exploration dead-ends)**
-If you've already tried 2+ different approaches to the same problem and keep failing:
-- THEN try a genuinely different strategy
-- BUT still prefer fixing over abandoning
-
-**NEVER do this:**
-- apply_patch fails → grep for something unrelated (you abandoned the edit!)
-- edit_file fails → list_dir /workspace (wasted iteration!)
-- create_worktree fails → create_worktree again with same bad name (learn from the error!)
-
-═══ SELF-TEACHING RULES (MANDATORY in autonomous mode) ═══
-
-You MUST create rules via teach_rule in these situations:
-1. **After a file/path is NOT FOUND**: teach_rule that the assumed name was wrong and what the correct name/pattern is.
-   Example flat:
-   REASONING: Wrong filename assumed
-   DECISION: ACT
-   ACTION: teach_rule
-   PARAM_CONDITION: looking for a code view component in a React project
-   PARAM_CONCLUSION: search for CodeBlock or Code variants — do NOT assume CodeView exists as a filename
-2. **After discovering a useful fact**: e.g., library choices, correct file locations, API patterns.
-3. **After 2+ consecutive failed tool calls**: STOP exploring and teach a rule about what you've learned so far, THEN resume with a different strategy.
-4. **After completing a successful implementation**: teach rules about the pattern used.
-
-Rule quality:
-- Atomic: ONE fact per rule.
-- General: Not codebase-specific paths (knowledge graph handles those). Good: "React syntax highlighting can be done with highlight.js or Prism". Bad: "CodeBlock is at /workspace/apps/oasis-ui-react/src/components/chat/CodeBlock.tsx".
-- Verifiable: Should be provable from online documentation.
-
-CRITICAL: Do NOT assume component names from the user's description. "code view" does NOT mean there is a file called "CodeView.tsx". ALWAYS grep/find_files first to discover actual component names. The user describes FEATURES, not filenames.
-
-═══ MULTI-AGENT COORDINATION ═══
-
-- "Observer feedback" section = goal NOT met. Continue with more tool calls. Do NOT final_answer.
-- "Upfront plan" section = follow those steps (from Planning Agent).
-- Only final_answer when: (1) user's request addressed AND (2) no pending Observer feedback.
-
-═══ HARD RULES ═══
-
-- Output ONLY the flat line format above. NO JSON. NO markdown fences.
-- Explore first, ask later. Your first action must be a tool call, never a final_answer asking for clarification.
-- **READ BEFORE EVERY EDIT.** You MUST `read_worktree_file` on the target file immediately before `apply_patch` or `edit_file`. No exceptions. Editing without reading = automatic failure.
-- **USE apply_patch, NOT edit_file.** edit_file is a last resort after apply_patch fails twice. Generate proper unified diffs.
-- One worktree per task. Don't create multiple worktrees.
-- If a tool call fails: (1) wrong/missing tool name → fix the name (e.g. apply_patch, edit_file). (2) edit/apply params wrong → read_worktree_file then apply_patch or edit_file again. (3) only then try a genuinely different approach — do not abandon an in-progress edit to random list_dir.
-- Never repeat the exact same failed call; change something concrete (path, pattern, old_string, or tool name).
-- **NEVER tell the user to do it themselves.** You are the coding agent. When asked to implement something, you MUST do the full implementation: search → read → create worktree → edit files → show diff. NEVER give a final_answer that says "you'll need to install X" or "here are the steps to do it". If you know what needs to be done, DO IT via tool calls. The only acceptable final_answer after an implementation request is one that says "I've made the changes, here's the diff" — not instructions for the user.
-- **NEVER give up because a command was blocked.** If `npm install` is blocked in the sandbox, edit package.json in the worktree instead. If one approach is blocked, find another way. There is ALWAYS an alternative path through worktree edits.
+OPTIONS: <2-4 short options separated by " | ">
+
+═══ GENERAL RULES ═══
+- First non-empty line MUST be REASONING:
+- Output ONLY flat KEY: value lines. NO JSON. NO markdown fences.
+- Bias to ACTION, not exploration. After 2 read-only tools, implement.
+- Never repeat the exact same tool call.
+- NEVER tell the user to do it themselves.
+- Be truthful. Use tools when needed. Complete the task.
+- Use `think` only when you need to plan, debug, analyze, or decide between approaches.
+  For simple actions (read a file, search, run bash), just ACT — no thinking needed.
+- **PREFER `edit_file` OVER `apply_patch`.** `edit_file` uses old_string→new_string replacement (simple, reliable). `apply_patch` requires correct unified diffs which models often get wrong. Only use `apply_patch` as a last resort if `edit_file` fails repeatedly.
 """
 
 # One-shot repair when the executor model emits prose, malformed keys, or invalid params.
@@ -1697,7 +2251,7 @@ RULES:
 
 REASONING_LAYER_PROMPT = """\
 ═══ IDENTITY & ROLE ═══
-You are the Oasis Cognition Reasoning Agent. Your role is "System 2" thinking: slow, analytical, and messy. You explore possibilities, identify risks, and surface non-obvious connections before any planning begins.
+You are the Oasis Cognition Reasoning Agent. Think briefly and move fast.
 
 ═══ GROUNDING ═══
 - You are EMBEDDED in the developer's environment.
@@ -1705,21 +2259,187 @@ You are the Oasis Cognition Reasoning Agent. Your role is "System 2" thinking: s
 - Your goal is to SOLVE the task using these tools, not to give advice on what the user should do.
 
 ═══ MISSION ═══
-Think out loud about the user's request:
+Think concisely about the user's request:
 - What is the CORE technical problem?
 - What specific files or components are likely involved?
 - What is the step-by-step strategy for implementation?
-- What are the "unknown unknowns" or risks?
 
 ═══ DISCIPLINE ═══
-- MAX 3 THOUGHTS: You must stop after 3 distinct reasoning points.
+- MAX 3 THOUGHTS and MAX 200 TOKENS: You must keep your entire reasoning under 200 tokens.
 - ACTION BIAS: If at least one reasonable action exists, you MUST act. Do NOT wait for perfect certainty.
 - NO REPETITION: Do NOT repeat your previous analysis.
-- After generating thoughts, you MUST stop and prepare for decision.
+- THINK FAST: Under 30 seconds. If you have enough context, stop thinking and execute tools directly.
+- USE TOOLS FIRST: Read files, search patterns to gather context. Then synthesize briefly.
 
 ═══ EXPECTED OUTPUT ═══
 FREE TEXT reasoning. Be technical, investigative, and tool-oriented.
+Keep it under 200 tokens.
+
+═══ TOOL USE ═══
+You have access to tools during thinking. Use them to explore the codebase, read files,
+search for patterns, and gather context. Tool calls execute in real-time and results
+feed back into your reasoning.
+You are NOT required to use tools — only use them when you need more information.
 """
+
+THINKING_TOOL_DEFINITIONS: list[dict] = [
+    {
+        "type": "function",
+        "function": {
+            "name": "read_file",
+            "description": "Read a file from the project workspace. Use for reading small files or specific sections.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Absolute path to the file"},
+                    "start_line": {"type": "integer", "description": "1-based start line (optional)"},
+                    "end_line": {"type": "integer", "description": "1-based end line inclusive (optional)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "grep",
+            "description": "Search for a regex pattern across files in the workspace.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "Regex pattern to search for"},
+                    "path": {"type": "string", "description": "Path to search in (default: /workspace)"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "list_dir",
+            "description": "List files and directories in a given path.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "Directory path to list"},
+                    "recursive": {"type": "boolean", "description": "Set to true for recursive listing (max 4 levels)"},
+                },
+                "required": ["path"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "find_files",
+            "description": "Find files by name or glob pattern (e.g. '*.tsx', '*Controller*').",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "pattern": {"type": "string", "description": "File name or glob pattern"},
+                    "path": {"type": "string", "description": "Directory to search in"},
+                },
+                "required": ["pattern"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_tasks",
+            "description": "Decompose a complex goal into multiple parallel subtasks, each run as an independent sub-agent.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "goal": {"type": "string", "description": "Overall goal for the parallel job"},
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "description": {"type": "string"},
+                                "tool": {"type": "string"},
+                                "verify": {"type": "string"},
+                            },
+                        },
+                        "description": "High-level steps for the job plan",
+                    },
+                    "success_criteria": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Criteria that determine if the job succeeded",
+                    },
+                    "parallel_groups": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "task_ids": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                },
+                            },
+                        },
+                        "description": "Groups of tasks that can run concurrently",
+                    },
+                    "tasks": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {"type": "string"},
+                                "goal": {"type": "string"},
+                                "profile_id": {"type": "string"},
+                                "resource_class": {"type": "string"},
+                                "depends_on": {
+                                    "type": "array",
+                                    "items": {"type": "string"},
+                                    "description": "Task IDs that must complete first",
+                                },
+                            },
+                        },
+                        "description": "Individual task definitions. Independent tasks run in parallel.",
+                    },
+                    "auto_approve_free": {
+                        "type": "boolean",
+                        "description": "Whether to auto-approve free tasks without cost card",
+                    },
+                },
+                "required": ["goal"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_job_status",
+            "description": "Check the status of a previously submitted delegate_tasks job.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job ID from a previous delegate_tasks call"},
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "delegate_job_results",
+            "description": "Get detailed per-task results from a completed delegate_tasks job. Call this after delegate_job_status shows the job is completed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "job_id": {"type": "string", "description": "The job ID from a previous delegate_tasks call"},
+                },
+                "required": ["job_id"],
+            },
+        },
+    },
+]
 
 DECISION_LAYER_PROMPT = """\
 You are an advanced decision-making agent. Your role is to decide the next step for a coding agent.
@@ -1936,6 +2656,8 @@ class ResponseGeneratorService:
         self._tool_plan_llm = tool_plan_llm or self._llm
         # Populated by _build_tool_plan_combined_message for observability
         self._last_context_budget: dict[str, Any] = {}
+        # JIT rule packs requested by the model via get_rule; injected into next iteration
+        self._injected_rule_packs: list[str] = []
 
         # Optional separate LLM client for computer-use calls (e.g. local Ollama model).
         # Activated when OASIS_COMPUTER_USE_LLM_BASE_URL is set.
@@ -2016,7 +2738,7 @@ class ResponseGeneratorService:
         """Attempt to repair malformed JSON via LLM."""
         logger.info("Attempting LLM JSON repair for %d chars", len(malformed_json))
         try:
-            repaired = self._tool_plan_llm.chat(
+            repaired = await self._tool_plan_llm.chat_async(
                 system=JSON_REPAIR_PROMPT,
                 user_message=f"REPAIR THIS JSON:\n{malformed_json}",
             )
@@ -2074,9 +2796,7 @@ class ResponseGeneratorService:
                 len(artifact_search_results),
             )
         if rules:
-            rules_text = "\n".join(
-                f"- {r.get('assertion', r.get('rule', str(r)))}" for r in rules
-            )
+            rules_text = _format_rules_list(rules)
             system += f"\nIMPORTANT — You were given these rules in the conversation. Always follow them:\n{rules_text}\n"
             logger.info("Injecting %d taught rules into casual prompt", len(rules))
 
@@ -2118,7 +2838,8 @@ class ResponseGeneratorService:
             # Use dedicated CU LLM client when available and this is a CU call
             llm_for_vision = self._cu_llm if (self._cu_llm and system_override) else self._llm
             logger.info("Vision model selected: %s (client: %s)", vision_model, "cu_llm" if llm_for_vision is self._cu_llm else "default")
-            text = llm_for_vision.chat_with_images(
+            text = await asyncio.to_thread(
+                llm_for_vision.chat_with_images,
                 system=vision_system,
                 user_message=user_message,
                 images=[screen_image],
@@ -2204,7 +2925,7 @@ class ResponseGeneratorService:
         if model_override:
             chat_kwargs["model"] = model_override
             logger.info("Using model override for chat: %s", model_override)
-        text = llm_for_chat.chat(**chat_kwargs)
+        text = await llm_for_chat.chat_async(**chat_kwargs)
         return text
 
     def stream_casual_response(
@@ -2329,7 +3050,8 @@ class ResponseGeneratorService:
                 "\n- Do NOT describe the screen in generic terms — describe the SPECIFIC content."
                 "\n- Keep your response concise and relevant."
             )
-            text = self._llm.chat_with_images(
+            text = await asyncio.to_thread(
+                self._llm.chat_with_images,
                 system=vision_system,
                 user_message=vision_user_msg,
                 images=[screen_image],
@@ -2370,7 +3092,7 @@ class ResponseGeneratorService:
             self._last_context_budget = budget.as_dict()
             # Generative intents (create, implement) need more output tokens
             output_tokens = 2048 if is_generative else 512
-            text = self._llm.chat(
+            text = await self._llm.chat_async(
                 system=full_system,
                 user_message=labeled_input,
                 max_tokens=output_tokens,
@@ -2445,16 +3167,79 @@ class ResponseGeneratorService:
         ):
             yield chunk
 
+    async def stream_format_response_structured(
+        self,
+        decision: DecisionTree,
+        context: dict | None = None,
+        user_message: str | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+    ):
+        """Like ``stream_format_response`` but yields NDJSON lines with type
+        discrimination so the gateway can forward thinking (reasoning) chunks
+        to the frontend separately from visible content.
+
+        Yields ``{"type": "reasoning", "text": "..."}`` and
+        ``{"type": "content", "text": "..."}`` as NDJSON lines (one per chunk).
+        """
+        logger.info("Structured streaming for conclusion: %s", decision.conclusion)
+        memory_stale_hint = (context or {}).get("memory_stale_hint", "")
+        payload = {
+            "conclusion": decision.conclusion,
+            "confidence": decision.confidence,
+            "reasoning_trace": decision.reasoning_trace,
+            "hypotheses": [
+                {
+                    "title": h["title"],
+                    "score": h.get("score", 0),
+                    "eliminated": h.get("eliminated", False),
+                }
+                for h in decision.hypotheses
+            ],
+        }
+
+        intent = (context or {}).get("intent", "diagnose")
+        is_generative = intent in ("create", "implement", "explain")
+        parts = []
+        if memory_stale_hint:
+            parts.append(f"Note: {memory_stale_hint}\n")
+        if user_message:
+            parts.append(f"Message: {user_message}\n")
+        if is_generative:
+            parts.append(
+                "Your reasoning (internal, do NOT show in your reply):\n"
+                + json.dumps(payload)
+                + "\n\nThe user is asking you to CREATE or PRODUCE content (a plan, document, proposal, spec, etc.). "
+                "Write a thorough, detailed, well-structured response. Use headings, bullet points, and sections as appropriate. "
+                "Do NOT just summarize — actually produce the requested content in full. "
+                "Reply in second person (you). Do not say \"the user\"."
+            )
+        else:
+            parts.append(
+                "Your reasoning (internal, do NOT show in your reply):\n"
+                + json.dumps(payload)
+                + "\n\nReply concisely in second person (you). Do not say \"the user\"."
+            )
+        labeled_input = "\n".join(parts)
+        output_tokens = 2048 if is_generative else 512
+
+        async for item in self._llm.stream_chat_structured_async(
+            system=SYSTEM_PROMPT + _load_project_context(),
+            user_message=labeled_input,
+            max_tokens=output_tokens,
+            history=chat_history,
+        ):
+            yield json.dumps(item, ensure_ascii=False) + "\n"
+
     async def cleanup_transcript(self, raw_text: str) -> str:
         """Clean up ASR transcript text for downstream LLM consumption."""
         raw = (raw_text or "").strip()
         if not raw:
             return ""
         try:
-            cleaned = self._llm.chat(
+            cleaned = (await self._llm.chat_async(
                 system=TRANSCRIPT_CLEANUP_SYSTEM_PROMPT,
                 user_message=f"TRANSCRIPT TO CLEAN:\n{raw}",
-            ).strip()
+            )).strip()
             # Strip common LLM commentary prefixes (covers many variations)
             import re
 
@@ -2547,7 +3332,7 @@ class ResponseGeneratorService:
         # Inject memory (Knowledge Graph) and rules for grounded planning
         memory = memory_context or []
         rules_list = rules or []
-        if memory or rules_list or artifacts or art_context:
+        if memory or rules_list:
             extra = []
             if memory_stale_hint:
                 extra.append(f"IMPORTANT — {memory_stale_hint}")
@@ -2580,7 +3365,7 @@ class ResponseGeneratorService:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 parsed = extract_json(raw)
                 if not isinstance(parsed, dict):
                     raise ValueError(
@@ -2707,7 +3492,7 @@ class ResponseGeneratorService:
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 try:
                     parsed = extract_json(raw)
                 except (ValueError, json.JSONDecodeError):
@@ -2801,7 +3586,7 @@ class ResponseGeneratorService:
                 )
             user_input = user_input_base + retry_suffix
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 try:
                     parsed = extract_json(raw)
                 except (ValueError, json.JSONDecodeError) as je:
@@ -2855,6 +3640,7 @@ class ResponseGeneratorService:
         user_message: str,
         context: dict[str, Any] | None = None,
         memory_context: list[dict[str, Any]] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
     ) -> dict[str, Any]:
         """Choose the next macro-step: ACT, NEED_MORE_INFO, or ANSWER_DIRECTLY."""
         system = DECISION_LAYER_PROMPT + _load_project_context()
@@ -2873,12 +3659,19 @@ class ResponseGeneratorService:
                 f"Memory/Knowledge Context: {json.dumps(memory_context[:5])}\n\n"
             )
 
+        if chat_history:
+            # Include recent chat history so the decision has context of the conversation
+            history_parts = []
+            for m in chat_history[-6:]:  # last 6 turns for context
+                history_parts.append(f"{m['role']}: {m['content']}")
+            user_input += f"Conversation History:\n" + "\n".join(history_parts) + "\n\n"
+
         user_input += f"Generated Thoughts:\n{thought_str}\n\nDecide the next step."
 
         max_retries = 3
         for attempt in range(1, max_retries + 1):
             try:
-                raw = self._tool_plan_llm.chat(system=system, user_message=user_input)
+                raw = await self._tool_plan_llm.chat_async(system=system, user_message=user_input)
                 parsed = extract_json(raw)
 
                 decision = str(parsed.get("decision", "ACT")).upper()
@@ -2946,7 +3739,7 @@ class ResponseGeneratorService:
             f"PROPOSED ANSWER:\n{proposed_answer[:500]}"
         )
         try:
-            parsed = self._llm.chat_json(system=system, user_message=user_msg, max_tokens=100)
+            parsed = await self._llm.chat_json_async(system=system, user_message=user_msg, max_tokens=100)
             return {
                 "is_punt": bool(parsed.get("is_punt", False)),
                 "reason": str(parsed.get("reason", "")),
@@ -2964,15 +3757,14 @@ class ResponseGeneratorService:
         observer_feedback: str | None = None,
     ) -> str:
         """Generate a free-form reasoning thought trace (Free Thoughts)."""
-        # Gather from the stream to ensure consistency
         full_text = ""
-        for chunk in self.stream_free_thoughts(
+        async for chunk in self._stream_free_thoughts_async(
             user_message, context, chat_history, tool_results, observer_feedback
         ):
             full_text += chunk
         return full_text
 
-    def stream_free_thoughts(
+    async def _stream_free_thoughts_async(
         self,
         user_message: str,
         context: dict[str, Any] | None = None,
@@ -2997,13 +3789,134 @@ class ResponseGeneratorService:
             user_input += f"\n\nOBSERVER FEEDBACK:\n{observer_feedback}"
 
         logger.info("Streaming free-form thoughts for: %s", user_message[:80])
-        # Cap thoughts at 500 tokens to prevent hallucination/repetition loops.
-        # The prompt says "MAX 3 THOUGHTS" but without a hard token cap the LLM
-        # can ramble or repeat indefinitely.
-        yield from self._tool_plan_llm.stream_chat(
+        # Cap thoughts at 200 tokens to prevent rambling.
+        # The prompt says "MAX 200 TOKENS" — this enforces it.
+        async for chunk in self._tool_plan_llm.stream_chat_async(
             system=system, user_message=user_input, history=chat_history,
-            max_tokens=500,
-        )
+            max_tokens=200,
+        ):
+            yield chunk
+
+    async def _stream_free_thoughts_structured_async(
+        self,
+        user_message: str,
+        context: dict[str, Any] | None = None,
+        chat_history: list[dict[str, str]] | None = None,
+        tool_results: list[dict[str, Any]] | None = None,
+        observer_feedback: str | None = None,
+    ):
+        """Stream a structured reasoning trace with tool call support (NDJSON).
+
+        Yields structured dicts:
+        - ``{"type": "reasoning", "text": "..."}`` — reasoning/thinking tokens
+        - ``{"type": "tool_call", "id": "...", "function": {"name": "...", "arguments": "..."}}``
+          — tool call requests (from either native API or text-parsed)
+        - ``{"type": "content", "text": "..."}`` — visible content
+        - ``{"type": "done", "text": "..."}`` — final accumulated text when streaming completes
+
+        The caller (gateway) is expected to detect ``tool_call`` items, execute
+        the tool, and re-invoke this method with the results appended via
+        ``tool_results``. This creates a loop: LLM thinks → calls tools → gets
+        results → thinks more → calls more tools → final synthesized reasoning.
+
+        Tool calls can come from two sources:
+        1. Native OpenAI API ``delta.tool_calls`` (models that support it)
+        2. Plain text patterns like ``ACTION: read_file`` or ``read_file(/path)``
+           (fallback for local models like Gemma that emit tools as text)
+        """
+        system = REASONING_LAYER_PROMPT + _load_project_context()
+        user_input = f"User asked: {user_message}"
+        if context:
+            user_input += f"\nContext: {json.dumps(context)}"
+
+        if tool_results:
+            results_text = "\n".join(
+                f"- Tool: {r.get('tool')}, Success: {r.get('success')}, Output: {str(r.get('output'))[:500]}"
+                for r in tool_results
+            )
+            user_input += f"\n\nRECENT TOOL RESULTS:\n{results_text}"
+
+        if observer_feedback:
+            user_input += f"\n\nOBSERVER FEEDBACK:\n{observer_feedback}"
+
+        logger.info("Streaming structured thoughts with tools for: %s", user_message[:80])
+
+        full_text = ""
+        async for item in self._tool_plan_llm.stream_chat_structured_async(
+            system=system,
+            user_message=user_input,
+            history=chat_history,
+            max_tokens=2000,
+            tools=THINKING_TOOL_DEFINITIONS,
+        ):
+            if item.get("type") == "tool_call":
+                yield item  # pass through to gateway for execution
+            elif item.get("type") in ("reasoning", "content"):
+                full_text += item.get("text", "")
+
+        # ── Text-based tool call fallback ──
+        # For models like Gemma that don't support native tool calls,
+        # scan the accumulated text for tool call patterns.
+        # Patterns: "TOOL: read_file(...)" or "ACTION: grep" or "read_file(/path)"
+        text_tool_calls = self._extract_text_tool_calls(full_text)
+
+        for tc in text_tool_calls:
+            # Mark as text-detected so the gateway knows it's not native API
+            yield {"type": "tool_call", "id": tc["id"], "function": tc["function"], "_source": "text"}
+            # Pause here — the gateway will re-invoke with tool results
+
+        yield {"type": "done", "text": full_text}
+
+    _TOOL_CALL_PATTERNS: list[tuple[str, str]] = [
+        # ACTION: tool_name / PARAM_KEY: value
+        (r'ACTION:\s*(\w+)', 'flat'),
+        # tool_name(param1=value1, param2=value2)
+        (r'(read_file|grep|list_dir|find_files|search_artifacts|web_search|delegate_tasks|delegate_job_status|delegate_job_cancel|delegate_job_results)\s*\(([^)]*)\)', 'inline'),
+    ]
+
+    def _extract_text_tool_calls(self, text: str) -> list[dict]:
+        """Scan free-form text for tool call patterns.
+        
+        Returns a list of dicts like ``{"id": "...", "function": {"name": "...", "arguments": "..."}}``.
+        """
+        import uuid
+        calls: list[dict] = []
+
+        # Pattern 1: Flat key-value format (like the tool plan prompt)
+        # ACTION: read_file / PARAM_PATH: /foo
+        lines = text.split('\n')
+        i = 0
+        while i < len(lines):
+            line = lines[i].strip()
+            action_match = re.match(r'^ACTION:\s*(\w+)$', line, re.IGNORECASE)
+            if action_match and action_match.group(1).lower() in ('read_file', 'grep', 'list_dir', 'find_files', 'search_artifacts', 'web_search', 'delegate_tasks', 'delegate_job_status', 'delegate_job_cancel', 'delegate_job_results'):
+                tool_name = action_match.group(1).lower()
+                args: dict[str, Any] = {}
+                i += 1
+                while i < len(lines):
+                    param_line = lines[i].strip()
+                    param_match = re.match(r'^PARAM_(\w+):\s*(.*)$', param_line, re.IGNORECASE)
+                    if not param_match:
+                        break
+                    key = param_match.group(1).lower()
+                    val = param_match.group(2).strip()
+                    if val.lower() in ('true', 'false'):
+                        val = val.lower() == 'true'
+                    elif val.isdigit():
+                        val = int(val)
+                    args[key] = val
+                    i += 1
+                calls.append({
+                    "id": f"text_tc_{uuid.uuid4().hex[:8]}",
+                    "function": {"name": tool_name, "arguments": json.dumps(args)},
+                })
+                continue
+            i += 1
+
+        if calls:
+            logger.info("Extracted %d text-based tool call(s) from thinking: %s", len(calls), [c["function"]["name"] for c in calls])
+
+        return calls
 
     def _build_tool_plan_combined_message(
         self,
@@ -3023,31 +3936,85 @@ class ResponseGeneratorService:
         free_thoughts: str | None = None,
         active_worktree_id: str | None = None,
         tool_history_digest: list[str] | None = None,
+        model_override: str | None = None,
+        rule_packs_to_inject: list[str] | None = None,  # JIT-inject these rule packs
+        use_fc: bool | None = None,  # True=FC prompt, False=flat-text prompt, None=auto
+        context_window_override: int | None = None,  # per-request override for context window
+        context_output_reserve: float | None = None,  # per-request override for output reserve
         **kwargs,  # accept but ignore legacy artifact params
-    ) -> str:
+    ) -> tuple[str, str, str]:
         """Shared context for tool-plan — budget-aware to stay within context window.
 
-        Returns the assembled user message. Also stores budget breakdown in
-        ``self._last_context_budget`` for observability.
-        """
-        budget = ContextBudget(self._settings)
+        Uses the CORE_TOOL_PLAN_PROMPT (~40 lines) plus optionally injected rule
+        packs (tool_rules, delegation_rules, etc.) loaded just-in-time based on
+        ``rule_packs_to_inject``.
 
-        # Reserve space for system prompt (TOOL_PLAN_PROMPT + project context)
-        system_text = TOOL_PLAN_PROMPT + _load_project_context()
-        # When session already has a worktree, strip create_worktree from the
-        # tool catalogue so the LLM cannot even suggest it.
+        For OpenAI-compatible and Ollama providers, uses the FC-optimized prompt
+        (``CORE_TOOL_PLAN_PROMPT_FC``) since tools are defined via the API ``tools``
+        parameter rather than in the text.
+
+        Returns (assembled_user_message, prompt_tier, system_text) so the caller
+        can use the configured system prompt directly.
+        """
+        # Per-request overrides: profile > model variant > env default.
+        # Clone settings so we don't mutate the global object.
+        effective_settings = self._settings.model_copy()
+        if context_window_override is not None:
+            effective_settings.context_window = context_window_override
+        if context_output_reserve is not None:
+            effective_settings.context_output_reserve = context_output_reserve
+        budget = ContextBudget(effective_settings)
+
+        # Select prompt variant: FC (function calling) for OpenAI/Ollama,
+        # flat-text for Anthropic. Caller can override.
+        if use_fc is None:
+            fc_providers = {"openai", "ollama"}
+            model_name = self._tool_plan_llm.model or ""
+            # Local models rarely support native function calling properly — force flat-text for them
+            if any(kw in model_name.lower() for kw in ("coder", "fable", "gguf", "qwen")):
+                use_fc = False
+            else:
+                use_fc = self._tool_plan_llm.provider in fc_providers
+        prompt_text = CORE_TOOL_PLAN_PROMPT_FC if use_fc else CORE_TOOL_PLAN_PROMPT
+
+        # Inject the model-appropriate tool list based on model_override (only relevant for flat-text path).
+        available = resolve_available_tools(model_override)
+        if available is None:
+            available = list(TOOL_PLAN_ALLOWED_TOOLS)
+        formatted_tools = _format_tool_list(available)
+        prompt_text = prompt_text.replace("{AVAILABLE_TOOLS}", formatted_tools)
+        prompt_tier = "jit"
+
+        # JIT-rule injection: merge requested rule packs into the system prompt.
+        # Order: explicit request (rule_packs_to_inject) → instance stored (get_rule)
+        jit_packs: list[str] = list(rule_packs_to_inject or [])
+        stored_packs = getattr(self, '_injected_rule_packs', None) or []
+        for p in stored_packs:
+            if p not in jit_packs:
+                jit_packs.append(p)
+        if jit_packs:
+            pack_texts = []
+            for pack_name in jit_packs:
+                pack_content = RULE_PACKS.get(pack_name)
+                if pack_content:
+                    pack_texts.append(f"\n═══ {pack_name.upper()} ═══\n{pack_content}")
+            if pack_texts:
+                prompt_text += "\n".join(pack_texts)
+            self._injected_rule_packs = []  # reset after injection
+
+        # Reserve space for system prompt (prompt + project context)
+        system_text = prompt_text + _load_project_context()
+        # When session already has a worktree, append a reminder that create_worktree is unavailable
         if active_worktree_id:
-            system_text = re.sub(
-                r"^8\.\s*create_worktree:.*$",
-                f"8. (create_worktree — UNAVAILABLE: session already has worktree '{active_worktree_id}'. Use PARAM_WORKTREE_ID: {active_worktree_id} for all tools.)",
-                system_text,
-                flags=re.MULTILINE,
+            system_text += (
+                f"\n\n⚠️ ACTIVE WORKTREE: {active_worktree_id} — do NOT call create_worktree. "
+                f"Use PARAM_WORKTREE_ID: {active_worktree_id} for all worktree tools."
             )
         budget.record("system_prompt", system_text)
 
         parts: list[str] = []
 
-        # ── Walls (max 5% of budget) ────────────────────────────────────
+        # ── Walls (max 5% of budget) — summarized ──────────────────────
         walls = list(walls_hit or [])
         memory = memory_context or []
         for m in memory:
@@ -3055,12 +4022,7 @@ class ResponseGeneratorService:
             if isinstance(content, dict) and content.get("walls"):
                 walls.extend(content["walls"])
         if walls:
-            walls_str = "\n".join(f"  - {w}" for w in walls[:15])
-            walls_block = (
-                "⚠️ FAILED ATTEMPTS / WALLS HIT — DO NOT RETRY THESE. Use different paths or approaches:\n"
-                f"{walls_str}\n"
-                "Note: /workspace/X and /X refer to the same path. Before any read_file/list_dir/grep, check the path is NOT in the list above.\n"
-            )
+            walls_block = _categorize_walls(walls) + "\n"
             parts.append(budget.allocate("walls", walls_block, max_share=0.05))
             parts.append("")
 
@@ -3082,22 +4044,13 @@ class ResponseGeneratorService:
             budget.record("task_graph", tg_summary)
             parts.append("")
 
-        # ── Memory + rules (max 10% of budget) ─────────────────────────
+        # ── Memory + rules (max 10% of budget) — summarized ─────────────
         rules_list = rules or []
         if memory_stale_hint:
             parts.append(f"IMPORTANT — {memory_stale_hint}")
             parts.append("")
-        if memory or rules_list:
-            mem_block = ""
-            if memory:
-                memory_str = "\n".join(f"- {_memory_to_str(m)}" for m in memory[:5])
-                mem_block += f"Relevant past context (memory):\n{memory_str}\n"
-            if rules_list:
-                rules_str = "\n".join(
-                    f"- {r.get('assertion', r.get('rule', str(r)))}"
-                    for r in rules_list[:5]
-                )
-                mem_block += f"User-taught rules (apply these):\n{rules_str}\n"
+        if memory or rules_list or knowledge_summary or walls:
+            mem_block = _summarize_knowledge(memory, rules_list, knowledge_summary, len(walls))
             parts.append(budget.allocate("memory_rules", mem_block, max_share=0.10))
             parts.append("")
 
@@ -3113,16 +4066,13 @@ class ResponseGeneratorService:
             )
             parts.append(budget.allocate("validated_thoughts", block, max_share=0.10))
 
-        # ── Free thoughts — deferred to after tool results (recency matters) ──
+        # ── Free thoughts (max 8%) — summarized TOC with drill-down ──────
         _free_thoughts_block = None
         if free_thoughts:
-            header = (
-                "═══ REASONING CONTEXT (observations & implementation ideas — useful context, but the PLAN above is authoritative) ═══\n"
-                if upfront_plan
-                else "═══ YOUR REASONING (follow this — your next ACTION must be the next unfinished step below) ═══\n"
+            block = _summarize_free_thoughts(free_thoughts)
+            _free_thoughts_block = budget.allocate(
+                "free_thoughts", block, max_share=0.08,
             )
-            block = header + f"{free_thoughts}\n"
-            _free_thoughts_block = budget.allocate("free_thoughts", block, max_share=0.10)
 
         # ── User request (max 5%) ──────────────────────────────────────
         user_block = f"User request: {user_message}"
@@ -3132,18 +4082,18 @@ class ResponseGeneratorService:
         _upfront_plan_block = None
         if upfront_plan:
             steps = upfront_plan.get("steps", [])
+            n_steps = len(steps)
             if steps and isinstance(steps[0], dict):
-                steps_str = "\n".join(
-                    f"  {i+1}. {s.get('description', s)}" for i, s in enumerate(steps)
-                )
+                step_descs = [s.get('description', s) for s in steps]
             else:
-                steps_str = "\n".join(f"  {i+1}. {s}" for i, s in enumerate(steps))
+                step_descs = [str(s) for s in steps]
             criteria = upfront_plan.get("success_criteria", [])
             criteria_str = (
                 "\n".join(f"  - {c}" for c in criteria)
                 if criteria
                 else "  (none specified)"
             )
+
             focus_desc = active_step_description
             if (
                 not focus_desc
@@ -3162,24 +4112,36 @@ class ResponseGeneratorService:
                     focus_desc = str(step_at)
 
             if focus_desc:
-                plan_block = (
-                    f"\n═══ ACTIVE PLAN STEP (THIS IS YOUR PRIMARY DIRECTIVE — execute this step now) ═══\n"
-                    f"  → {focus_desc}\n"
-                    f"Success criteria:\n{criteria_str}"
-                )
+                # Show active step only + TOC of remaining
+                remaining_steps = n_steps - (active_step_index + 1) if isinstance(active_step_index, int) else max(0, n_steps - 1)
+                toc_lines = [
+                    f"\n═══ ACTIVE PLAN STEP (THIS IS YOUR PRIMARY DIRECTIVE — execute this step now) ═══"
+                    f"\n  → {focus_desc}"
+                    f"\nSuccess criteria:\n{criteria_str}"
+                ]
+                if n_steps > 1:
+                    toc_lines.append(
+                        f"\n  📋 Plan: {n_steps} step(s) total — you are on step {(active_step_index or 0) + 1}/{n_steps}. "
+                        f"{remaining_steps} step(s) remain after this."
+                    )
+                if remaining_steps > 0:
+                    remaining_titles = step_descs[active_step_index + 1:] if isinstance(active_step_index, int) else step_descs[1:]
+                    toc_lines.append("  Remaining steps:")
+                    for i, title in enumerate(remaining_titles[:4], (active_step_index or 0) + 2):
+                        toc_lines.append(f"    {i}. {title[:100]}")
+                    if len(remaining_titles) > 4:
+                        toc_lines.append(f"    ... and {len(remaining_titles) - 4} more step(s).")
+                plan_block = "\n".join(toc_lines)
             else:
+                # No active step — show all step titles as TOC
+                step_titles = "\n".join(
+                    f"  {i+1}. {d[:100]}" for i, d in enumerate(step_descs)
+                )
                 plan_block = (
                     f"\n═══ PLAN (follow these steps in order — this is your PRIMARY DIRECTIVE) ═══\n"
-                    f"{steps_str}\nSuccess criteria:\n{criteria_str}"
+                    f"{step_titles}\nSuccess criteria:\n{criteria_str}"
                 )
             _upfront_plan_block = budget.allocate("upfront_plan", plan_block, max_share=0.08)
-
-        # ── Knowledge summary (max 8%) ─────────────────────────────────
-        if knowledge_summary:
-            block = (
-                f"\nKnowledge Graph Summary (historical context):\n{knowledge_summary}"
-            )
-            parts.append(budget.allocate("knowledge_summary", block, max_share=0.08))
 
         # Note: artifacts are no longer auto-injected here. The LLM uses
         # the `search_artifacts` tool to query documents on demand.
@@ -3361,7 +4323,7 @@ class ResponseGeneratorService:
             {k: v for k, v in budget._breakdown.items() if v > 50},
         )
 
-        return "\n".join(parts)
+        return "\n".join(parts), prompt_tier, system_text
 
     def _heuristic_repair_tool_plan_raw(self, raw: str, error_context: str) -> str:
         """Single LLM pass: turn prose / broken output into a flat tool plan."""
@@ -3497,75 +4459,130 @@ class ResponseGeneratorService:
         free_thoughts: str | None = None,
         active_worktree_id: str | None = None,
         tool_history_digest: list[str] | None = None,
+        rule_packs_to_inject: list[str] | None = None,
+        model_override: str | None = None,
+        max_tokens: int | None = None,  # model-tier-specific output token cap
     ) -> dict[str, Any]:
-        """Plan next tool call or final answer (flat KEY: lines preferred; JSON fallback).
+        """Plan next tool call or final answer using native function calling (preferred)
+        or flat-text fallback.
 
-        Retries up to 3 times if the model output cannot be parsed into a valid plan.
+        Uses ``chat_structured_async`` with tool definitions for OpenAI-compatible
+        and Ollama providers. Falls back to ``chat_async`` + ``parse_tool_plan_raw``
+        for Anthropic.
         """
-        system = TOOL_PLAN_PROMPT + _load_project_context()
-        base_combined = self._build_tool_plan_combined_message(
+        message_args: dict[str, Any] = {}
+        for kw in ('upfront_plan', 'active_step_index', 'active_step_description',
+                    'observer_feedback', 'knowledge_summary', 'memory_context', 'rules',
+                    'memory_stale_hint', 'walls_hit', 'task_graph', 'validated_thoughts',
+                    'free_thoughts', 'active_worktree_id', 'tool_history_digest'):
+            val = locals().get(kw)
+            if val is not None:
+                message_args[kw] = val
+
+        base_combined, prompt_tier, system = self._build_tool_plan_combined_message(
             user_message=user_message,
-            tool_results=tool_results,
-            upfront_plan=upfront_plan,
-            active_step_index=active_step_index,
-            active_step_description=active_step_description,
-            observer_feedback=observer_feedback,
-            knowledge_summary=knowledge_summary,
-            memory_context=memory_context,
-            rules=rules,
-            memory_stale_hint=memory_stale_hint,
-            walls_hit=walls_hit,
-            task_graph=task_graph,
-            validated_thoughts=validated_thoughts,
-            free_thoughts=free_thoughts,
-            active_worktree_id=active_worktree_id,
-            tool_history_digest=tool_history_digest,
+            **message_args,
+            model_override=model_override,
+            rule_packs_to_inject=rule_packs_to_inject,
         )
         logger.info(
-            "Planning tool call for: %s (prior_results=%d)",
+            "Planning tool call for: %s (prior_results=%d, prompt_tier=%s)",
             user_message[:80],
             len(tool_results or []),
+            prompt_tier,
         )
 
-        max_retries = 3
-        combined = base_combined
-        extra_hints = ""
-        last_error: Exception | None = None
-        for attempt in range(1, max_retries + 1):
-            try:
-                raw = self._tool_plan_llm.chat(
-                    system=system, user_message=combined, history=chat_history
-                )
-                return await self.parse_tool_plan_raw(raw)
-            except ValueError as e:
-                last_error = e
-                logger.warning(
-                    "Tool plan attempt %d/%d failed (parse): %s — retrying",
-                    attempt,
-                    max_retries,
-                    e,
-                )
-                if attempt < max_retries:
-                    extra_hints += (
-                        "\n\n[SYSTEM: Your previous reply was not a valid tool plan. "
-                        "Output ONLY flat lines (no JSON): DECISION:, ACTION: (if ACT), PARAM_*:, REASONING:. "
-                        "See the format in your system instructions.]"
-                    )
-                    combined = base_combined + extra_hints
-                continue
-            except Exception as e:
-                logger.error(
-                    "Tool plan LLM call failed (attempt %d/%d): %s",
-                    attempt,
-                    max_retries,
-                    e,
-                )
-                last_error = e
-                if attempt < max_retries:
-                    continue
-                break
+        # Determine available tools for this model
+        available = resolve_available_tools(model_override)
+        if available is None:
+            available = list(TOOL_PLAN_ALLOWED_TOOLS)
 
-        logger.error("Tool plan failed after %d attempts: %s", max_retries, last_error)
+        # Check if FC is supported
+        fc_providers = {"openai", "ollama"}
+        model_name = self._tool_plan_llm.model or ""
+        # Local models rarely support native function calling properly — force flat-text for them
+        if any(kw in model_name.lower() for kw in ("coder", "fable", "gguf", "qwen")):
+            use_fc = False
+
+        max_retries = 3
+        last_error: Exception | None = None
+
+        if use_fc:
+            # ── Native function calling path ──
+            tool_defs = _build_tool_definitions(available)
+            for attempt in range(1, max_retries + 1):
+                try:
+                    fc_resp = await self._tool_plan_llm.chat_structured_async(
+                        system=system,
+                        user_message=base_combined,
+                        history=chat_history,
+                        tools=tool_defs,
+                        max_tokens=max_tokens,
+                    )
+                    plan = _fc_response_to_plan(fc_resp)
+                    # Validate: INVALID_TOOL answer means the call name was bad
+                    if plan.get("action") == "final_answer" and "_retry_hint" in plan:
+                        logger.warning(
+                            "FC tool plan invalid tool (attempt %d/%d): %s",
+                            attempt, max_retries,
+                            plan.get("answer", "")[:200],
+                        )
+                        if attempt < max_retries:
+                            # Retry with a system hint
+                            base_combined += (
+                                "\n\n[SYSTEM: The tool name you used is not valid. "
+                                f"Use ONLY one of these function names: {', '.join(t['function']['name'] for t in tool_defs)}]"
+                            )
+                            continue
+                        return plan
+                    return plan
+                except Exception as e:
+                    last_error = e
+                    logger.warning(
+                        "FC tool plan attempt %d/%d failed: %s — %s",
+                        attempt, max_retries, type(e).__name__, e,
+                    )
+                    if attempt < max_retries:
+                        continue
+                    break
+
+            logger.error("FC tool plan failed after %d attempts: %s", max_retries, last_error)
+        else:
+            # ── Flat text fallback (Anthropic) ──
+            combined = base_combined
+            extra_hints = ""
+            for attempt in range(1, max_retries + 1):
+                try:
+                    raw = await self._tool_plan_llm.chat_async(
+                        system=system, user_message=combined, history=chat_history
+                    )
+                    return await self.parse_tool_plan_raw(raw)
+                except ValueError as e:
+                    last_error = e
+                    logger.warning(
+                        "Tool plan attempt %d/%d failed (parse): %s — retrying",
+                        attempt, max_retries, e,
+                    )
+                    if attempt < max_retries:
+                        extra_hints += (
+                            "\n\n[SYSTEM: Your previous reply was not a valid tool plan. "
+                            "Output ONLY flat lines (no JSON): DECISION:, ACTION: (if ACT), PARAM_*:, REASONING:. "
+                            "See the format in your system instructions.]"
+                        )
+                        combined = base_combined + extra_hints
+                    continue
+                except Exception as e:
+                    logger.error(
+                        "Tool plan LLM call failed (attempt %d/%d): %s",
+                        attempt, max_retries, e,
+                    )
+                    last_error = e
+                    if attempt < max_retries:
+                        continue
+                    break
+
+            logger.error("Tool plan failed after %d attempts: %s", max_retries, last_error)
+
         fallback_pattern = _extract_fallback_keyword(user_message)
         if fallback_pattern:
             return {
@@ -3580,7 +4597,7 @@ class ResponseGeneratorService:
             "answer": f"I had trouble planning tool calls after {max_retries} attempts. Could you rephrase your request?",
         }
 
-    def stream_tool_plan(
+    async def stream_tool_plan(
         self,
         user_message: str,
         tool_results: list[dict[str, Any]] | None = None,
@@ -3598,11 +4615,23 @@ class ResponseGeneratorService:
         validated_thoughts: list[dict[str, Any]] | None = None,
         free_thoughts: str | None = None,
         active_worktree_id: str | None = None,
+        model_override: str | None = None,
         tool_history_digest: list[str] | None = None,
+        rule_packs_to_inject: list[str] | None = None,
+        context_window_override: int | None = None,
+        context_output_reserve: float | None = None,
+        max_tokens: int | None = None,
         **kwargs,  # accept but ignore legacy artifact params
     ):
-        """Stream tool-plan generation (flat lines; server parses full buffer when stream ends)."""
-        user_input = self._build_tool_plan_combined_message(
+        """Async generator for tool-plan generation.
+
+        Uses flat-text format with built-in tool descriptions that include
+        required parameter hints. The full output is parsed by the gateway.
+
+        Yields:
+            str — plain text chunks from the LLM.
+        """
+        base_combined, prompt_tier, system = self._build_tool_plan_combined_message(
             user_message=user_message,
             tool_results=tool_results,
             upfront_plan=upfront_plan,
@@ -3619,11 +4648,16 @@ class ResponseGeneratorService:
             free_thoughts=free_thoughts,
             active_worktree_id=active_worktree_id,
             tool_history_digest=tool_history_digest,
+            model_override=model_override,
+            rule_packs_to_inject=rule_packs_to_inject,
+            context_window_override=context_window_override,
+            context_output_reserve=context_output_reserve,
+            use_fc=False,
         )
-        system = TOOL_PLAN_PROMPT + _load_project_context()
-        yield from self._tool_plan_llm.stream_chat(
-            system=system, user_message=user_input, history=chat_history
-        )
+        async for chunk in self._tool_plan_llm.stream_chat_async(
+            system=system, user_message=base_combined, history=chat_history
+        ):
+            yield chunk
 
     async def summarize_tool_results(
         self, user_message: str, tool_results: list[dict[str, Any]]
@@ -3644,7 +4678,7 @@ class ResponseGeneratorService:
             parts.append(f"\n--- Tool #{i}: {r.get('tool', '?')} [{status}] ---")
             parts.append(r.get("output", "(no output)")[:3000])
 
-        text = self._llm.chat(system=system, user_message="\n".join(parts))
+        text = await self._llm.chat_async(system=system, user_message="\n".join(parts))
         return text
 
     async def summarize_history(self, messages: list[dict[str, str]]) -> str:
@@ -3662,4 +4696,4 @@ class ResponseGeneratorService:
             content = (m.get("content", "") or "")[:2000]
             parts.append(f"{role.upper()}: {content}")
         user_msg = "\n\n".join(parts)
-        return self._llm.chat(system=system, user_message=user_msg, max_tokens=512)
+        return await self._llm.chat_async(system=system, user_message=user_msg, max_tokens=512)

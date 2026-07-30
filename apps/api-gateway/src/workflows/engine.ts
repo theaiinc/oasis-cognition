@@ -1,25 +1,27 @@
 /**
- * Workflow engine — topological execution of a workflow DAG.
+ * Workflow engine — parallel topological execution of a workflow DAG.
  *
  * Contract:
- *   engine.execute(run, workflow, { abortSignal })  →  finished run
+ *   engine.executeRun(run, workflow, { abortSignal })  →  finished run
  *
  * The engine mutates the passed run object in place and persists progress
  * via `store.saveRun()` + `store.appendRunEvent()` so SSE listeners see
  * each node transition.
  *
  * Execution rules:
- *   • Topological order (Kahn's algorithm). Cycles are rejected with a
- *     `failed` run before any node executes.
+ *   • Topological order with round-based concurrent dispatch. Each round
+ *     discovers all nodes whose dependencies are satisfied and runs them
+ *     in parallel via Promise.allSettled.
+ *   • When a round finishes, the engine re-evaluates the DAG and starts
+ *     the next round with any newly-ready nodes.
  *   • A node is "ready" when all its incoming edges originate from nodes
  *     that have emitted a value on the required from_port. If an incoming
  *     edge's upstream emitted no value on that port (e.g. branch's untaken
- *     side, filter that didn't pass), the downstream node is marked
- *     `skipped` — which in turn propagates to its descendants.
+ *     side, filter that didn't pass) or was skipped/failed, the downstream
+ *     node is marked `skipped`.
  *   • `output` nodes write their received value to `run.output`.
- *   • Cancellation: if abortSignal fires, the currently-running node is
- *     aborted (it receives the signal) and remaining nodes are marked
- *     `skipped`; run status → `cancelled`.
+ *   • Cancellation: if abortSignal fires, running nodes are skipped
+ *     and remaining nodes are marked `skipped`; run status → `cancelled`.
  */
 
 import { Logger } from '@nestjs/common';
@@ -64,6 +66,68 @@ function topoSort(nodes: WorkflowNode[], edges: Array<{ from_node: string; to_no
 
 export interface ExecuteOptions {
   abortSignal?: AbortSignal;
+  /** Max number of nodes to run concurrently per round.
+   *  0 = unlimited (all ready nodes fire at once). */
+  maxConcurrency?: number;
+}
+
+/** Build a lookup of incoming edges keyed by target node id. */
+function buildIncomingEdges(
+  edges: Array<{ from_node: string; to_node: string; from_port?: string; to_port?: string }>,
+): Map<string, Array<{ from_node: string; from_port: string; to_port: string }>> {
+  const incomingByNode = new Map<string, Array<{ from_node: string; from_port: string; to_port: string }>>();
+  for (const e of edges) {
+    if (!incomingByNode.has(e.to_node)) incomingByNode.set(e.to_node, []);
+    incomingByNode.get(e.to_node)!.push({
+      from_node: e.from_node,
+      from_port: e.from_port || 'out',
+      to_port: e.to_port || 'in',
+    });
+  }
+  return incomingByNode;
+}
+
+/**
+ * Determine if a node is ready to execute based on its upstream states.
+ *
+ * Returns one of three outcomes:
+ *   { ready: true,  skip: false }  — all dependencies satisfied, execute.
+ *   { ready: false, skip: true  }  — upstream skipped/failed/no output.
+ *   { ready: false, skip: false }  — upstream still running, try again later.
+ */
+function computeReadiness(
+  nodeId: string,
+  incoming: Array<{ from_node: string; from_port: string; to_port: string }> | undefined,
+  nodeStates: Record<string, any>,
+): { ready: boolean; skip: boolean; inputs?: Record<string, any>; skipReason?: string } {
+  if (!incoming || incoming.length === 0) {
+    return { ready: true, skip: false, inputs: {} };
+  }
+
+  const inputs: Record<string, any> = {};
+  for (const e of incoming) {
+    const up = nodeStates[e.from_node];
+    // Upstream not evaluated yet — not ready, don't skip (might be dispatched this round)
+    if (!up || up.status === 'pending') return { ready: false, skip: false };
+    if (up.status === 'skipped') {
+      return { ready: false, skip: true, skipReason: `upstream ${e.from_node} was skipped` };
+    }
+    if (up.status === 'failed') {
+      return { ready: false, skip: true, skipReason: `upstream ${e.from_node} failed` };
+    }
+    if (up.status !== 'completed') {
+      // Still running — not ready
+      return { ready: false, skip: false };
+    }
+    // Presence check, not truthy check — nodes may legitimately emit
+    // `undefined` / `null` on a port.
+    const upstreamOut = up.output || {};
+    if (!(e.from_port in upstreamOut)) {
+      return { ready: false, skip: true, skipReason: `upstream ${e.from_node} emitted no value on port ${e.from_port}` };
+    }
+    inputs[e.to_port] = upstreamOut[e.from_port];
+  }
+  return { ready: true, skip: false, inputs };
 }
 
 export async function executeRun(
@@ -97,154 +161,189 @@ export async function executeRun(
     return run;
   }
 
-  // Incoming edges lookup
-  const incomingByNode = new Map<string, Array<{ from_node: string; from_port: string; to_port: string }>>();
-  for (const e of edges) {
-    if (!incomingByNode.has(e.to_node)) incomingByNode.set(e.to_node, []);
-    incomingByNode.get(e.to_node)!.push({
-      from_node: e.from_node,
-      from_port: e.from_port || 'out',
-      to_port: e.to_port || 'in',
-    });
-  }
+  const nodeById = new Map(nodes.map(n => [n.id, n] as const));
+  const incomingByNode = buildIncomingEdges(edges);
+  const dispatched = new Set<string>();
+  let cancelledByNode: string | undefined;
+  let cancelledReason: string | undefined;
 
   const aborted = () => opts.abortSignal?.aborted === true;
 
-  for (const node of order) {
-    if (aborted()) break;
+  /** Skip a node (upstream prevented execution). Propagates downstream. */
+  async function skipNode(nodeId: string, reason?: string): Promise<void> {
+    if (dispatched.has(nodeId)) return;
+    dispatched.add(nodeId);
+    run.node_states[nodeId] = { status: 'skipped', error: reason };
+    await store.saveRun(run);
+    await store.appendRunEvent(run.run_id, 'node', { node_id: nodeId, status: 'skipped', error: reason });
 
-    // Resolve inputs; any upstream that is `skipped` or `failed` OR didn't
-    // emit the required from_port causes this node to skip (unless it has
-    // no incoming edges at all, in which case it's a source node).
-    const incoming = incomingByNode.get(node.id) || [];
-    let shouldSkip = false;
-    const inputs: Record<string, any> = {};
+    // Propagate downstream: any node that depends on this one should also skip
+    for (const n of order) {
+      const incoming = incomingByNode.get(n.id) || [];
+      const dependsOnSkipped = incoming.some(e => e.from_node === nodeId);
+      if (dependsOnSkipped && !dispatched.has(n.id)) {
+        await skipNode(n.id, `upstream ${nodeId} was skipped`);
+      }
+    }
+  }
 
-    for (const e of incoming) {
-      const upstreamState = run.node_states[e.from_node];
-      if (!upstreamState || upstreamState.status === 'skipped' || upstreamState.status === 'failed') {
-        shouldSkip = true;
-        break;
-      }
-      if (upstreamState.status !== 'completed') {
-        // This shouldn't happen with topo order, but be defensive.
-        shouldSkip = true;
-        break;
-      }
-      // Presence check, not truthy check — nodes may legitimately emit
-      // `undefined` / `null` on a port. We skip only when the port key was
-      // absent from the output map (e.g. filter didn't match, branch chose
-      // the other side).
-      const upstreamOut = upstreamState.output || {};
-      if (!(e.from_port in upstreamOut)) {
-        shouldSkip = true;
-        break;
-      }
-      inputs[e.to_port] = upstreamOut[e.from_port];
+  /** Execute a single node. Returns when it finishes (or is skipped/failed). */
+  async function executeNode(node: WorkflowNode): Promise<void> {
+    const { id, type, on_error } = node;
+    const incoming = incomingByNode.get(id) || [];
+    const readiness = computeReadiness(id, incoming, run.node_states);
+
+    if (readiness.skip) {
+      await skipNode(id, readiness.skipReason);
+      return;
     }
 
-    if (shouldSkip) {
-      run.node_states[node.id] = { status: 'skipped' };
-      await store.saveRun(run);
-      await store.appendRunEvent(run.run_id, 'node', { node_id: node.id, status: 'skipped' });
-      continue;
+    if (!readiness.ready) {
+      return; // caller should not dispatch unready nodes
     }
 
-    // Interpolate params against the current context
+    // ── Interpolate params ─────────────────────────────────────
     const priorOutputs: Record<string, Record<string, any>> = {};
     for (const [nid, state] of Object.entries(run.node_states)) {
       if (state?.output) priorOutputs[nid] = state.output;
     }
     const jexlCtx = buildJexlContext({
-      inputs,
+      inputs: readiness.inputs!,
       nodes: priorOutputs,
       run_input: run.input,
       run_context: run.context,
     });
     const interpolatedParams = interpolateDeep(node.params || {}, jexlCtx);
 
-    const executor = getExecutor(node.type);
-    if (!executor) {
-      run.node_states[node.id] = {
-        status: 'failed',
-        error: `No executor registered for node type "${node.type}"`,
-        started_at: iso(),
-        finished_at: iso(),
-      };
-      await store.saveRun(run);
-      await store.appendRunEvent(run.run_id, 'node', {
-        node_id: node.id, status: 'failed', error: run.node_states[node.id].error,
-      });
-      if (node.on_error !== 'continue') {
-        run.status = 'failed';
-        run.error = run.node_states[node.id].error;
-        break;
-      }
-      continue;
-    }
-
-    run.node_states[node.id] = {
+    run.node_states[id] = {
       status: 'running',
-      input: inputs,
+      input: readiness.inputs,
       started_at: iso(),
     };
     await store.saveRun(run);
-    await store.appendRunEvent(run.run_id, 'node', { node_id: node.id, status: 'running' });
+    await store.appendRunEvent(run.run_id, 'node', { node_id: id, status: 'running' });
 
     try {
+      const executor = getExecutor(type);
+      if (!executor) {
+        throw new Error(`No executor registered for node type "${type}"`);
+      }
+
       const nodeWithInterpolatedParams: WorkflowNode = { ...node, params: interpolatedParams };
       const output = await executor({
         node: nodeWithInterpolatedParams,
-        inputs,
+        inputs: readiness.inputs!,
         run,
         abortSignal: opts.abortSignal,
       });
-      run.node_states[node.id] = {
+
+      if (aborted()) return;
+
+      run.node_states[id] = {
         status: 'completed',
-        input: inputs,
+        input: readiness.inputs,
         output,
-        started_at: run.node_states[node.id].started_at,
+        started_at: run.node_states[id].started_at,
         finished_at: iso(),
       };
       await store.saveRun(run);
       await store.appendRunEvent(run.run_id, 'node', {
-        node_id: node.id, status: 'completed', output,
+        node_id: id, status: 'completed', output,
       });
 
       // output node: write the received value to run.output
-      if (node.type === 'output') {
-        run.output = inputs.in;
+      if (type === 'output') {
+        run.output = readiness.inputs?.in;
       }
     } catch (err: any) {
+      if (aborted()) return;
+
       const message = err?.message || String(err);
-      run.node_states[node.id] = {
+      run.node_states[id] = {
         status: 'failed',
-        input: inputs,
+        input: readiness.inputs,
         error: message,
-        started_at: run.node_states[node.id].started_at,
+        started_at: run.node_states[id].started_at,
         finished_at: iso(),
       };
       await store.saveRun(run);
       await store.appendRunEvent(run.run_id, 'node', {
-        node_id: node.id, status: 'failed', error: message,
+        node_id: id, status: 'failed', error: message,
       });
-      logger.warn(`node ${node.id} (${node.type}) failed: ${message}`);
-      if (node.on_error !== 'continue') {
-        run.status = 'failed';
-        run.error = message;
-        break;
+      logger.warn(`node ${id} (${type}) failed: ${message}`);
+
+      if (on_error !== 'continue') {
+        cancelledByNode = id;
+        cancelledReason = message;
       }
+    }
+  }
+
+  // ── Round-based parallel execution ──────────────────────────────
+  // Each round: find ready nodes → fire them in parallel → wait →
+  // handle cancelled/skipped → repeat until no nodes remain.
+
+  while (!cancelledByNode && !aborted()) {
+    // Find all nodes that are ready (all deps met) and not yet dispatched
+    const readyNodes = order.filter(n => {
+      if (dispatched.has(n.id)) return false;
+      const incoming = incomingByNode.get(n.id) || [];
+      const r = computeReadiness(n.id, incoming, run.node_states);
+      return r.ready;
+    });
+
+    // Find nodes that should be skipped (upstream failed/skipped/no-output)
+    const toSkip = order.filter(n => {
+      if (dispatched.has(n.id)) return false;
+      const incoming = incomingByNode.get(n.id) || [];
+      if (incoming.length === 0) return false; // source nodes never skipped
+      const r = computeReadiness(n.id, incoming, run.node_states);
+      return r.skip;
+    });
+
+    // Skip nodes that can't execute
+    for (const node of toSkip) {
+      await skipNode(node.id);
+    }
+
+    // If no ready nodes and nothing to skip, we're done
+    if (readyNodes.length === 0 && toSkip.length === 0) break;
+
+    // Dispatch only the current batch. Ready nodes beyond the concurrency
+    // limit must remain undispatched so the next round can execute them.
+    let batch = readyNodes;
+    if (opts.maxConcurrency && opts.maxConcurrency > 0 && batch.length > opts.maxConcurrency) {
+      // Limit concurrency: process in chunks
+      batch = batch.slice(0, opts.maxConcurrency);
+    }
+    for (const n of batch) dispatched.add(n.id);
+
+    await Promise.allSettled(batch.map(n => executeNode(n)));
+
+    // If a node execution caused a cancellation, break out
+    if (cancelledByNode) break;
+  }
+
+  // ── Finalise run ────────────────────────────────────────────────
+  // Mark all remaining pending/skipped nodes
+  const failOrCancelMsg = cancelledReason || 'run cancelled';
+
+  for (const n of order) {
+    const state = run.node_states[n.id];
+    if (state.status === 'pending' || state.status === 'running') {
+      run.node_states[n.id] = { ...state, status: 'skipped' };
+    }
+    if (!dispatched.has(n.id)) {
+      dispatched.add(n.id);
     }
   }
 
   if (aborted() && run.status === 'running') {
     run.status = 'cancelled';
     run.error = 'run cancelled';
-    for (const n of nodes) {
-      if (run.node_states[n.id].status === 'pending' || run.node_states[n.id].status === 'running') {
-        run.node_states[n.id] = { ...run.node_states[n.id], status: 'skipped' };
-      }
-    }
+  } else if (cancelledByNode) {
+    run.status = 'failed';
+    run.error = failOrCancelMsg;
   } else if (run.status === 'running') {
     run.status = 'completed';
   }

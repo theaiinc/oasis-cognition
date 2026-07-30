@@ -42,6 +42,9 @@ PROJECT_OVERRIDABLE_FIELDS: set[str] = {
     "context_output_reserve",
     "embedding_model",
     "log_level",
+    "leyline_base_url",
+    "leyline_max_budget_usd",
+    "leyline_daily_budget_usd",
 }
 
 
@@ -51,30 +54,33 @@ class Settings(BaseSettings):
     debug: bool = False
     log_level: str = "INFO"
 
-    # LLM provider: "anthropic", "openai", or "ollama"
+    # LLM provider: "anthropic", "openai" (also works with any OpenAI-compatible
+    # endpoint like DeepSeek / LLM API / vLLM / LM Studio), or "ollama"
     llm_provider: str = "ollama"
-    llm_model: str = "qwen3:8b"
-    llm_max_tokens: int = 40000
+    llm_model: str = "qwen3:4b"
+    llm_max_tokens: int = 8192
 
     # Anthropic
     anthropic_api_key: str = ""
 
-    # OpenAI (also works with any OpenAI-compatible endpoint)
-    openai_api_key: str = ""
-    openai_base_url: str = ""
+    # OpenAI (also works with any OpenAI-compatible endpoint, including LM Studio)
+    openai_api_key: str = "lm-studio"
+    openai_base_url: str = "http://localhost:1234/v1"
 
     # Ollama
     ollama_host: str = "http://localhost:11434"
+    # Alias for backward-compatibility (LLMClient reads ollama_host)
+    @property
+    def ollama_base_url(self) -> str:
+        return self.ollama_host
 
     # Response model (separate from interpreter model)
     response_llm_provider: str = "ollama"
-    response_llm_model: str = "qwen3:8b"
+    response_llm_model: str = "qwen3:4b"
 
     # Tool-plan model (separate for prompt-following / JSON reliability)
-    # Used by response_generator to decide the next tool call and generate
-    # the exact JSON params (including edit_file strings).
     tool_plan_llm_provider: str = "ollama"
-    tool_plan_llm_model: str = "qwen3:8b"
+    tool_plan_llm_model: str = "qwen3:4b"
 
     # Vision (screen-share / multimodal). OpenAI-compatible APIs: same base_url + key as text.
     # Empty: Ollama falls back to llava:13b in response-generator; OpenAI-compatible uses llm_model.
@@ -89,10 +95,39 @@ class Settings(BaseSettings):
     # Empty = uses the same base URL as the vision model.
     computer_use_llm_base_url: str = ""
 
+    # Router model (tiny/fast model for intent routing)
+    router_model: str = ""  # empty = use llm_model as fallback
+
+    # Leyline proxy — when set, all LLM calls route through the Leyline gateway
+    # (https://github.com/theaiinc/leyline). Leyline handles provider failover,
+    # model routing, load balancing, prompt compression, and cost-aware selection.
+    # Cognition only needs to set the budget — Leyline picks the cheapest capable
+    # model within that constraint.
+    #
+    # Expected format: "http://leyline:3000"
+    # When empty, LLC calls go directly to the configured provider as before.
+    leyline_base_url: str = ""
+
+    # Budget constraints forwarded to Leyline for cost-aware model selection.
+    # Leyline picks the cheapest capable model within these limits.
+    # 0 = no cap (Leyline uses its own default).
+    leyline_max_budget_usd: float = 0.0  # max cost per request
+    leyline_daily_budget_usd: float = 0.0  # max cost per rolling day
+
+    # Output token limits per model tier (0 = unlimited)
+    max_output_tokens_2b: int = 128
+    max_output_tokens_4b: int = 384
+    max_output_tokens_12b: int = 1024
+
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "oasis-cognition"
+    # Startup connection policy. Keep fallback detection bounded; container
+    # restart policy is responsible for retrying a permanently unavailable DB.
+    neo4j_connection_timeout_seconds: float = 2.0
+    neo4j_init_max_retries: int = 1
+    neo4j_retry_delay_seconds: float = 0.5
 
     # Redis
     redis_url: str = "redis://localhost:6379"
@@ -135,7 +170,7 @@ class Settings(BaseSettings):
     weight_rule_match: float = 0.25
     weight_contradiction_penalty: float = 0.1
 
-    model_config = {"env_prefix": "OASIS_", "env_file": ".env"}
+    model_config = {"env_prefix": "OASIS_", "env_file": ".env", "extra": "ignore"}
 
 
 def _load_active_project_overrides() -> dict[str, Any]:

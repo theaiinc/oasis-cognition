@@ -106,6 +106,20 @@ export class WorkflowStore implements OnModuleDestroy {
       .exec();
   }
 
+  async deleteRunsForWorkflow(workflowId: string): Promise<void> {
+    for (const [runId, run] of this.mem.runs) {
+      if (run.workflow_id === workflowId) this.mem.runs.delete(runId);
+    }
+    const r = this.r;
+    if (!r) return;
+    const runIds = await r.zrange(`wf:runs:by-workflow:${workflowId}`, 0, -1);
+    const tx = r.multi().del(`wf:runs:by-workflow:${workflowId}`);
+    for (const runId of runIds) {
+      tx.del(`wf:run:${runId}`, `wf:stream:${runId}`);
+    }
+    await tx.exec();
+  }
+
   /* ── Triggers ──────────────────────────────────────────────────── */
 
   async saveTrigger(t: Trigger): Promise<void> {

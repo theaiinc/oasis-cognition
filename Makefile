@@ -31,7 +31,8 @@ DIARIZATION_PID := /tmp/oasis-diarization.pid
 	mobile-relay-start mobile-relay-stop dev-agent-start dev-agent-stop \
 	gipformer-start gipformer-stop diarization-start diarization-stop \
 	ui-parser-start ui-parser-stop \
-	docker-ensure docker-fix-stale-state
+	docker-ensure docker-fix-stale-state \
+	asgard asgard-status asgard-stop asgard-logs
 
 # ── Main commands ─────────────────────────────────────────────────────────────
 
@@ -131,10 +132,9 @@ dev-agent-start:
 	@if curl -s http://localhost:8008/health >/dev/null 2>&1; then \
 		echo "🔧  Dev Agent: already running"; \
 	else \
-		echo "🔧  Dev Agent: starting..."; \
-		nohup bash $(CURDIR)/scripts/start-dev-agent.sh > $(DEV_AGENT_LOG) 2>&1 & \
-		echo $$! > $(DEV_AGENT_PID); \
-		sleep 2; \
+		echo "🔧  Dev Agent: starting via launchd..."; \
+		launchctl load $(HOME)/Library/LaunchAgents/com.oasis.dev-agent.plist 2>/dev/null || true; \
+		sleep 3; \
 		if curl -s http://localhost:8008/health >/dev/null 2>&1; then \
 			echo "🔧  Dev Agent: ready"; \
 		else \
@@ -143,10 +143,11 @@ dev-agent-start:
 	fi
 
 dev-agent-stop:
-	@if [ -f $(DEV_AGENT_PID) ]; then \
-		kill $$(cat $(DEV_AGENT_PID)) 2>/dev/null || true; \
-		rm -f $(DEV_AGENT_PID); \
+	@if launchctl print gui/$(shell id -u)/com.oasis.dev-agent >/dev/null 2>&1; then \
+		launchctl bootout gui/$(shell id -u)/com.oasis.dev-agent 2>/dev/null || true; \
 		echo "🔧  Dev Agent: stopped"; \
+	else \
+		echo "🔧  Dev Agent: not running"; \
 	fi
 
 # ── UI Parser (native Python, OmniParser V2 + Tesseract OCR) ────────────────
@@ -313,3 +314,19 @@ transcription-ensure:
 		bash scripts/install-transcription-service.sh; \
 		sleep 3; \
 	fi
+
+# ── Asgard — Unified Launcher for theaiinc Daily Apps ──────────────────────────
+
+ASGARD := $(CURDIR)/apps/asgard/asgard
+
+asgard:
+	@$(ASGARD) up
+
+asgard-status:
+	@$(ASGARD) status
+
+asgard-stop:
+	@$(ASGARD) down
+
+asgard-logs:
+	@$(ASGARD) logs

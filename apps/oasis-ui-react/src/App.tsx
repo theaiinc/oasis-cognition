@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog } from 'lucide-react';
+import { Terminal, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog, FolderOpen } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Toaster } from "@/components/ui/toaster";
@@ -11,7 +11,7 @@ import { assistantMessageId, cn, getErrorMessage, timelineClientKeyForMessage } 
 import type { Message, TimelineEvent, ProjectConfig, GraphData, RulesGraphData, CodeGraphData, ContextBudget } from '@/lib/types';
 import { computeThoughtStreamRevision } from '@/lib/thoughtStreamRevision';
 import { OASIS_BASE_URL, VOICE_AGENT_URL } from '@/lib/constants';
-import { postInteractionNdjson } from '@/lib/interaction-api';
+import { postInteraction } from '@/lib/interaction-api';
 import { linkChatToProject } from '@/lib/artifact-api';
 import { extractMentionedArtifactIds } from '@/lib/mention-utils';
 import { useQuickUpload } from '@/hooks/useQuickUpload';
@@ -28,8 +28,9 @@ import {
 import { VirtualizedChatMessages } from '@/components/chat/VirtualizedChatMessages';
 import { ActiveMissionsBar, type MissionRow } from '@/components/chat/ActiveMissionsBar';
 import { EmptyChatHints } from '@/components/chat/EmptyChatHints';
+import type { SessionUsage as BudgetUsage, SessionBudget } from '@/components/chat/SessionBudgetPill';
 import { GraphPanel } from '@/components/graph';
-import { SettingsPanel, HistoryPanel, ArtifactsPanel } from '@/components/panels';
+import { SettingsPanel, HistoryPanel, ArtifactsPanel, ProjectsPanel } from '@/components/panels';
 import { AgentsPanel } from '@/components/agents/AgentsPanel';
 import { RolePicker } from '@/components/chat/RolePicker';
 import { WorkflowsPanel } from '@/components/workflows/WorkflowsPanel';
@@ -66,6 +67,7 @@ export default function App() {
     return id;
   });
   const [timelineByClientMessageId, setTimelineByClientMessageId] = useState<Record<string, TimelineEvent[]>>({});
+  const [liveReasoningByClientId, setLiveReasoningByClientId] = useState<Record<string, string>>({});
   const [selectedTimelineMessageId, setSelectedTimelineMessageId] = useState<string | null>(null);
   const [activeClientMessageId, setActiveClientMessageId] = useState<string | null>(null);
   const [voiceIdModalOpen, setVoiceIdModalOpen] = useState(false);
@@ -80,6 +82,7 @@ export default function App() {
   const [showWorkflowsPanel, setShowWorkflowsPanel] = useState(false);
   const [showMobilePairingPanel, setShowMobilePairingPanel] = useState(false);
   const [showArtifactsPanel, setShowArtifactsPanel] = useState(false);
+  const [showProjectsPanel, setShowProjectsPanel] = useState(false);
   // Missions visible inline in the chat — not in a separate panel. The map is the source of
   // truth; the SSE handlers below mutate it as Mission* events arrive.
   const [missionsById, setMissionsById] = useState<Record<string, MissionRow>>({});
@@ -87,6 +90,10 @@ export default function App() {
   // /api/v1/sessions/active every 5s; drives the green pulse on HistoryPanel
   // rows + the sidebar History-icon badge so cross-tab activity is visible.
   const [activeSessionIds, setActiveSessionIds] = useState<Set<string>>(() => new Set());
+  // Per-session token / USD usage + budget cap. Polled alongside the active-session list.
+  const [sessionUsage, setSessionUsage] = useState<BudgetUsage | null>(null);
+  const [sessionBudget, setSessionBudget] = useState<SessionBudget | null>(null);
+  const [sessionBudgetPct, setSessionBudgetPct] = useState<number>(0);
   // Active project role for routing chat → agent profile (model + preamble).
   // Persisted per project by <RolePicker> via localStorage.
   const [activeRoleId, setActiveRoleId] = useState<string | null>(null);
@@ -108,9 +115,52 @@ export default function App() {
     setActiveProjectId(id);
     if (id) localStorage.setItem('oasis_active_project', id);
     else localStorage.removeItem('oasis_active_project');
+    // Clear session-bound graphs/timelines from the old project so stale data doesn't persist
+    setGraphsBySessionId({});
+    setTimelineByClientMessageId({});
   }, []);
   const [contextBudget, setContextBudget] = useState<ContextBudget | null>(null);
   const [activeProjectName, setActiveProjectName] = useState<string | undefined>(undefined);
+
+  // ── Infinite-scroll pagination state ──────────────────────────────────
+  const [historyPage, setHistoryPage] = useState(0);
+  const [hasMoreHistory, setHasMoreHistory] = useState(true);
+  const [loadingHistory, setLoadingHistory] = useState(false);
+
+  // ── Agent completion notifications ──
+  const [notifications, setNotifications] = useState<string[]>([]);
+  const originalTitleRef = useRef<string>('');
+  const flashTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  // Tracks which client_message_ids have received a ThinkingChunkGenerated
+  // event.  When absent, the model doesn't expose separate reasoning tokens
+  // and we show content text in the overlay instead of a blank "Working…".
+  const seenThinkingRef = useRef<Set<string>>(new Set());
+
+  /** Flash the document title between original and a badge so the user
+   *  notices even if they're on another tab.  Auto-restores after 4s. */
+  const flashTitle = useCallback((badge: string) => {
+    if (!originalTitleRef.current) originalTitleRef.current = document.title;
+    if (flashTimerRef.current) {
+      clearInterval(flashTimerRef.current);
+      flashTimerRef.current = null;
+    }
+    let toggle = false;
+    flashTimerRef.current = setInterval(() => {
+      document.title = toggle ? `🔔 ${badge}` : originalTitleRef.current;
+      toggle = !toggle;
+    }, 1200);
+    setTimeout(() => {
+      if (flashTimerRef.current) {
+        clearInterval(flashTimerRef.current);
+        flashTimerRef.current = null;
+      }
+      document.title = originalTitleRef.current;
+    }, 4000);
+  }, []);
+  /** Stable ref so the SSE effect can call flashTitle without being in its dep array. */
+  const flashTitleRef = useRef(flashTitle);
+  flashTitleRef.current = flashTitle;
 
   // Fetch active project name whenever activeProjectId changes
   useEffect(() => {
@@ -145,6 +195,10 @@ export default function App() {
               }
             }
             _setActiveProjectId(undefined);
+          } else if (devAgentProjectId !== activeProjectId) {
+            // The browser's persisted selection is authoritative for the
+            // session; bring the dev-agent back into sync after a restart.
+            await axios.post(`${OASIS_BASE_URL}/api/v1/project/activate`, { project_id: activeProjectId }, { timeout: 15000 }).catch(() => undefined);
           }
         } else if (devAgentProjectId) {
           // No stored project but dev-agent has one — auto-adopt it
@@ -160,6 +214,20 @@ export default function App() {
     })();
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Auto-load messages on startup ──
+  // When the user refreshes, restore the chat history so the session picks
+  // up where they left off.  If the last interaction was in-flight we also
+  // persist & restore the client message id so SSE backlog events
+  // find the correct message rows instead of duplicating.
+  useEffect(() => {
+    const sid = sessionStorage.getItem('oasis-session-id');
+    if (!sid) return;
+
+    const storedClientId = sessionStorage.getItem('oasis-last-client-msg');
+
+    loadHistoryPage(sid, 0, false, storedClientId);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   const quickUpload = useQuickUpload();
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -167,6 +235,51 @@ export default function App() {
   const isSendingRef = useRef(false);
   const abortControllerRef = useRef<AbortController | null>(null);
   const { toast } = useToast();
+
+  // Auto-request notification permission on mount so the browser prompt
+  // fires from a user-gesture context (the first click / interaction).
+  useEffect(() => {
+    if (typeof Notification === 'undefined') return;
+    if (Notification.permission === 'granted' || Notification.permission === 'denied') return;
+    const timer = setTimeout(() => { void Notification.requestPermission(); }, 2000);
+    return () => clearTimeout(timer);
+  }, []);
+
+  /** Fire an OS-level notification — uses Electron IPC in desktop, Web Notification API in browser. */
+  const fireOsNotification = useCallback((msg: string) => {
+    try {
+      // Electron desktop shell
+      const w = window as unknown as { oasis?: { isDesktop?: boolean; notify?: (o: { title: string; body: string; silent?: boolean }) => void } };
+      if (w.oasis?.isDesktop && w.oasis.notify) {
+        w.oasis.notify({ title: 'Oasis', body: msg });
+        return;
+      }
+      // Browser: use the Web Notification API
+      if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+        new Notification('Oasis', { body: msg });
+      }
+    } catch { /* notifications not supported */ }
+  }, []);
+
+  /** Push a notification, fire a toast, flash the document title, and send an OS notification.
+   *  Used at every agent completion boundary so the user never misses
+   *  a response even when looking at another tab. */
+  const notifyAgentEvent = useCallback((msg: string, opts?: { variant?: 'default' | 'destructive' }) => {
+    setNotifications(prev => [msg, ...prev].slice(0, 20));
+    flashTitleRef.current(msg.length > 22 ? msg.slice(0, 20) + '…' : msg);
+    toast({ title: msg, variant: opts?.variant || 'default' });
+    // Fire OS notification on the next microtask so it doesn't block rendering
+    queueMicrotask(() => fireOsNotification(msg));
+  }, [toast, fireOsNotification]);
+  /** Stable ref so the SSE effect can call notifyAgentEvent without being in its dep array. */
+  const notifyRef = useRef(notifyAgentEvent);
+  notifyRef.current = notifyAgentEvent;
+  /** Tracks client_message_ids we've already notified for (SSE backlog replay suppression) */
+  const notifiedIdsRef = useRef<Set<string>>(new Set());
+
+  const dismissNotification = useCallback((idx: number) => {
+    setNotifications(prev => prev.filter((_, i) => i !== idx));
+  }, []);
 
   const addMessage = useCallback((text: string, sender: Message['sender'], confidence?: string, isTranscript?: boolean, isQueued?: boolean, id?: string, replyTo?: { messageId: string; preview: string }) => {
     setMessages(prev => [...prev, {
@@ -320,19 +433,64 @@ export default function App() {
     return () => { cancelled = true; clearInterval(interval); };
   }, []);
 
+  // Poll the current session's usage + budget. Cheap (one Redis hash lookup
+  // server-side); kept on a separate interval so changes to the cap don't
+  // wait the full 5s of the active-sessions poll.
+  const reloadBudget = useCallback(async (sid: string) => {
+    if (!sid) return;
+    try {
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/session/usage`, {
+        params: { session_id: sid },
+        timeout: 4000,
+      });
+      const d = res.data || {};
+      setSessionUsage(d.usage || null);
+      setSessionBudget(d.budget || null);
+      setSessionBudgetPct(typeof d.pct === 'number' ? d.pct : 0);
+    } catch {
+      // endpoint optional — fail silent
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!textSessionId) return;
+    void reloadBudget(textSessionId);
+    const interval = setInterval(() => reloadBudget(textSessionId), 6000);
+    return () => clearInterval(interval);
+  }, [textSessionId, reloadBudget]);
+
   const loadSession = useCallback(async (sessionId: string) => {
     try {
-      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, { params: { session_id: sessionId } });
-      const msgs: Message[] = (res.data.messages || []).map((m: { role: string; content: string; timestamp: string }, i: number) => ({
-        id: `hist-${sessionId}-${i}`,
-        text: m.content,
-        sender: m.role === 'user' ? 'user' : 'assistant',
-        timestamp: new Date(m.timestamp),
-      }));
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, { params: { session_id: sessionId, page: 0, limit: 50 } });
+      const raw = res.data.messages || [];
+      const hasMore = res.data.has_more === true;
+      setHasMoreHistory(hasMore);
+      let lastClientMsgId: string | undefined;
+      const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string; client_message_id?: string }, i: number) => {
+        const cmId = m.client_message_id;
+        const sender: Message['sender'] = m.role === 'user' ? 'user' : 'assistant';
+        if (sender === 'user' && cmId) {
+          lastClientMsgId = cmId;
+          return { id: cmId, text: m.content, sender, timestamp: new Date(m.timestamp) };
+        }
+        if (sender === 'assistant' && lastClientMsgId) {
+          return { id: assistantMessageId(lastClientMsgId), text: m.content, sender, timestamp: new Date(m.timestamp) };
+        }
+        return { id: `hist-${sessionId}-${i}`, text: m.content, sender, timestamp: new Date(m.timestamp) };
+      });
       setMessages(msgs);
+      setHistoryPage(0);
       setTextSessionId(sessionId);
       sessionStorage.setItem('oasis-session-id', sessionId);
       setTimelineByClientMessageId({});
+      // Track in-flight API-started sessions so SSE events & thinking overlay work
+      if (raw.length > 0) {
+        const lastRaw = raw[raw.length - 1] as { role?: string; client_message_id?: string } | undefined;
+        if (lastRaw?.role === 'user' && lastRaw?.client_message_id) {
+          setActiveClientMessageId(lastRaw.client_message_id);
+          setIsThinking(true);
+        }
+      }
       setShowHistoryPanel(false);
       // Reset scroll state so the "New messages" button doesn't persist across sessions
       setIsNearBottom(true);
@@ -367,7 +525,7 @@ export default function App() {
     if (mentionedArtifactIds && mentionedArtifactIds.length > 0) context.mentioned_artifact_ids = mentionedArtifactIds;
     if (attachedArtifactIds && attachedArtifactIds.length > 0) context.attached_artifact_ids = attachedArtifactIds;
 
-    const data = await postInteractionNdjson(
+    return postInteraction(
       `${OASIS_BASE_URL}/api/v1/interaction`,
       {
         user_message: text,
@@ -377,7 +535,6 @@ export default function App() {
       },
       signal,
     );
-    return data;
   }, [textSessionId, autonomousMode, activeProjectId, activeRoleId]);
 
   const handleStopPipeline = useCallback(() => {
@@ -386,6 +543,7 @@ export default function App() {
     isSendingRef.current = false;
     queueRef.current = [];
     setQueuedMessages([]);
+    sessionStorage.removeItem('oasis-last-client-msg');
     addMessage('Pipeline stopped.', 'system');
   }, [addMessage]);
 
@@ -400,23 +558,7 @@ export default function App() {
     setIsThinking(true);
     setActiveClientMessageId(next.clientMessageId);
     try {
-      const data = await sendToApi(next.text, next.clientMessageId, next.replyTo);
-      setIsThinking(false);
-      const assistantReply = typeof data?.response === 'string' ? data.response.trim() : '';
-      if (assistantReply) {
-        upsertAssistantMessage(next.clientMessageId, assistantReply, data.confidence?.toString());
-        if (data?.reasoning_graph && Object.keys(data.reasoning_graph).length > 0) {
-          const g = data.reasoning_graph as { nodes?: Array<{ node_type?: string; title?: string }> };
-          const conclusionNode = g?.nodes?.find((n: { node_type?: string }) => n.node_type === 'ConclusionNode');
-          setGraphsBySessionId(prev => ({ ...prev, [textSessionId]: { graph: data.reasoning_graph, timestamp: new Date().toISOString(), reasoning_trace: data.reasoning_trace, confidence: data.confidence, conclusion: data.conclusion ?? conclusionNode?.title ?? assistantReply.slice(0, 200) } }));
-        }
-      } else if (data) {
-        upsertAssistantMessage(
-          next.clientMessageId,
-          '_(Empty reply from the pipeline — open the timeline for this message or try again.)_',
-          data.confidence?.toString(),
-        );
-      }
+      await sendToApi(next.text, next.clientMessageId, next.replyTo);
     } catch (e: unknown) {
       setIsThinking(false);
       if (isUserAbort(e)) return;
@@ -425,7 +567,6 @@ export default function App() {
       toast({ title: "Reasoning Pipeline Error", description: detail, variant: "destructive" });
     } finally {
       isSendingRef.current = false;
-      if (queueRef.current.length > 0) queueMicrotask(() => { void flushQueueIfIdle(); });
     }
   }, [addMessage, sendToApi, toast, textSessionId, upsertAssistantMessage]);
 
@@ -520,6 +661,89 @@ export default function App() {
     }
   }, []);
 
+  // ── Infinite-scroll history pagination ──────────────────────────────────
+  const loadingHistoryRef = useRef(false);
+  const loadHistoryPage = useCallback(async (sid: string, page: number, append: boolean, storedClientId?: string | null) => {
+    if (loadingHistoryRef.current) return;
+    loadingHistoryRef.current = true;
+    setLoadingHistory(true);
+    try {
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/history/messages`, {
+        params: { session_id: sid, page, limit: 50 },
+        timeout: 8000,
+      });
+      const raw = res.data.messages || [];
+      const hasMore = res.data.has_more === true;
+      setHasMoreHistory(hasMore);
+
+      if (page === 0 && !append) {
+        // Initial load: assign IDs from stored client_message_id when available,
+        // so SSE events can correlate properly (critical for API-started sessions).
+        let lastClientMsgId: string | undefined;
+        const msgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string; client_message_id?: string }, i: number) => {
+          const cmId = m.client_message_id;
+          const sender = m.role === 'user' ? 'user' as const : 'assistant' as const;
+          if (sender === 'user' && cmId) {
+            lastClientMsgId = cmId;
+            return { id: cmId, text: m.content, sender, timestamp: new Date(m.timestamp) };
+          }
+          // For assistant messages right after a user message with known client_message_id,
+          // derive the SSE-compatible ID so ResponseChunkGenerated events can find them.
+          if (sender === 'assistant' && lastClientMsgId) {
+            return { id: assistantMessageId(lastClientMsgId), text: m.content, sender, timestamp: new Date(m.timestamp) };
+          }
+          return { id: '', text: m.content, sender, timestamp: new Date(m.timestamp) };
+        });
+
+        // If the last interaction was in-flight, reconstruct rows with SSE-compatible IDs
+        if (storedClientId && msgs.length >= 1) {
+          const last = msgs[msgs.length - 1];
+          if (last.sender === 'user') {
+            msgs[msgs.length - 1] = { ...last, id: storedClientId };
+          } else {
+            if (msgs.length >= 2 && msgs[msgs.length - 2]?.sender === 'user') {
+              msgs[msgs.length - 2] = { ...msgs[msgs.length - 2], id: storedClientId };
+              msgs[msgs.length - 1] = { ...last, id: assistantMessageId(storedClientId) };
+            }
+            sessionStorage.removeItem('oasis-last-client-msg');
+          }
+        }
+
+        // For the last in-flight user message, track it for SSE correlation.
+        // Use storedClientId from sessionStorage when the UI sent the message,
+        // or fall back to the stored client_message_id for API-started sessions.
+        const lastRaw = raw.length > 0 ? raw[raw.length - 1] as { role?: string; client_message_id?: string } : undefined;
+        if (lastRaw?.role === 'user') {
+          if (storedClientId) {
+            setActiveClientMessageId(storedClientId);
+          } else if (lastRaw?.client_message_id) {
+            setActiveClientMessageId(lastRaw.client_message_id);
+          }
+        }
+        if (lastRaw?.role === 'user') setIsThinking(true);
+
+        // Fill in synthetic IDs for any messages that still lack them
+        setMessages(msgs.map((m, i) => (m.id ? m : { ...m, id: `hist-${sid}-${i}` })));
+      } else {
+        // Append older messages at the beginning (prepend)
+        const olderMsgs: Message[] = raw.map((m: { role: string; content: string; timestamp: string }, i: number) => ({
+          id: `hist-${sid}-p${page}-${i}`,
+          text: m.content,
+          sender: m.role === 'user' ? 'user' : 'assistant',
+          timestamp: new Date(m.timestamp),
+        }));
+        setMessages(prev => [...olderMsgs, ...prev]);
+      }
+      setHistoryPage(page);
+    } catch {
+      // No more history or error
+      setHasMoreHistory(false);
+    } finally {
+      loadingHistoryRef.current = false;
+      setLoadingHistory(false);
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Sync autonomous mode to backend whenever session changes (including new chats)
   useEffect(() => {
     if (!textSessionId) return;
@@ -546,7 +770,7 @@ export default function App() {
     axios.get(`${OASIS_BASE_URL}/api/v1/project/config`, { timeout: 5000 })
       .then(res => { const d = res.data; if (d?.success && d.config) setProjectConfig({ configured: true, project_path: d.config.project_path, project_name: d.config.project_name, project_type: d.config.project_type, git_url: d.config.git_url, last_indexed: d.config.last_indexed, context_summary: d.config.context_summary, tech_stack: d.config.tech_stack, frameworks: d.config.frameworks }); })
       .catch(() => { /* dev-agent not running */ });
-  }, []);
+  }, [activeProjectId]);
 
   // ── CU session progress poller (lives at App level so it survives panel close) ──
   const cuPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
@@ -641,6 +865,43 @@ export default function App() {
           void reloadMissions();
           return;
         }
+
+        // Snap the budget pill into sync as soon as a turn completes or the cap
+        // is hit, instead of waiting for the next 6s poll.
+        if (data.event_type === 'ResponseGenerated' || data.event_type === 'SessionBudgetExceeded') {
+          if (data.session_id === textSessionId || (data.payload as Record<string, unknown>)?.session_id === textSessionId) {
+            void reloadBudget(textSessionId);
+          }
+        }
+
+        // Terminal events clear the thinking state — important when the
+        // pipeline finished while the page was refreshing (SSE backlog replay).
+        if (
+          data.event_type === 'ResponseGenerated' ||
+          data.event_type === 'ResponseFailed' ||
+          data.event_type === 'InteractionFailed' ||
+          data.event_type === 'InteractionAborted'
+        ) {
+          setIsThinking(false);
+          sessionStorage.removeItem('oasis-last-client-msg');
+          // Clear reasoning overlay + tracking ref once the response is done
+          const clientMsgId = (data.payload as any)?.client_message_id;
+          if (clientMsgId) {
+            seenThinkingRef.current.delete(clientMsgId);
+            setLiveReasoningByClientId(prev => {
+              if (prev[clientMsgId]) { const n = { ...prev }; delete n[clientMsgId]; return n; }
+              return prev;
+            });
+          }
+          // Notify the user when a chat response completes (or fails).
+          // Suppress backlog replay duplicates by tracking notified client_message_ids.
+          if (data.event_type === 'ResponseGenerated' && clientMsgId && !notifiedIdsRef.current.has(clientMsgId)) {
+            notifiedIdsRef.current.add(clientMsgId);
+            notifyRef.current('Agent finished responding.');
+          } else if (data.event_type === 'ResponseFailed') {
+            notifyRef.current('Agent response failed.', { variant: 'destructive' });
+          }
+        }
         if (data.event_type === 'MissionRunStarted') {
           const p = data.payload as Record<string, any>;
           const mid = p?.mission_id;
@@ -727,6 +988,73 @@ export default function App() {
               : (p.result ? String(p.result).replace(/\s+/g, ' ').slice(0, 200) : 'Run completed.');
             try { w.oasis.notify({ title, body: bodyText }); } catch { /* notifications not supported */ }
           }
+          // Toast + title flash so the user notices even in the browser.
+          if (p.error) {
+            notifyRef.current(`Mission failed: ${(p.goal || 'untitled').slice(0, 60)}`, { variant: 'destructive' });
+          } else {
+            notifyRef.current(`Mission completed: ${(p.goal || 'untitled').slice(0, 60)}`);
+          }
+          return;
+        }
+
+        // ── Coordinator (parallel subagent) events ──────────────────────
+        // These surface as their own chat rows (sender='coordinator') for
+        // preflight approval cards and child report digests.
+        if (data.event_type === 'CoordinatorPreflightReady') {
+          const p = data.payload as Record<string, any>;
+          if (!p?.job_id) return;
+          const rowId = `job-${p.job_id}`;
+          const cardPayload = {
+            job_id: p.job_id,
+            status: 'awaiting_approval' as const,
+            task_count: p.task_count ?? 0,
+            parallel_allowed: p.parallel_allowed ?? 1,
+            degraded_mode: (p.degraded_mode ?? 'full') as 'full' | 'sequential' | 'reduced',
+            degraded_reason: p.degraded_reason,
+            est_usd_low: p.est_usd_low ?? 0,
+            est_usd_high: p.est_usd_high ?? 0,
+            host_ram_mb: p.host_ram_mb ?? 0,
+            child_reports: [],
+          };
+          setMessages(prev => prev.some(m => m.id === rowId) ? prev : [...prev, {
+            id: rowId,
+            text: '',
+            sender: 'coordinator',
+            timestamp: new Date(),
+            jobApproval: cardPayload,
+          }]);
+          return;
+        }
+
+        if (data.event_type === 'SubagentStarted' || data.event_type === 'SubagentReport' || data.event_type === 'JobCompleted') {
+          const p = data.payload as Record<string, any>;
+          const jobId = p?.job_id;
+          if (!jobId) return;
+          const rowId = `job-${jobId}`;
+          setMessages(prev => prev.map(m => {
+            if (m.id !== rowId || !m.jobApproval) return m;
+            const j = { ...m.jobApproval };
+            if (data.event_type === 'SubagentStarted') {
+              j.status = 'running';
+            } else if (data.event_type === 'SubagentReport') {
+              j.child_reports = [...(j.child_reports || []), {
+                task_id: p.task_id,
+                status: p.status,
+                cost_usd: p.cost_usd,
+                final_message: p.final_message,
+              }];
+            } else if (data.event_type === 'JobCompleted') {
+              j.status = p.status === 'completed' ? 'completed' : p.status === 'failed' ? 'failed' : 'cancelled';
+              if (p.error) j.error = p.error;
+              // Notify for completed coordinator jobs
+              if (p.status === 'completed') {
+                notifyRef.current('Coordinator job completed.');
+              } else if (p.status === 'failed') {
+                notifyRef.current('Coordinator job failed.', { variant: 'destructive' });
+              }
+            }
+            return { ...m, jobApproval: j };
+          }));
           return;
         }
 
@@ -737,10 +1065,20 @@ export default function App() {
         if (data.event_type === 'ResponseChunkGenerated') {
           const fullText = (data.payload as any).full_text;
           const assistantRowId = assistantMessageId(clientId);
+          // Do NOT push response chunks into the thinking overlay — that's
+          // for reasoning tokens (ThinkingChunkGenerated) only.  The chat
+          // message itself already streams the response text, so putting it
+          // in the overlay too just duplicates content, especially for
+          // casual/complex routes that never produce reasoning tokens.
           setMessages(prev => {
             const aidx = prev.findIndex(m => m.id === assistantRowId);
             if (aidx >= 0) {
               return prev.map(m => (m.id === assistantRowId ? { ...m, text: fullText } : m));
+            }
+            // Backlog replay: check if an assistant message with this text (or containing this chunk)
+            // already exists (loaded from history with a hist-* ID). If so, don't duplicate.
+            if (fullText && prev.some(m => m.sender === 'assistant' && m.text.includes(fullText))) {
+              return prev;
             }
             const uidx = prev.findIndex(m => m.id === clientId && m.sender === 'user');
             if (uidx >= 0) {
@@ -764,11 +1102,11 @@ export default function App() {
         }
 
         if (data.event_type === 'ToolReasoningChunkGenerated') {
-          const fullReasoning = (data.payload as any).full_reasoning;
+          const fullReasoning = (data.payload as any).full_reasoning || '';
           const iteration = (data.payload as any).iteration;
+          // Update timeline event for this iteration
           setTimelineByClientMessageId(prev => {
             const events = prev[clientId] || [];
-            // Find and update the specific ToolCallStarted event for this iteration
             const updatedEvents = events.map(e => {
               if (e.event_type === 'ToolCallStarted' && (e.payload as any).iteration === iteration) {
                 return { ...e, payload: { ...e.payload, reasoning: fullReasoning } };
@@ -777,6 +1115,17 @@ export default function App() {
             });
             return { ...prev, [clientId]: updatedEvents };
           });
+          // Update live reasoning overlay so thinking card shows tool-loop reasoning
+          seenThinkingRef.current.add(clientId);
+          setLiveReasoningByClientId(prev => ({ ...prev, [clientId]: fullReasoning }));
+          return;
+        }
+
+        // Live reasoning from thinking models (Gemma, DeepSeek R1, etc.)
+        if (data.event_type === 'ThinkingChunkGenerated') {
+          const fullReasoning = (data.payload as any).full_reasoning || '';
+          seenThinkingRef.current.add(clientId);
+          setLiveReasoningByClientId(prev => ({ ...prev, [clientId]: fullReasoning }));
           return;
         }
 
@@ -843,28 +1192,13 @@ export default function App() {
       return;
     }
     setActiveClientMessageId(clientMessageId);
+    sessionStorage.setItem('oasis-last-client-msg', clientMessageId);
     addMessage(trimmed, 'user', undefined, false, false, clientMessageId, replyTo ? { messageId: replyTo.messageId, preview: replyTo.preview } : undefined);
     quickUpload.clearAll();
     isSendingRef.current = true;
     setIsThinking(true);
     try {
-      const data = await sendToApi(trimmed, clientMessageId, replyTo, mentionedIds, attachedIds);
-      setIsThinking(false);
-      const assistantReply = typeof data?.response === 'string' ? data.response.trim() : '';
-      if (assistantReply) {
-        upsertAssistantMessage(clientMessageId, assistantReply, data.confidence?.toString());
-        if (data?.reasoning_graph && Object.keys(data.reasoning_graph).length > 0) {
-          const g = data.reasoning_graph as { nodes?: Array<{ node_type?: string; title?: string }> };
-          const conclusionNode = g?.nodes?.find((n: { node_type?: string }) => n.node_type === 'ConclusionNode');
-          setGraphsBySessionId(prev => ({ ...prev, [textSessionId]: { graph: data.reasoning_graph, timestamp: new Date().toISOString(), reasoning_trace: data.reasoning_trace, confidence: data.confidence, conclusion: data.conclusion ?? conclusionNode?.title ?? assistantReply.slice(0, 200) } }));
-        }
-      } else if (data) {
-        upsertAssistantMessage(
-          clientMessageId,
-          '_(Empty reply from the pipeline — open the timeline for this message or try again.)_',
-          data.confidence?.toString(),
-        );
-      }
+      await sendToApi(trimmed, clientMessageId, replyTo, mentionedIds, attachedIds);
     } catch (e: unknown) {
       setIsThinking(false);
       if (isUserAbort(e)) return;
@@ -873,7 +1207,6 @@ export default function App() {
       toast({ title: "Reasoning Pipeline Error", description: detail, variant: "destructive" });
     } finally {
       isSendingRef.current = false;
-      queueMicrotask(() => { void flushQueueIfIdle(); });
     }
   }, [replyToMessageId, replyToMessageText, isThinking, addMessage, sendToApi, flushQueueIfIdle, toast, upsertAssistantMessage, textSessionId, quickUpload]);
 
@@ -895,6 +1228,7 @@ export default function App() {
     const newId = `browser-${crypto?.randomUUID?.() || Math.random().toString(36).slice(2)}`;
     setTextSessionId(newId);
     sessionStorage.setItem('oasis-session-id', newId);
+    sessionStorage.removeItem('oasis-last-client-msg');
     setTimelineByClientMessageId({});
     setGraphsBySessionId({});
     setShowHistoryPanel(false);
@@ -914,29 +1248,13 @@ export default function App() {
     addMessage(option, 'user', undefined, false, false, clientMessageId);
     isSendingRef.current = true;
     setIsThinking(true);
-    sendToApi(option, clientMessageId).then((data) => {
-      setIsThinking(false);
-      const assistantReply = typeof data?.response === 'string' ? data.response.trim() : '';
-      if (assistantReply) {
-        upsertAssistantMessage(clientMessageId, assistantReply, data.confidence?.toString());
-        if (data?.reasoning_graph && Object.keys(data.reasoning_graph as object).length > 0) {
-          const g = data.reasoning_graph as { nodes?: Array<{ node_type?: string; title?: string }> };
-          const conclusionNode = g?.nodes?.find((n: { node_type?: string }) => n.node_type === 'ConclusionNode');
-          setGraphsBySessionId(prev => ({ ...prev, [textSessionId]: { graph: data.reasoning_graph as Record<string, unknown>, timestamp: new Date().toISOString(), reasoning_trace: data.reasoning_trace, confidence: data.confidence, conclusion: data.conclusion ?? conclusionNode?.title ?? assistantReply.slice(0, 200) } }));
-        }
-      } else if (data) {
-        upsertAssistantMessage(
-          clientMessageId,
-          '_(Empty reply from the pipeline — open the timeline for this message or try again.)_',
-          data.confidence?.toString(),
-        );
-      }
+    sendToApi(option, clientMessageId).then(() => {
     }).catch((e: unknown) => {
       setIsThinking(false);
       if (isUserAbort(e)) return;
       const detail = axios.isAxiosError(e) ? (e.response?.data as { error?: string } | undefined)?.error || e.message : getErrorMessage(e);
       addMessage(`Error: ${detail}`, 'system');
-    }).finally(() => { isSendingRef.current = false; queueMicrotask(() => { void flushQueueIfIdle(); }); });
+    }).finally(() => { isSendingRef.current = false; });
   }, [addMessage, sendToApi, flushQueueIfIdle, textSessionId, upsertAssistantMessage]);
 
   return (
@@ -963,6 +1281,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title={
@@ -992,6 +1311,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Knowledge graph & Logic engine"
@@ -1013,6 +1333,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Self Teaching"
@@ -1034,6 +1355,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Computer Use"
@@ -1055,6 +1377,7 @@ export default function App() {
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Agents"
@@ -1076,6 +1399,7 @@ export default function App() {
                 setShowAgentsPanel(false);
                 setShowMobilePairingPanel(false);
                 setShowArtifactsPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Workflows"
@@ -1118,6 +1442,7 @@ export default function App() {
                 setShowAgentsPanel(false);
                 setShowWorkflowsPanel(false);
                 setShowMobilePairingPanel(false);
+                setShowProjectsPanel(false);
               }
             }}
             title="Artifacts"
@@ -1140,6 +1465,7 @@ export default function App() {
             setShowWorkflowsPanel(false);
             setShowMobilePairingPanel(false);
             setShowArtifactsPanel(false);
+            setShowProjectsPanel(false);
           }}
           title="Settings"
         >
@@ -1224,6 +1550,16 @@ export default function App() {
         )}
       </AnimatePresence>
       <AnimatePresence>
+        {showProjectsPanel && (
+          <ProjectsPanel
+            open={showProjectsPanel}
+            onClose={() => setShowProjectsPanel(false)}
+            activeProjectId={activeProjectId}
+            onActiveProjectChange={_setActiveProjectId}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
         {showSettingsPanel && <SettingsPanel open={showSettingsPanel} onClose={() => setShowSettingsPanel(false)} projectConfig={projectConfig} onProjectConfigured={(cfg) => setProjectConfig({ ...cfg, configured: true })} sessionId={textSessionId} autonomousMode={autonomousMode} onAutonomousModeChange={handleAutonomousModeChange} activeProjectId={activeProjectId} onActiveProjectChange={_setActiveProjectId} />}
       </AnimatePresence>
 
@@ -1232,7 +1568,7 @@ export default function App() {
         // Full-canvas panels replace the chat area entirely.
         (showWorkflowsPanel || showAgentsPanel) && "hidden",
       )}>
-<ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} />
+<ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} onOpenProjects={() => { setShowProjectsPanel(v => !v); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} sessionUsage={sessionUsage} sessionBudget={sessionBudget} sessionBudgetPct={sessionBudgetPct} onOpenBudget={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} notifications={notifications} onDismissNotification={dismissNotification} />
 
         <div className="flex-1 overflow-hidden flex flex-col p-6 max-w-5xl mx-auto w-full">
           <ActiveMissionsBar
@@ -1250,31 +1586,26 @@ export default function App() {
                 />
               )}
 
-              {messages.length <= 20
-                ? messages.map((m) => (
-                    <ChatMessage
-                      key={m.id}
-                      message={m}
-                      timelineEvents={timelineByClientMessageId[timelineClientKeyForMessage(m)] || []}
-                      onOptionClick={handleOptionClick}
-                      onReply={(id, text) => { setReplyToMessageId(id); setReplyToMessageText(text); }}
-                      onViewTimeline={setSelectedTimelineMessageId}
-                      onEditResend={setInputText}
-                      onResend={sendText}
-                      inputRef={inputRef}
-                    />
-                  ))
-                : <VirtualizedChatMessages
-                    messages={messages}
-                    timelineByClientMessageId={timelineByClientMessageId}
-                    onOptionClick={handleOptionClick}
-                    onReply={(id, text) => { setReplyToMessageId(id); setReplyToMessageText(text); }}
-                    onViewTimeline={setSelectedTimelineMessageId}
-                    onEditResend={setInputText}
-                    onResend={sendText}
-                    inputRef={inputRef}
-                  />
-              }
+              {messages.length > 0 && (
+                <VirtualizedChatMessages
+                  messages={messages}
+                  timelineByClientMessageId={timelineByClientMessageId}
+                  onOptionClick={handleOptionClick}
+                  onReply={(id, text) => { setReplyToMessageId(id); setReplyToMessageText(text); }}
+                  onViewTimeline={setSelectedTimelineMessageId}
+                  onEditResend={setInputText}
+                  onResend={sendText}
+                  inputRef={inputRef}
+                  loadMore={() => {
+                    if (hasMoreHistory && !loadingHistory && textSessionId) {
+                      const nextPage = historyPage + 1;
+                      loadHistoryPage(textSessionId, nextPage, true);
+                    }
+                  }}
+                  hasMore={hasMoreHistory}
+                  loadingMore={loadingHistory}
+                />
+              )}
 
               <VoiceBubbles isTranscribing={voice.isTranscribing} liveTranscript={voice.liveTranscript} silenceSeconds={voice.silenceSeconds} />
 
@@ -1287,6 +1618,7 @@ export default function App() {
                     messages={messages}
                     onViewTimeline={setSelectedTimelineMessageId}
                     onStop={handleStopPipeline}
+                    liveReasoning={activeClientMessageId ? liveReasoningByClientId[activeClientMessageId] || '' : ''}
                   />
                 )}
               </AnimatePresence>

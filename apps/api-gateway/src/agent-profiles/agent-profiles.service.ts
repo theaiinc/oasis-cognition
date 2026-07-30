@@ -13,6 +13,7 @@ import type {
   CreateAgentProfileDto,
   UpdateAgentProfileDto,
 } from './agent-profiles.types';
+import { inferBillingClass, inferResourceClass, validateModelProvider, type ModelVariant } from '../models/model-variants';
 
 function iso(): string { return new Date().toISOString(); }
 
@@ -94,16 +95,33 @@ export class AgentProfilesService implements OnModuleDestroy, OnModuleInit {
   async create(dto: CreateAgentProfileDto): Promise<AgentProfile> {
     if (!dto?.name?.trim()) throw new HttpException('name is required', HttpStatus.BAD_REQUEST);
     if (!dto?.agent_type) throw new HttpException('agent_type is required', HttpStatus.BAD_REQUEST);
-    if (!['internal', 'claude-code', 'cursor-cli'].includes(dto.agent_type)) {
+    if (!['internal', 'claude-code', 'cursor-cli', 'opencode'].includes(dto.agent_type)) {
       throw new HttpException(`unsupported agent_type: ${dto.agent_type}`, HttpStatus.BAD_REQUEST);
     }
     const now = iso();
+    const config = dto.config || {};
+    // Auto-infer billing_class and resource_class from model/provider when not explicitly set
+    if (config.model || config.provider) {
+      if (!config.billing_class) {
+        config.billing_class = inferBillingClass(config.provider, config.model);
+      }
+      if (!config.resource_class) {
+        config.resource_class = inferResourceClass(config.provider, config.model);
+      }
+    }
+    // Validate model-provider consistency
+    if (config.model && config.provider) {
+      const validationError = validateModelProvider(config.provider, config.model);
+      if (validationError) {
+        throw new HttpException(validationError, HttpStatus.BAD_REQUEST);
+      }
+    }
     const profile: AgentProfile = {
       profile_id: uuidv4(),
       name: dto.name.trim(),
       description: dto.description,
       agent_type: dto.agent_type,
-      config: dto.config || {},
+      config,
       created_at: now,
       updated_at: now,
     };

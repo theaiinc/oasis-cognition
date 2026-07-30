@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  X, FolderOpen, RefreshCw, Loader2, CheckCircle2,
-  HardDrive, Globe, RotateCcw,
+  X, FolderOpen, RefreshCw, Loader2,
+  RotateCcw,
   Trash2, FileText,
   ChevronDown, Plus, Edit2, Check, Mic,
   MessageSquare, Link2, Unlink,
@@ -50,7 +50,22 @@ function inferMediaType(mime: string, name: string): 'audio' | 'video' | 'image'
   return null;
 }
 
-type TabKey = 'project' | 'voices' | 'autonomous' | 'general';
+type TabKey = 'project' | 'voices' | 'autonomous' | 'budget' | 'general';
+
+type BudgetMode = 'unlimited' | 'tokens' | 'usd';
+interface BudgetSnapshot {
+  mode: BudgetMode;
+  limit: number;
+  warn_at_pct: number;
+}
+interface BudgetUsageSnapshot {
+  input_tokens: number;
+  output_tokens: number;
+  usd_estimate: number;
+  usd_known: boolean;
+  pricing_updated_at: string | null;
+  last_model: string | null;
+}
 
 export function SettingsPanel({
   open, onClose, projectConfig, onProjectConfigured, sessionId,
@@ -70,6 +85,68 @@ export function SettingsPanel({
 
   // ── Autonomous ───────────────────────────────────────────────────────
   const [autonomousMaxHours, setAutonomousMaxHours] = useState(() => parseInt(localStorage.getItem('oasis_autonomous_max_hours') || '6', 10));
+
+  // ── Budget ───────────────────────────────────────────────────────────
+  // Drafted in local state until the user clicks Save — same pattern as the
+  // project-path field. Loaded from /session/usage on tab open.
+  const [budgetMode, setBudgetMode] = useState<BudgetMode>('unlimited');
+  const [budgetLimit, setBudgetLimit] = useState<string>('');
+  const [budgetSaving, setBudgetSaving] = useState(false);
+  const [budgetSavedAt, setBudgetSavedAt] = useState<string | null>(null);
+  const [budgetUsage, setBudgetUsage] = useState<BudgetUsageSnapshot | null>(null);
+  const [budgetCurrent, setBudgetCurrent] = useState<BudgetSnapshot | null>(null);
+
+  // ── Job / Subagent auto-approve ──────────────────────────────────────
+  const [autoApproveFree, setAutoApproveFree] = useState(() => localStorage.getItem('oasis_auto_approve_free_jobs') !== 'false');
+  const [autoApprovePaid, setAutoApprovePaid] = useState(() => localStorage.getItem('oasis_auto_approve_paid_jobs') === 'true');
+  const [defaultJobBudget, setDefaultJobBudget] = useState(() => localStorage.getItem('oasis_default_job_budget_usd') || '5.0');
+
+  const reloadBudget = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      const res = await axios.get(`${OASIS_BASE_URL}/api/v1/session/usage`, { params: { session_id: sessionId } });
+      const d = res.data || {};
+      const b: BudgetSnapshot | null = d.budget || null;
+      const u: BudgetUsageSnapshot | null = d.usage || null;
+      setBudgetCurrent(b);
+      setBudgetUsage(u);
+      if (b) {
+        setBudgetMode(b.mode);
+        setBudgetLimit(b.limit > 0 ? String(b.limit) : '');
+      }
+    } catch { /* silent */ }
+  }, [sessionId]);
+  useEffect(() => { if (open && tab === 'budget') void reloadBudget(); }, [open, tab, reloadBudget]);
+
+  const handleSaveBudget = useCallback(async () => {
+    if (!sessionId) return;
+    setBudgetSaving(true);
+    try {
+      const limit = budgetMode === 'unlimited' ? 0 : Number(budgetLimit);
+      if (budgetMode !== 'unlimited' && (!Number.isFinite(limit) || limit <= 0)) {
+        // Invalid input — bail without writing
+        setBudgetSaving(false);
+        return;
+      }
+      await axios.post(`${OASIS_BASE_URL}/api/v1/session/budget`, {
+        session_id: sessionId,
+        mode: budgetMode,
+        limit,
+      });
+      setBudgetSavedAt(new Date().toISOString());
+      await reloadBudget();
+    } finally {
+      setBudgetSaving(false);
+    }
+  }, [sessionId, budgetMode, budgetLimit, reloadBudget]);
+
+  const handleResetUsage = useCallback(async () => {
+    if (!sessionId) return;
+    try {
+      await axios.post(`${OASIS_BASE_URL}/api/v1/session/usage/reset`, { session_id: sessionId });
+      await reloadBudget();
+    } catch { /* silent */ }
+  }, [sessionId, reloadBudget]);
   const [snapshots, setSnapshots] = useState<Array<{ snapshot_id: string; timestamp: string; iteration_count: number }>>([]);
   const [restoringSnapshot, setRestoringSnapshot] = useState(false);
 
@@ -341,6 +418,7 @@ export function SettingsPanel({
           ['project', 'Project'],
           ['voices', 'Voices'],
           ['autonomous', 'Autonomous'],
+          ['budget', 'Budget'],
           ['general', 'General'],
         ] as [TabKey, string][]).map(([key, label]) => (
           <button
@@ -503,60 +581,6 @@ export function SettingsPanel({
                   </div>
                 </div>
               )}
-
-              {/* ── Code Index Config ───────────────────────────────── */}
-              <div className="pt-3 border-t border-slate-800">
-                <h3 className="text-xs text-slate-400 font-medium mb-3">Code Index</h3>
-                <div className="flex flex-col gap-3">
-                  <div>
-                    <label className="text-[10px] text-slate-500 font-medium mb-1 block">Source</label>
-                    <div className="flex gap-2">
-                      <button className={cn("flex-1 flex items-center justify-center gap-2 py-1.5 rounded-lg text-xs font-medium transition-all", projectType === 'local' ? "bg-blue-600/20 border border-blue-500/30 text-blue-400" : "bg-slate-800/50 border border-slate-700/50 text-slate-400 hover:text-slate-300")} onClick={() => setProjectType('local')}>
-                        <HardDrive className="w-3 h-3" /> Local
-                      </button>
-                      <button className={cn("flex-1 flex items-center justify-center gap-2 py-1.5 rounded-lg text-xs font-medium transition-all", projectType === 'git' ? "bg-blue-600/20 border border-blue-500/30 text-blue-400" : "bg-slate-800/50 border border-slate-700/50 text-slate-400 hover:text-slate-300")} onClick={() => setProjectType('git')}>
-                        <Globe className="w-3 h-3" /> Git
-                      </button>
-                    </div>
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-slate-500 font-medium mb-1 block">{projectType === 'local' ? 'Project Path' : 'Local Clone Path'}</label>
-                    <input type="text" value={projectPath} onChange={e => setProjectPath(e.target.value)} placeholder="/Users/you/your-project" className="w-full px-3 py-1.5 rounded-lg bg-slate-900/80 border border-slate-700/50 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500/50" />
-                  </div>
-                  {projectType === 'git' && (
-                    <div>
-                      <label className="text-[10px] text-slate-500 font-medium mb-1 block">Git URL</label>
-                      <input type="text" value={gitUrl} onChange={e => setGitUrl(e.target.value)} placeholder="https://github.com/user/repo.git" className="w-full px-3 py-1.5 rounded-lg bg-slate-900/80 border border-slate-700/50 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500/50" />
-                    </div>
-                  )}
-                  <button onClick={projectConfig.configured ? handleReindex : handleConfigure} disabled={isIndexing || !projectPath.trim()} className={cn("w-full py-2 rounded-lg text-xs font-medium transition-all flex items-center justify-center gap-2", isIndexing ? "bg-slate-800 text-slate-400 cursor-wait" : "bg-blue-600 hover:bg-blue-500 text-white")}>
-                    {isIndexing ? (<><Loader2 className="w-3.5 h-3.5 animate-spin" />Indexing...</>) : projectConfig.configured ? (<><RefreshCw className="w-3.5 h-3.5" />Re-index</>) : (<><FolderOpen className="w-3.5 h-3.5" />Configure &amp; Index</>)}
-                  </button>
-                  {indexError && <p className="text-xs text-red-400">{indexError}</p>}
-                  {projectConfig.configured && (
-                    <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800">
-                      <div className="flex items-center gap-2 mb-1.5">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-green-400" />
-                        <span className="text-[11px] font-semibold text-slate-300">{projectConfig.project_name || 'Project'}</span>
-                      </div>
-                      <p className="text-[10px] text-slate-500 mb-1.5">{projectConfig.project_path}</p>
-                      {projectConfig.tech_stack && projectConfig.tech_stack.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mb-1.5">
-                          {projectConfig.tech_stack.map(t => (<span key={t} className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] text-slate-400">{t}</span>))}
-                        </div>
-                      )}
-                      {projectConfig.frameworks && projectConfig.frameworks.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mb-1.5">
-                          {projectConfig.frameworks.map(f => (<span key={f} className="px-1.5 py-0.5 rounded bg-blue-900/30 text-[10px] text-blue-400">{f}</span>))}
-                        </div>
-                      )}
-                      {projectConfig.last_indexed && (
-                        <p className="text-[10px] text-slate-600">Last indexed: {new Date(projectConfig.last_indexed).toLocaleString()}</p>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
             </div>
           )}
 
@@ -695,6 +719,166 @@ export function SettingsPanel({
           {/* ════════════════════════════════════════════════════════════ */}
           {/* ── GENERAL TAB ─────────────────────────────────────────── */}
           {/* ════════════════════════════════════════════════════════════ */}
+          {tab === 'budget' && (
+            <div className="flex flex-col gap-4">
+              <div>
+                <p className="text-sm font-semibold text-slate-200">Per-session budget cap</p>
+                <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
+                  Cap how many tokens or how many dollars this session can consume across all
+                  agent calls. When the cap is reached, Oasis refuses further LLM work and asks
+                  you to raise the cap or start a new chat. The cap applies to the current
+                  session only — every new chat starts fresh.
+                </p>
+              </div>
+
+              {/* Mode picker */}
+              <div className="flex gap-1 rounded-lg bg-slate-900/60 p-1 border border-slate-800">
+                {(['unlimited', 'tokens', 'usd'] as BudgetMode[]).map((m) => (
+                  <button
+                    key={m}
+                    type="button"
+                    onClick={() => setBudgetMode(m)}
+                    className={cn(
+                      'flex-1 px-3 py-1.5 rounded-md text-xs font-medium transition-colors',
+                      budgetMode === m
+                        ? 'bg-slate-700 text-white'
+                        : 'text-slate-400 hover:text-slate-200',
+                    )}
+                  >
+                    {m === 'unlimited' ? '∞ Unlimited' : m === 'tokens' ? 'Tokens' : 'USD'}
+                  </button>
+                ))}
+              </div>
+
+              {/* Limit input */}
+              {budgetMode !== 'unlimited' && (
+                <div>
+                  <label className="text-xs text-slate-400 font-medium mb-1.5 block">
+                    {budgetMode === 'tokens' ? 'Token cap' : 'USD cap'}
+                  </label>
+                  <div className="flex items-center gap-2">
+                    {budgetMode === 'usd' && <span className="text-slate-400 text-sm">$</span>}
+                    <input
+                      type="number"
+                      min={0}
+                      step={budgetMode === 'usd' ? 0.5 : 1000}
+                      value={budgetLimit}
+                      onChange={(e) => setBudgetLimit(e.target.value)}
+                      placeholder={budgetMode === 'tokens' ? '100000' : '5.00'}
+                      className="flex-1 px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-sm text-slate-200"
+                      aria-label={budgetMode === 'tokens' ? 'Token cap' : 'USD cap'}
+                    />
+                    {budgetMode === 'tokens' && <span className="text-[10px] text-slate-500">tokens</span>}
+                  </div>
+                  <p className="text-[10px] text-slate-600 mt-1">
+                    {budgetMode === 'tokens'
+                      ? 'Cumulative input + output tokens. Output is estimated at 20% of input.'
+                      : `Estimated USD cost. Pricing per model — see tooltip on the header pill for the rates' "as of" date.${budgetCurrent && budgetUsage && !budgetUsage.usd_known ? ' ⚠ Current model has no pricing entry; the $ meter will read "$?".' : ''}`}
+                  </p>
+                </div>
+              )}
+
+              {/* Save row */}
+              <div className="flex items-center gap-2">
+                <Button size="sm" onClick={handleSaveBudget} disabled={budgetSaving}>
+                  {budgetSaving ? 'Saving…' : 'Save cap'}
+                </Button>
+                {budgetSavedAt && (
+                  <span className="text-[10px] text-emerald-400">Saved {new Date(budgetSavedAt).toLocaleTimeString()}</span>
+                )}
+              </div>
+
+              {/* Current usage readout */}
+              {budgetUsage && (
+                <div className="rounded-lg border border-slate-800 bg-slate-900/40 p-3">
+                  <div className="flex items-center justify-between mb-2">
+                    <span className="text-[11px] uppercase tracking-wider text-slate-500 font-medium">Current usage</span>
+                    <button
+                      type="button"
+                      onClick={handleResetUsage}
+                      className="text-[10px] text-slate-500 hover:text-red-300 underline underline-offset-2"
+                      title="Zero out the cumulative counters for this session (does not change the cap)"
+                    >
+                      Reset counters
+                    </button>
+                  </div>
+                  <dl className="grid grid-cols-2 gap-y-1.5 text-[11px]">
+                    <dt className="text-slate-500">Input tokens</dt>
+                    <dd className="text-slate-200 font-mono text-right">{budgetUsage.input_tokens.toLocaleString()}</dd>
+                    <dt className="text-slate-500">Output tokens (est.)</dt>
+                    <dd className="text-slate-200 font-mono text-right">{budgetUsage.output_tokens.toLocaleString()}</dd>
+                    <dt className="text-slate-500">USD estimate</dt>
+                    <dd className={cn('font-mono text-right', budgetUsage.usd_known ? 'text-slate-200' : 'text-slate-500')}>
+                      {budgetUsage.usd_known ? `$${budgetUsage.usd_estimate.toFixed(4)}` : '$?'}
+                    </dd>
+                    <dt className="text-slate-500">Last model</dt>
+                    <dd className="text-slate-300 font-mono text-right truncate">{budgetUsage.last_model || '—'}</dd>
+                    {budgetUsage.pricing_updated_at && (
+                      <>
+                        <dt className="text-slate-500">Pricing as of</dt>
+                        <dd className="text-slate-400 font-mono text-right">{budgetUsage.pricing_updated_at}</dd>
+                      </>
+                    )}
+                  </dl>
+                </div>
+              )}
+
+              <p className="text-[10px] text-slate-600 leading-relaxed">
+                ⚠ USD figures are estimates from a static pricing table. Override at the gateway via
+                <code className="text-slate-400 mx-1">OASIS_MODEL_PRICING_JSON</code>
+                if your provider rates differ.
+              </p>
+
+              {/* ── Job / Subagent Budget Settings ──────────────────── */}
+              <div className="pt-3 border-t border-slate-800">
+                <h3 className="text-xs text-slate-400 font-medium mb-3">Subagent Jobs</h3>
+                <p className="text-[10px] text-slate-500 leading-relaxed mb-3">
+                  Auto-approve subagent jobs so they bypass the approval card. Paid jobs use API
+                  or external CLI costs; free jobs use local models (Ollama, MLX).
+                </p>
+                <div className="flex flex-col gap-3">
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] text-slate-300">Auto-approve free jobs</label>
+                    <button
+                      className={cn("relative w-10 h-6 rounded-full transition-all duration-200 flex-shrink-0 border",
+                        autoApproveFree ? "bg-emerald-600 border-emerald-500" : "bg-slate-800 border-slate-600")}
+                      onClick={() => { const v = !autoApproveFree; setAutoApproveFree(v); localStorage.setItem('oasis_auto_approve_free_jobs', String(v)); }}
+                      role="switch" aria-checked={autoApproveFree} aria-label="Auto-approve free jobs"
+                    >
+                      <span className={cn("absolute top-0.5 block w-[18px] h-[18px] rounded-full shadow-md transition-all duration-200",
+                        autoApproveFree ? "left-[20px] bg-white" : "left-0.5 bg-slate-400")} />
+                    </button>
+                  </div>
+                  <div className="flex items-center justify-between">
+                    <label className="text-[11px] text-slate-300">Auto-approve paid jobs</label>
+                    <button
+                      className={cn("relative w-10 h-6 rounded-full transition-all duration-200 flex-shrink-0 border",
+                        autoApprovePaid ? "bg-emerald-600 border-emerald-500" : "bg-slate-800 border-slate-600")}
+                      onClick={() => { const v = !autoApprovePaid; setAutoApprovePaid(v); localStorage.setItem('oasis_auto_approve_paid_jobs', String(v)); }}
+                      role="switch" aria-checked={autoApprovePaid} aria-label="Auto-approve paid jobs"
+                    >
+                      <span className={cn("absolute top-0.5 block w-[18px] h-[18px] rounded-full shadow-md transition-all duration-200",
+                        autoApprovePaid ? "left-[20px] bg-white" : "left-0.5 bg-slate-400")} />
+                    </button>
+                  </div>
+                  <div>
+                    <label className="text-[10px] text-slate-500 font-medium mb-1 block">Default job USD cap</label>
+                    <div className="flex items-center gap-2">
+                      <span className="text-slate-400 text-sm">$</span>
+                      <input
+                        type="number" min={0} step={0.5}
+                        value={defaultJobBudget}
+                        onChange={(e) => { setDefaultJobBudget(e.target.value); localStorage.setItem('oasis_default_job_budget_usd', e.target.value); }}
+                        className="flex-1 px-3 py-2 rounded-lg bg-slate-900/80 border border-slate-700/50 text-sm text-slate-200"
+                        aria-label="Default job USD cap"
+                      />
+                    </div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          )}
+
           {tab === 'general' && (
             <div className="flex flex-col gap-4">
               <LanguageSettings />

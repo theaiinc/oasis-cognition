@@ -1,0 +1,73 @@
+services:
+  # This file is an optional test overlay. The canonical service topology and
+  # ports match ../../docker-compose.yml; the full stack must be started with
+  # that file (this overlay only supplies test databases and overrides).
+  neo4j:
+    image: neo4j:5-community
+    ports:
+      - "7474:7474"
+      - "7687:7687"
+    environment:
+      - NEO4J_AUTH=neo4j/test-password
+      - NEO4J_PLUGINS=["apoc"]
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p test-password 'RETURN 1' || exit 1"]
+      interval: 10s
+      timeout: 10s
+      retries: 10
+      start_period: 30s
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6380:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 3
+
+  # Core services needed for the test scenarios
+  api-gateway:
+    build:
+      context: ../../apps/api-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - OASIS_LLM_PROVIDER=ollama
+      - OASIS_LLM_MODEL=qwen3:8b
+      - OASIS_NEO4J_URI=bolt://neo4j:7687
+      - OASIS_NEO4J_USER=neo4j
+      - OASIS_NEO4J_PASSWORD=test-password
+      - REDIS_URL=redis://redis:6379
+      - RESPONSE_URL=http://response-generator:8005
+      - MEMORY_URL=http://memory-service:8004
+      - INTERPRETER_URL=http://interpreter:8001
+      - GRAPH_BUILDER_URL=http://graph-builder:8002
+      - LOGIC_ENGINE_URL=http://logic-engine:8003
+      - OBSERVER_URL=http://observer-service:8009
+    depends_on:
+      neo4j: { condition: service_healthy }
+      redis: { condition: service_healthy }
+
+  response-generator:
+    build:
+      context: ../..
+      dockerfile: services/response_generator/Dockerfile
+    ports:
+      - "8005:8005"
+    environment:
+      - OASIS_LLM_PROVIDER=ollama
+      - OASIS_LLM_MODEL=qwen3:8b
+
+  memory-service:
+    build:
+      context: ../..
+      dockerfile: services/memory_service/Dockerfile
+    ports:
+      - "8004:8004"
+    environment:
+      - OASIS_NEO4J_URI=bolt://neo4j:7687
+      - OASIS_NEO4J_USER=neo4j
+      - OASIS_NEO4J_PASSWORD=test-password

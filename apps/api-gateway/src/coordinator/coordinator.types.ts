@@ -57,6 +57,7 @@ export interface PlannerPlan {
 
 export interface CoordinatorJob {
   job_id: string;
+  project_id?: string;
   parent_session_id: string;
   interaction_id: string;
   plan: PlannerPlan;

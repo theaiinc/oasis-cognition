@@ -21,7 +21,7 @@ import {
   linkChatToProject, unlinkChatFromProject,
   unlinkArtifactFromProject,
   listSpeakers, enrollSpeaker, updateSpeaker, deleteSpeaker,
-  activateProject, getProjectSettings, saveProjectSettings,
+  activateProject, getProjectSettings, saveProjectSettings, getAgentProfile, updateAgentProfile,
   type Artifact, type Project, type SpeakerProfile,
 } from '@/lib/artifact-api';
 
@@ -40,6 +40,7 @@ interface SettingsPanelProps {
 // ── Helpers ────────────────────────────────────────────────────────────
 
 const AUDIO_EXTS = ['.m4a', '.mp3', '.wav', '.ogg', '.aac', '.flac', '.wma', '.webm'];
+const DEFAULT_LEYLINE_BASE_URL = 'http://localhost:3417/v1';
 
 function inferMediaType(mime: string, name: string): 'audio' | 'video' | 'image' | null {
   if (mime.startsWith('audio/')) return 'audio';
@@ -78,6 +79,26 @@ export function SettingsPanel({
   const [projectPath, setProjectPath] = useState(projectConfig.project_path || '');
   const [projectType, setProjectType] = useState<'local' | 'git'>(projectConfig.project_type || 'local');
   const [gitUrl, setGitUrl] = useState(projectConfig.git_url || '');
+  const [agentProvider, setAgentProvider] = useState('');
+  const [agentRoutingProvider, setAgentRoutingProvider] = useState<'leyline' | 'direct'>('leyline');
+  const [agentModel, setAgentModel] = useState('');
+  const [agentRouterModel, setAgentRouterModel] = useState('');
+  const [agentMaxTokens, setAgentMaxTokens] = useState('');
+  const [agentContextWindow, setAgentContextWindow] = useState('');
+  const [agentContextReserve, setAgentContextReserve] = useState('');
+  const [agentBaseUrl, setAgentBaseUrl] = useState('');
+  const [agentOllamaHost, setAgentOllamaHost] = useState('');
+  const [agentApiKey, setAgentApiKey] = useState('');
+  const [agentApiKeyConfigured, setAgentApiKeyConfigured] = useState(false);
+  const [agentAnthropicKey, setAgentAnthropicKey] = useState('');
+  const [agentAnthropicKeyConfigured, setAgentAnthropicKeyConfigured] = useState(false);
+  const [leylineUrl, setLeylineUrl] = useState(DEFAULT_LEYLINE_BASE_URL);
+  const [leylineProvider, setLeylineProvider] = useState('');
+  const [leylineModel, setLeylineModel] = useState('');
+  const [leylineMaxBudget, setLeylineMaxBudget] = useState('');
+  const [leylineDailyBudget, setLeylineDailyBudget] = useState('');
+  const [agentSettingsSaving, setAgentSettingsSaving] = useState(false);
+  const [agentSettingsSaved, setAgentSettingsSaved] = useState(false);
   const [isIndexing, setIsIndexing] = useState(false);
   const [indexError, setIndexError] = useState('');
   // Track whether per-project settings have been loaded (to avoid overwriting with stale prop)
@@ -160,6 +181,8 @@ export function SettingsPanel({
   const [showCreateProject, setShowCreateProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
   const [newProjectDesc, setNewProjectDesc] = useState('');
+  const [creatingProject, setCreatingProject] = useState(false);
+  const [createProjectError, setCreateProjectError] = useState('');
   const [editingProjectName, setEditingProjectName] = useState(false);
   const [editName, setEditName] = useState('');
   const [showProjectPicker, setShowProjectPicker] = useState(false);
@@ -198,6 +221,60 @@ export function SettingsPanel({
     try { setActiveProjectDetail(await getProject(activeProjectId)); } catch { setActiveProjectDetail(null); }
   }, [activeProjectId]);
 
+  const applyAgentSettings = useCallback((settings: Record<string, any>) => {
+    setAgentProvider(settings.llm_provider || '');
+    setAgentRoutingProvider(settings.llm_routing_provider === 'direct' ? 'direct' : 'leyline');
+    setAgentModel(settings.llm_model || '');
+    setAgentRouterModel(settings.router_model || '');
+    setAgentMaxTokens(settings.llm_max_tokens != null ? String(settings.llm_max_tokens) : '');
+    setAgentContextWindow(settings.context_window != null ? String(settings.context_window) : '');
+    setAgentContextReserve(settings.context_output_reserve != null ? String(settings.context_output_reserve) : '');
+    setAgentBaseUrl(settings.openai_base_url || '');
+    setAgentOllamaHost(settings.ollama_host || '');
+    setAgentApiKey('');
+    setAgentApiKeyConfigured(Boolean(settings.openai_api_key_configured));
+    setAgentAnthropicKey('');
+    setAgentAnthropicKeyConfigured(Boolean(settings.anthropic_api_key_configured));
+    setLeylineUrl(settings.leyline_base_url ?? DEFAULT_LEYLINE_BASE_URL);
+    setLeylineProvider(settings.leyline_provider || '');
+    setLeylineModel(settings.leyline_model || '');
+    setLeylineMaxBudget(settings.leyline_max_budget_usd > 0 ? String(settings.leyline_max_budget_usd) : '');
+    setLeylineDailyBudget(settings.leyline_daily_budget_usd > 0 ? String(settings.leyline_daily_budget_usd) : '');
+  }, []);
+
+  const handleSaveAgentSettings = async () => {
+    setAgentSettingsSaving(true);
+    try {
+      const settings: Record<string, any> = {
+        routing_provider: agentRoutingProvider,
+        leyline_base_url: leylineUrl.trim(),
+        leyline_provider: leylineProvider.trim(),
+        leyline_model: leylineModel.trim(),
+        // Null clears a profile budget override; blank must not become zero.
+        leyline_max_budget_usd: leylineMaxBudget.trim() ? Number(leylineMaxBudget) : null,
+        leyline_daily_budget_usd: leylineDailyBudget.trim() ? Number(leylineDailyBudget) : null,
+      };
+      Object.assign(settings, {
+        provider: agentProvider || undefined,
+        model: agentModel || undefined,
+        max_tokens: agentMaxTokens ? Number(agentMaxTokens) : undefined,
+        context_window: agentContextWindow ? Number(agentContextWindow) : undefined,
+        context_output_reserve: agentContextReserve ? Number(agentContextReserve) : undefined,
+        base_url: agentBaseUrl || undefined,
+      });
+      if (agentApiKey.trim()) settings.openai_api_key = agentApiKey.trim();
+      if (agentAnthropicKey.trim()) settings.anthropic_api_key = agentAnthropicKey.trim();
+      await updateAgentProfile('internal-default', Object.fromEntries(Object.entries(settings).filter(([, v]) => v !== undefined)));
+      setAgentApiKey('');
+      setAgentApiKeyConfigured(agentApiKey.trim() ? true : agentApiKeyConfigured);
+      setAgentAnthropicKey('');
+      setAgentAnthropicKeyConfigured(agentAnthropicKey.trim() ? true : agentAnthropicKeyConfigured);
+      setAgentSettingsSaved(true);
+    } finally {
+      setAgentSettingsSaving(false);
+    }
+  };
+
   useEffect(() => {
     if (open && tab === 'project') {
       refreshProjects();
@@ -218,7 +295,15 @@ export function SettingsPanel({
         setProjectSettingsLoaded(false);
       }
     }
-  }, [open, tab, refreshProjects, refreshActiveProject, activeProjectId]);
+  }, [open, tab, refreshProjects, refreshActiveProject, activeProjectId, applyAgentSettings]);
+
+  useEffect(() => {
+    if (open && tab === 'general') {
+      getAgentProfile()
+        .then(profile => applyAgentSettings(profile.config || {}))
+        .catch(() => { /* keep defaults */ });
+    }
+  }, [open, tab, applyAgentSettings]);
 
   // Sync from projectConfig prop when it changes (e.g. after App fetches /project/config)
   // but only if per-project settings haven't been loaded yet
@@ -294,17 +379,36 @@ export function SettingsPanel({
   // ── Project management handlers ──────────────────────────────────────
 
   const handleCreateProject = async () => {
-    if (!newProjectName.trim()) return;
-    const p = await createProject(newProjectName, newProjectDesc);
-    setNewProjectName(''); setNewProjectDesc(''); setShowCreateProject(false);
-    onActiveProjectChange?.(p.project_id);
-    // New project has no settings yet — clear the code index form
-    setProjectPath('');
-    setProjectType('local');
-    setGitUrl('');
-    setProjectSettingsLoaded(true); // prevent stale prop from overwriting
-    await refreshProjects();
-    await refreshActiveProject();
+    const name = newProjectName.trim();
+    if (!name || creatingProject) return;
+    setCreatingProject(true);
+    setCreateProjectError('');
+    try {
+      const p = await createProject(name, newProjectDesc.trim() || undefined);
+      // Activate before publishing the new selection so backend workspace state
+      // and the UI's persisted active project stay in sync.
+      try {
+        await activateProject(p.project_id);
+      } catch {
+        // Keep the local selection even when dev-agent is temporarily offline;
+        // the normal mount/switch synchronization will retry activation.
+      }
+      setNewProjectName('');
+      setNewProjectDesc('');
+      setShowCreateProject(false);
+      onActiveProjectChange?.(p.project_id);
+      // New project has no settings yet — clear the code index form
+      setProjectPath('');
+      setProjectType('local');
+      setGitUrl('');
+      setProjectSettingsLoaded(true); // prevent stale prop from overwriting
+      await refreshProjects();
+      await refreshActiveProject();
+    } catch {
+      setCreateProjectError('Could not create the project. Please try again.');
+    } finally {
+      setCreatingProject(false);
+    }
   };
 
   const handleSelectProject = async (id: string | undefined) => {
@@ -320,11 +424,12 @@ export function SettingsPanel({
       try {
         const { settings } = await getProjectSettings(id);
         if (settings) {
+          applyAgentSettings(settings);
           if (settings.project_path) setProjectPath(settings.project_path);
           if (settings.project_type) setProjectType(settings.project_type);
           if (settings.git_url !== undefined) setGitUrl(settings.git_url || '');
           setProjectSettingsLoaded(true);
-        }
+      }
       } catch { /* ignore */ }
     } else {
       // Deactivated — reset to global config
@@ -444,7 +549,23 @@ export function SettingsPanel({
 
               {/* ── Project Switcher ────────────────────────────────── */}
               <div className="flex flex-col gap-2">
-                <label className="text-xs text-slate-400 font-medium">Active Project</label>
+                <div className="flex items-center justify-between gap-2">
+                  <label className="text-xs text-slate-400 font-medium">Active Project</label>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 px-2 text-[10px] text-blue-400"
+                    onClick={() => {
+                      setShowProjectPicker(false);
+                      setCreateProjectError('');
+                      setShowCreateProject(true);
+                    }}
+                    aria-label="Create new project"
+                  >
+                    <Plus className="h-3 w-3 mr-1" />
+                    New Project
+                  </Button>
+                </div>
                 {activeProjectId && activeProjectName ? (
                   <div className="flex items-center gap-2 p-2.5 rounded-lg bg-blue-900/15 border border-blue-800/25">
                     <FolderOpen className="w-4 h-4 text-blue-400 shrink-0" />
@@ -513,10 +634,17 @@ export function SettingsPanel({
                   {showCreateProject && (
                     <motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: 'auto', opacity: 1 }} exit={{ height: 0, opacity: 0 }} className="overflow-hidden">
                       <div className="rounded-lg border border-slate-800 p-3 flex flex-col gap-2">
-                        <Input placeholder="Project name..." value={newProjectName} onChange={e => setNewProjectName(e.target.value)} className="text-xs h-8" autoFocus onKeyDown={e => e.key === 'Enter' && handleCreateProject()} />
-                        <Input placeholder="Description (optional)..." value={newProjectDesc} onChange={e => setNewProjectDesc(e.target.value)} className="text-xs h-8" />
+                        <label htmlFor="new-project-name" className="text-[10px] text-slate-400 font-medium">
+                          Name <span className="text-red-400">*</span>
+                        </label>
+                        <Input id="new-project-name" required aria-required="true" placeholder="e.g. Personal knowledge base" value={newProjectName} onChange={e => { setNewProjectName(e.target.value); setCreateProjectError(''); }} className="text-xs h-8" autoFocus onKeyDown={e => e.key === 'Enter' && handleCreateProject()} />
+                        <label htmlFor="new-project-description" className="text-[10px] text-slate-400 font-medium">
+                          Description <span className="text-slate-600">(optional)</span>
+                        </label>
+                        <Input id="new-project-description" placeholder="What is this project for?" value={newProjectDesc} onChange={e => setNewProjectDesc(e.target.value)} className="text-xs h-8" />
+                        {createProjectError && <p role="alert" className="text-[11px] text-red-400">{createProjectError}</p>}
                         <div className="flex gap-2">
-                          <Button size="sm" className="text-xs h-7 flex-1" onClick={handleCreateProject}>Create</Button>
+                          <Button size="sm" className="text-xs h-7 flex-1" disabled={!newProjectName.trim() || creatingProject} onClick={handleCreateProject}>{creatingProject ? 'Creating...' : 'Create project'}</Button>
                           <Button variant="ghost" size="sm" className="text-xs h-7" onClick={() => setShowCreateProject(false)}>Cancel</Button>
                         </div>
                       </div>
@@ -578,6 +706,60 @@ export function SettingsPanel({
                     <Button variant="ghost" size="sm" className="text-[10px] h-6 text-red-400 hover:text-red-300" onClick={handleDeleteProject}>
                       <Trash2 className="h-3 w-3 mr-1" /> Delete project
                     </Button>
+                  </div>
+                </div>
+              )}
+
+              {/* ── Internal Agent LLM ─────────────────────────────── */}
+              {false && activeProjectId && (
+                <div className="pt-3 border-t border-slate-800">
+                  <h3 className="text-xs text-slate-400 font-medium mb-1">Internal Agent LLM</h3>
+                  <p className="text-[10px] text-slate-600 mb-3">Project-scoped settings. API keys are write-only.</p>
+                  <div className="flex flex-col gap-2.5">
+                    <select value={agentRoutingProvider} onChange={e => setAgentRoutingProvider(e.target.value as 'leyline' | 'direct')} className="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300" aria-label="Internal agent routing provider">
+                      <option value="leyline">Leyline (default routing)</option>
+                      <option value="direct">Direct provider</option>
+                    </select>
+                    {agentRoutingProvider === 'direct' ? (
+                      <select value={agentProvider} onChange={e => setAgentProvider(e.target.value)} className="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300" aria-label="Internal agent provider">
+                        <option value="">Default provider</option><option value="ollama">Ollama</option><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic</option>
+                      </select>
+                    ) : null}
+                    {agentRoutingProvider === 'leyline' && (
+                      <>
+                        <Input className="text-xs h-8" placeholder="Leyline upstream provider (optional)" value={leylineProvider} onChange={e => setLeylineProvider(e.target.value)} aria-label="Leyline upstream provider" />
+                        <Input className="text-xs h-8" placeholder="Leyline upstream model (optional)" value={leylineModel} onChange={e => setLeylineModel(e.target.value)} aria-label="Leyline upstream model" />
+                      </>
+                    )}
+                    <Input className="text-xs h-8" placeholder="Model (e.g. qwen3:8b)" value={agentModel} onChange={e => setAgentModel(e.target.value)} aria-label="Internal agent model" />
+                    <Input className="text-xs h-8" placeholder="Router model (optional)" value={agentRouterModel} onChange={e => setAgentRouterModel(e.target.value)} aria-label="Internal agent router model" />
+                    {agentRoutingProvider === 'direct' && agentProvider === 'ollama' ? (
+                      <Input className="text-xs h-8" placeholder="Ollama host URL" value={agentOllamaHost} onChange={e => setAgentOllamaHost(e.target.value)} aria-label="Internal agent Ollama host" />
+                    ) : agentRoutingProvider === 'direct' ? (
+                      <Input className="text-xs h-8" placeholder="OpenAI-compatible base URL" value={agentBaseUrl} onChange={e => setAgentBaseUrl(e.target.value)} aria-label="Internal agent base URL" />
+                    ) : null}
+                    {agentRoutingProvider === 'direct' && agentProvider === 'anthropic' ? (
+                      <Input className="text-xs h-8" type="password" placeholder={agentAnthropicKeyConfigured ? 'Anthropic key configured (leave blank to keep)' : 'Anthropic API key'} value={agentAnthropicKey} onChange={e => setAgentAnthropicKey(e.target.value)} aria-label="Internal agent Anthropic API key" autoComplete="new-password" />
+                    ) : agentRoutingProvider === 'direct' && agentProvider !== 'ollama' && (
+                      <Input className="text-xs h-8" type="password" placeholder={agentApiKeyConfigured ? 'API key configured (leave blank to keep)' : 'API key (optional)'} value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} aria-label="Internal agent API key" autoComplete="new-password" />
+                    )}
+                    <div className="grid grid-cols-2 gap-2">
+                      <Input className="text-xs h-8" type="number" min="1" placeholder="Max output tokens" value={agentMaxTokens} onChange={e => setAgentMaxTokens(e.target.value)} aria-label="Internal agent max tokens" />
+                      <Input className="text-xs h-8" type="number" min="1" placeholder="Context window" value={agentContextWindow} onChange={e => setAgentContextWindow(e.target.value)} aria-label="Internal agent context window" />
+                    </div>
+                    <Input className="text-xs h-8" type="number" min="0" max="1" step="0.05" placeholder="Output reserve (0–1)" value={agentContextReserve} onChange={e => setAgentContextReserve(e.target.value)} aria-label="Internal agent context output reserve" />
+                    <div className="pt-2 border-t border-slate-800">
+                      <p className="text-[10px] text-slate-500 mb-2">Leyline routing (blank disables the gateway)</p>
+                      <Input className="text-xs h-8 mb-2" placeholder="Leyline base URL" value={leylineUrl} onChange={e => setLeylineUrl(e.target.value)} aria-label="Leyline base URL" />
+                      <div className="grid grid-cols-2 gap-2">
+                        <Input className="text-xs h-8" type="number" min="0" step="0.01" placeholder="Per-request USD" value={leylineMaxBudget} onChange={e => setLeylineMaxBudget(e.target.value)} aria-label="Leyline max budget" />
+                        <Input className="text-xs h-8" type="number" min="0" step="0.01" placeholder="Daily USD" value={leylineDailyBudget} onChange={e => setLeylineDailyBudget(e.target.value)} aria-label="Leyline daily budget" />
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <Button size="sm" onClick={handleSaveAgentSettings} disabled={agentSettingsSaving}>{agentSettingsSaving ? 'Saving…' : 'Save LLM settings'}</Button>
+                      {agentSettingsSaved && <span className="text-[10px] text-emerald-400">Saved</span>}
+                    </div>
                   </div>
                 </div>
               )}
@@ -935,6 +1117,34 @@ export function SettingsPanel({
 
           {tab === 'general' && (
             <div className="flex flex-col gap-4">
+              <div className="pt-3 border-b border-slate-800 pb-4">
+                <h3 className="text-xs text-slate-400 font-medium mb-1">Internal Agent Profile</h3>
+                <p className="text-[10px] text-slate-600 mb-3">Global built-in profile. Leyline is the default route; direct providers are explicit pins.</p>
+                <div className="flex flex-col gap-2.5">
+                  <select value={agentRoutingProvider} onChange={e => setAgentRoutingProvider(e.target.value as 'leyline' | 'direct')} className="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300" aria-label="Internal agent routing provider">
+                    <option value="leyline">Leyline (default)</option><option value="direct">Direct provider</option>
+                  </select>
+                  {agentRoutingProvider === 'direct' && <select value={agentProvider} onChange={e => setAgentProvider(e.target.value)} className="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300" aria-label="Internal agent direct provider">
+                    <option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic</option><option value="ollama">Ollama</option>
+                  </select>}
+                  {agentRoutingProvider === 'leyline' && <>
+                    <Input className="text-xs h-8" placeholder="Leyline base URL" value={leylineUrl} onChange={e => setLeylineUrl(e.target.value)} aria-label="Leyline base URL" />
+                    <Input className="text-xs h-8" placeholder="Leyline upstream provider (optional)" value={leylineProvider} onChange={e => setLeylineProvider(e.target.value)} aria-label="Leyline upstream provider" />
+                  </>}
+                  {agentRoutingProvider === 'direct' && <Input className="text-xs h-8" placeholder="Direct provider base URL (optional)" value={agentBaseUrl} onChange={e => setAgentBaseUrl(e.target.value)} aria-label="Direct provider base URL" />}
+                  <Input className="text-xs h-8" placeholder="Model (optional)" value={agentModel} onChange={e => setAgentModel(e.target.value)} aria-label="Internal agent model" />
+                  <Input className="text-xs h-8" type="number" min="1" placeholder="Max output tokens (advanced)" value={agentMaxTokens} onChange={e => setAgentMaxTokens(e.target.value)} aria-label="Internal agent max output tokens" />
+                  <Input className="text-xs h-8" type="number" min="1" placeholder="Context window (advanced)" value={agentContextWindow} onChange={e => setAgentContextWindow(e.target.value)} aria-label="Internal agent context window" />
+                  <Input className="text-xs h-8" type="number" min="0" max="1" step="0.05" placeholder="Output reserve (advanced, default 0.4)" value={agentContextReserve} onChange={e => setAgentContextReserve(e.target.value)} aria-label="Internal agent output reserve" />
+                  <Input className="text-xs h-8" type="password" placeholder={agentApiKeyConfigured ? 'OpenAI key configured (leave blank)' : 'OpenAI API key (optional)'} value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} aria-label="Internal agent OpenAI API key" autoComplete="new-password" />
+                  <Input className="text-xs h-8" type="password" placeholder={agentAnthropicKeyConfigured ? 'Anthropic key configured (leave blank)' : 'Anthropic API key (optional)'} value={agentAnthropicKey} onChange={e => setAgentAnthropicKey(e.target.value)} aria-label="Internal agent Anthropic API key" autoComplete="new-password" />
+                  <div className="grid grid-cols-2 gap-2">
+                    <Input className="text-xs h-8" type="number" min="0" step="0.01" placeholder="Per-request USD (optional)" value={leylineMaxBudget} onChange={e => setLeylineMaxBudget(e.target.value)} aria-label="Leyline max budget" />
+                    <Input className="text-xs h-8" type="number" min="0" step="0.01" placeholder="Daily USD (optional)" value={leylineDailyBudget} onChange={e => setLeylineDailyBudget(e.target.value)} aria-label="Leyline daily budget" />
+                  </div>
+                  <Button size="sm" onClick={handleSaveAgentSettings} disabled={agentSettingsSaving}>{agentSettingsSaving ? 'Saving…' : 'Save internal profile'}</Button>
+                </div>
+              </div>
               <LanguageSettings />
             </div>
           )}

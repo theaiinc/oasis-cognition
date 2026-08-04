@@ -2195,6 +2195,9 @@ class ResponseGeneratorService:
         # (e.g. DeepSeek for text-only CU decisions, vision model for screenshots).
         model_override = (context or {}).get("model_override", "")
         llm_for_chat = self._cu_llm if (self._cu_llm and system_override) else self._llm
+        profile_config = (context or {}).get("_profile_config")
+        if isinstance(profile_config, dict):
+            llm_for_chat.apply_profile_config(profile_config)
         chat_kwargs: dict[str, Any] = dict(
             system=full_system,
             user_message=user_msg,
@@ -2291,6 +2294,7 @@ class ResponseGeneratorService:
         logger.info("Generating response for conclusion: %s", decision.conclusion)
 
         memory_stale_hint = (context or {}).get("memory_stale_hint", "")
+        code_knowledge = (context or {}).get("code_knowledge", "")
 
         payload = {
             "conclusion": decision.conclusion,
@@ -2342,6 +2346,8 @@ class ResponseGeneratorService:
             parts = []
             if memory_stale_hint:
                 parts.append(f"Note: {memory_stale_hint}\n")
+            if code_knowledge:
+                parts.append(f"{code_knowledge}\n")
             if user_message:
                 parts.append(f"Message: {user_message}\n")
             if is_generative:
@@ -2389,6 +2395,7 @@ class ResponseGeneratorService:
         """Stream natural language from reasoning results."""
         logger.info("Streaming response for conclusion: %s", decision.conclusion)
         memory_stale_hint = (context or {}).get("memory_stale_hint", "")
+        code_knowledge = (context or {}).get("code_knowledge", "")
         payload = {
             "conclusion": decision.conclusion,
             "confidence": decision.confidence,
@@ -2418,6 +2425,8 @@ class ResponseGeneratorService:
         parts = []
         if memory_stale_hint:
             parts.append(f"Note: {memory_stale_hint}\n")
+        if code_knowledge:
+            parts.append(f"{code_knowledge}\n")
         if user_message:
             parts.append(f"Message: {user_message}\n")
         if is_generative:

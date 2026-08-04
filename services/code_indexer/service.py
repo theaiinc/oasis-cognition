@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 from pathlib import Path
 from typing import Any
@@ -20,6 +21,21 @@ from services.code_indexer.parsers.base import BaseParser
 from services.code_indexer.parsers.typescript import TypeScriptParser
 
 logger = logging.getLogger(__name__)
+
+
+def _host_to_container_path(path: str) -> str:
+    """Translate a host-absolute path to this container's /host-home mount.
+
+    Mirrors dev_agent's `_host_to_docker_path`: the code-indexer container
+    only sees the host's home directory via the read-only /host-home bind
+    mount (docker-compose.yml), so any caller-supplied host path under
+    OASIS_HOST_HOME_PATH needs the same prefix swap before touching the
+    filesystem here.
+    """
+    host_home = os.getenv("OASIS_HOST_HOME_PATH")
+    if host_home and path.startswith(host_home):
+        return "/host-home" + path[len(host_home):]
+    return path
 
 
 class CodeIndexerService:
@@ -53,10 +69,11 @@ class CodeIndexerService:
         """Registered parsers (for file watcher)."""
         return self._parsers
 
-    def _normalize_repo_path(self, file_path: Path) -> str:
+    def _normalize_repo_path(self, file_path: Path, workspace: Path | None = None) -> str:
         """Repo-relative posix path for Neo4j (matches /workspace layout)."""
+        root = workspace or self._workspace
         try:
-            return file_path.resolve().relative_to(self._workspace.resolve()).as_posix()
+            return file_path.resolve().relative_to(root.resolve()).as_posix()
         except ValueError:
             return str(file_path).replace("\\", "/")
 
@@ -64,12 +81,13 @@ class CodeIndexerService:
         """Public API: index a single file (used by watcher)."""
         return self._index_file(file_path, force)
 
-    def search_symbols(self, query: SearchQuery) -> SymbolSearchResult:
+    def search_symbols(self, query: SearchQuery, project_id: str | None = None) -> SymbolSearchResult:
         """Search for symbols by name."""
         return self._client.search_symbols(
             query.q,
             query.type.value if query.type else None,
             query.limit,
+            project_id=project_id,
         )
 
     def get_symbol(self, symbol_id: str) -> Symbol | None:
@@ -84,16 +102,16 @@ class CodeIndexerService:
         """Get component hierarchy."""
         return self._client.get_component_hierarchy(root_name)
 
-    def get_index_status(self) -> IndexStatus:
+    def get_index_status(self, project_id: str | None = None) -> IndexStatus:
         """Get indexing status."""
-        return self._client.get_index_status()
+        return self._client.get_index_status(project_id=project_id)
 
-    def get_full_graph(self, max_symbols: int = 300) -> dict:
+    def get_full_graph(self, max_symbols: int = 300, project_id: str | None = None) -> dict:
         """Return all CodeFile + CodeSymbol nodes and relationships for the UI."""
-        return self._client.get_full_graph(max_symbols=max_symbols)
+        return self._client.get_full_graph(max_symbols=max_symbols, project_id=project_id)
 
     def index_path(self, path: str, force: bool = False) -> IndexResponse:
-        """Index a file or directory."""
+        """Index a file or directory in the active workspace (legacy, untagged data)."""
         start_time = time.time()
         target = self._workspace / path if not path.startswith('/') else Path(path)
 
@@ -112,7 +130,7 @@ class CodeIndexerService:
                 errors.append(f"Failed to index: {target}")
         else:
             # Index directory
-            for file_path in self._iter_source_files(target):
+            for file_path in self._iter_source_files(target, self._workspace):
                 try:
                     result = self._index_file(file_path, force)
                     if result:
@@ -126,7 +144,46 @@ class CodeIndexerService:
         duration_ms = int((time.time() - start_time) * 1000)
         return IndexResponse(indexed=indexed, removed=removed, errors=errors, duration_ms=duration_ms)
 
-    def _index_file(self, file_path: Path, force: bool = False) -> bool:
+    def index_project(self, project_id: str, workspace_path: str, force: bool = True) -> IndexResponse:
+        """Index a specific project's workspace, scoped by project_id.
+
+        Fully independent of the active workspace (`self._workspace`) — does
+        not read, switch, or otherwise touch it. Safe to call while another
+        project is actively being worked on.
+        """
+        start_time = time.time()
+        root = Path(_host_to_container_path(workspace_path))
+
+        if not root.is_dir():
+            return IndexResponse(
+                indexed=0,
+                removed=0,
+                errors=[f"Directory not found: {workspace_path} (resolved to {root} inside the container)"],
+            )
+
+        indexed = 0
+        errors: list[str] = []
+        for file_path in self._iter_source_files(root, root):
+            try:
+                if self._index_file(file_path, force, project_id=project_id, workspace=root):
+                    indexed += 1
+                else:
+                    errors.append(f"Failed to index: {file_path}")
+            except Exception as e:
+                errors.append(f"Error indexing {file_path}: {e}")
+                logger.error("Error indexing %s: %s", file_path, e)
+
+        duration_ms = int((time.time() - start_time) * 1000)
+        return IndexResponse(indexed=indexed, removed=0, errors=errors, duration_ms=duration_ms)
+
+    def _index_file(
+        self,
+        file_path: Path,
+        force: bool = False,
+        *,
+        project_id: str | None = None,
+        workspace: Path | None = None,
+    ) -> bool:
         """Index a single file. Returns True if successful."""
         # Find appropriate parser
         parser = self._get_parser(file_path)
@@ -141,13 +198,14 @@ class CodeIndexerService:
                 logger.warning("Parse error for %s: %s", file_path, result['error'])
                 return False
 
-            norm_path = self._normalize_repo_path(file_path)
+            raw_norm_path = self._normalize_repo_path(file_path, workspace)
+            norm_path = self._client.scoped_key(raw_norm_path, project_id)
             file_info = result['file_info'].model_copy(update={"path": norm_path})
             symbols_norm = [
                 s.model_copy(
                     update={
                         "file_path": norm_path,
-                        "id": f"{norm_path}:{s.name}:{s.line_start}",
+                        "id": self._client.scoped_key(f"{raw_norm_path}:{s.name}:{s.line_start}", project_id),
                     }
                 )
                 for s in result['symbols']
@@ -168,11 +226,11 @@ class CodeIndexerService:
             self._client.delete_file(file_info.path)
 
             # Store file
-            self._client.store_file(file_info)
+            self._client.store_file(file_info, project_id=project_id)
 
             # Store symbols
             for symbol in result['symbols']:
-                self._client.store_symbol(symbol)
+                self._client.store_symbol(symbol, project_id=project_id)
 
             # Store imports
             for import_info in result['imports']:
@@ -192,14 +250,15 @@ class CodeIndexerService:
                 return parser
         return None
 
-    def _iter_source_files(self, root: Path):
+    def _iter_source_files(self, root: Path, relative_to: Path | None = None):
         """Iterate over source files to index."""
+        base = relative_to or self._workspace
         for path in root.rglob('*'):
             if not path.is_file():
                 continue
 
             # Check exclusions
-            relative = str(path.relative_to(self._workspace))
+            relative = str(path.relative_to(base))
             if path.name.endswith(".d.ts") or path.name.endswith(".min.js"):
                 continue
             if any(p in relative for p in self._exclude_patterns if not p.startswith("*")):

@@ -89,6 +89,7 @@ export class MissionsService implements OnModuleInit, OnModuleDestroy {
     const id = uuidv4();
     const mission: Mission = {
       mission_id: id,
+      project_id: dto.project_id?.trim() || undefined,
       goal: dto.goal.trim(),
       prompt: (dto.prompt ?? dto.goal).trim(),
       schedule: dto.schedule.trim(),
@@ -109,7 +110,7 @@ export class MissionsService implements OnModuleInit, OnModuleDestroy {
     return mission;
   }
 
-  async list(): Promise<Mission[]> {
+  async list(projectId?: string): Promise<Mission[]> {
     if (this.redis && this.redisReady) {
       try {
         const map = await this.redis.hgetall(REDIS_KEY);
@@ -119,12 +120,16 @@ export class MissionsService implements OnModuleInit, OnModuleDestroy {
         }
         // refresh memcache
         for (const m of out) this.memCache.set(m.mission_id, m);
-        return out.sort((a, b) => b.created_at.localeCompare(a.created_at));
+        return out
+          .filter((mission) => !projectId || mission.project_id === projectId)
+          .sort((a, b) => b.created_at.localeCompare(a.created_at));
       } catch (err) {
         this.logger.warn(`list redis failed: ${err}`);
       }
     }
-    return Array.from(this.memCache.values()).sort((a, b) => b.created_at.localeCompare(a.created_at));
+    return Array.from(this.memCache.values())
+      .filter((mission) => !projectId || mission.project_id === projectId)
+      .sort((a, b) => b.created_at.localeCompare(a.created_at));
   }
 
   async get(id: string): Promise<Mission | null> {
@@ -279,7 +284,7 @@ export class MissionsService implements OnModuleInit, OnModuleDestroy {
         session_id: m.session_id,
         role_id: m.role_id,
         profile_id: m.profile_id,
-        context: { mission_id: m.mission_id, mission_goal: m.goal },
+        context: { mission_id: m.mission_id, mission_goal: m.goal, project_id: m.project_id },
       });
       result = out.response || '';
     } catch (err: any) {

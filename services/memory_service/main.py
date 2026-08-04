@@ -386,11 +386,12 @@ async def code_symbols_search(
     type: str | None = Query(None, description="Optional: function, class, interface, type, ..."),
     limit: int = Query(10, ge=1, le=100),
     path_prefix: str | None = Query(None, description="Comma-separated path prefixes to scope results (e.g. 'services/code_indexer,apps/oasis-ui-react')"),
+    project_id: str | None = Query(None, description="Optional project registry id to scope results to a specific project's index; omit for the legacy/active-workspace index"),
 ):
     """Search indexed code symbols (Neo4j CodeSymbol). Requires code-indexer to have run at least once."""
     prefixes = [p.strip() for p in path_prefix.split(",") if p.strip()] if path_prefix else None
-    symbols = await memory.search_code_symbols(q, symbol_type=type, limit=limit, path_prefixes=prefixes)
-    return {"query": q, "count": len(symbols), "symbols": symbols, "scope": prefixes}
+    symbols = await memory.search_code_symbols(q, symbol_type=type, limit=limit, path_prefixes=prefixes, project_id=project_id)
+    return {"query": q, "count": len(symbols), "symbols": symbols, "scope": prefixes, "project_id": project_id}
 
 
 @app.get("/internal/memory/code/references")

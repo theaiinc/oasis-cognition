@@ -1,6 +1,6 @@
 # Oasis Cognition
 
-A full-stack AI copilot that combines **LLM-driven language and planning** with **symbolic validation**, **Neo4j graph memory**, optional **Tree-sitter code indexing**, **host-native git worktrees**, **artifact processing** (PDF/DOCX/PPTX/audio transcription), **speaker diarization**, and **computer-use** (native screen capture + automation via macOS .app bundles) for real engineering workflows. The stack includes a NestJS **api-gateway**, Python microservices (interpreter, response-generator, memory, observer, teaching, tools, artifacts, ui-parser), a React **oasis-ui**, an **OpenAI-compatible adapter**, LiveKit voice, and Langfuse observability.
+A full-stack AI copilot that combines **LLM-driven language and planning** with **symbolic validation**, **Neo4j graph memory**, optional **Tree-sitter code indexing**, **host-native git worktrees**, **artifact processing** (PDF/DOCX/PPTX/audio transcription), **speaker diarization**, and **computer-use** (native screen capture + automation via macOS .app bundles) for real engineering workflows. The stack includes a NestJS **api-gateway**, Python microservices (interpreter, response-generator, memory, observer, teaching, tools, artifacts, ui-parser), a React **oasis-ui**, an **OpenAI-compatible adapter**, and LiveKit voice.
 
 **Documentation hub:** [docs/README.md](docs/README.md)
 
@@ -13,7 +13,7 @@ A full-stack AI copilot that combines **LLM-driven language and planning** with 
 - **Code index in the planner**: **code-indexer** + gateway enrichment injects Neo4j-backed symbol context into tool planning (see [docs/code-indexing-service-design.md](docs/code-indexing-service-design.md)).
 - **Worktrees on the host**: **dev-agent** runs outside Docker for authentic git worktrees and file tools (`./scripts/start-dev-agent.sh`).
 - **Provider flexibility**: Separate env for interpreter, response, and tool-plan models — **Ollama** (default), **Anthropic**, or **OpenAI-compatible** APIs ([`.env.example`](.env.example)).
-- **Observable pipelines**: **Langfuse** + streaming NDJSON UI for multi-step tool runs and thought layers.
+- **Observable pipelines**: Redis event timelines + streaming UI for multi-step tool runs and thought layers.
 
 A longer narrative: [docs/guides/what-makes-oasis-different.md](docs/guides/what-makes-oasis-different.md).
 
@@ -49,7 +49,7 @@ flowchart TB
 
 | Service | Port | Role |
 |---------|------|------|
-| api-gateway | 8000 | HTTP API, interaction orchestration, Redis, Langfuse hooks |
+| api-gateway | 8000 | HTTP API, interaction orchestration, Redis event timelines |
 | interpreter | 8001 | NL → structured semantics / routing |
 | graph-builder | 8002 | Reasoning graph construction (observer path) |
 | logic-engine | 8003 | Symbolic scoring / constraints |
@@ -64,7 +64,6 @@ flowchart TB
 | openai-adapter | 8080 | OpenAI-compatible REST API (`/v1/chat/completions`, `/v1/models`) — bridges external clients to Oasis |
 | voice-agent | 8090 | Voice pipeline → gateway |
 | oasis-ui | 3000 | Primary web UI |
-| langfuse | 3100 | Traces and dashboards |
 | neo4j | 7474 / 7687 | Browser / Bolt |
 | redis | 6379 | Gateway / events |
 | livekit | 7880+ | Real-time AV |
@@ -101,13 +100,39 @@ make up
 
 - **UI:** http://localhost:3000  
 - **API health:** http://localhost:8000/api/v1/health  
-- **Langfuse:** http://localhost:3100  
 
 ### 3. Dev agent (coding tasks)
 
 ```bash
 ./scripts/start-dev-agent.sh
 ```
+
+### Local UI development (Vite + HMR)
+
+The production UI is an Nginx container on port 3000. For frontend work,
+stop that container and run the backend with the development Compose override;
+the override keeps `oasis-ui` in the `production-ui` profile so it is not
+started as a second UI:
+
+```bash
+docker compose stop oasis-ui
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+cd apps/oasis-ui-react
+npm run dev
+```
+
+Open http://localhost:5173. Vite binds to `0.0.0.0`, uses HMR, and the browser
+continues to call the gateway at http://localhost:8000. Set
+`VITE_DEV_PORT=5174` before `npm run dev` if port 5173 is occupied.
+
+Stop the local Vite process with Ctrl+C, then stop the development backend:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down
+```
+
+To return to the production UI, use `make up` and open http://localhost:3000.
+Use `make down` to stop the production stack.
 
 ### 4. Chrome Bridge extension (for computer-use)
 

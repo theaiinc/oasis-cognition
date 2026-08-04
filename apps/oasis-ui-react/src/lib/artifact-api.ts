@@ -115,7 +115,9 @@ export async function searchArtifacts(
 /* ── Projects ──────────────────────────────────────────────────────────── */
 
 export async function createProject(name: string, description?: string): Promise<Project> {
-  const res = await axios.post(`${API}/projects`, { name, description });
+  const payload: { name: string; description?: string } = { name };
+  if (description?.trim()) payload.description = description.trim();
+  const res = await axios.post(`${API}/projects`, payload);
   return res.data.project;
 }
 
@@ -230,6 +232,16 @@ export async function getProjectSettings(projectId: string): Promise<{ settings:
 
 export async function saveProjectSettings(projectId: string, settings: Record<string, any>): Promise<void> {
   await axios.post(`${API}/project/settings`, { project_id: projectId, settings }, { timeout: 15000 });
+}
+
+export async function getAgentProfile(profileId = 'internal-default'): Promise<any> {
+  const res = await axios.get(`${API}/agent-profiles/${profileId}`, { timeout: 10000 });
+  return res.data;
+}
+
+export async function updateAgentProfile(profileId: string, config: Record<string, any>): Promise<any> {
+  const res = await axios.patch(`${API}/agent-profiles/${profileId}`, { config }, { timeout: 15000 });
+  return res.data;
 }
 
 /* ── SSE: Real-time artifact events ────────────────────────────────────── */

@@ -24,7 +24,7 @@ Different stages can use different models and providers (**Ollama**, **Anthropic
 
 ## 6. Observable multi-step runs
 
-**Langfuse** integration traces interactions and tool plans (with optional debug payload flags documented in compose). Combined with NDJSON streaming to the UI, you can see **thought layers**, tool cards, and observer feedback as a timeline rather than a single opaque completion.
+Redis event timelines trace interaction progress and tool plans. Combined with streaming to the UI, you can see **thought layers**, tool cards, and observer feedback as a timeline rather than a single opaque completion.
 
 ## 7. Voice and multimodal path
 

@@ -1,0 +1,15 @@
+# Development override for running the React UI with Vite/HMR on the host.
+#
+# Start the Dockerized backend without the production Nginx UI:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+#
+# The `production-ui` profile keeps oasis-ui out of the dev startup set. Stop
+# an already-running production UI first so the two workflows stay explicit:
+#   docker compose stop oasis-ui
+#
+# The Vite process is started separately from apps/oasis-ui-react and serves
+# port 5173 by default (VITE_DEV_PORT can override it).
+services:
+  oasis-ui:
+    profiles:
+      - production-ui

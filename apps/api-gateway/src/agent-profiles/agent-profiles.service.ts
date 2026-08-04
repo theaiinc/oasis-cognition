@@ -76,6 +76,8 @@ export class AgentProfilesService implements OnModuleDestroy, OnModuleInit {
       description: 'Built-in Oasis chat LLM. Used as the default for project roles. Spawning via external Agent Runner is coming in v2 — for now this profile runs through the in-app chat pipeline.',
       agent_type: 'internal',
       config: {
+        routing_provider: 'leyline',
+        leyline_base_url: 'http://localhost:3417/v1',
         system_prompt_preamble: '',
       },
       created_at: now,

@@ -33,3 +33,8 @@ def test_semantic_event():
         payload={"problem": "API latency", "trigger": "high concurrency"},
     )
     assert event.event_type == "SemanticParsed"
+
+
+def test_event_project_context_is_first_class():
+    event = InteractionReceivedEvent(session_id="s1", project_id="p1")
+    assert event.project_id == "p1"

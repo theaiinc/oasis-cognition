@@ -41,7 +41,15 @@ _response_settings = Settings(
     openai_api_key=_settings.openai_api_key,
     openai_base_url=_settings.openai_base_url,
     ollama_host=_settings.ollama_host,
+    leyline_base_url=_settings.leyline_base_url,
+    leyline_max_budget_usd=_settings.leyline_max_budget_usd,
+    leyline_daily_budget_usd=_settings.leyline_daily_budget_usd,
+    context_window=_settings.context_window,
+    context_output_reserve=_settings.context_output_reserve,
     vision_llm_model=_settings.vision_llm_model,
+    computer_use_llm_model=_settings.computer_use_llm_model,
+    computer_use_llm_base_url=_settings.computer_use_llm_base_url,
+    router_model=_settings.router_model,
 )
 _llm = LLMClient(_response_settings)
 
@@ -53,6 +61,15 @@ _tool_plan_settings = Settings(
     openai_api_key=_settings.openai_api_key,
     openai_base_url=_settings.openai_base_url,
     ollama_host=_settings.ollama_host,
+    leyline_base_url=_settings.leyline_base_url,
+    leyline_max_budget_usd=_settings.leyline_max_budget_usd,
+    leyline_daily_budget_usd=_settings.leyline_daily_budget_usd,
+    context_window=_settings.context_window,
+    context_output_reserve=_settings.context_output_reserve,
+    vision_llm_model=_settings.vision_llm_model,
+    computer_use_llm_model=_settings.computer_use_llm_model,
+    computer_use_llm_base_url=_settings.computer_use_llm_base_url,
+    router_model=_settings.router_model,
 )
 _tool_plan_llm = LLMClient(_tool_plan_settings)
 

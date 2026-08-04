@@ -3,7 +3,6 @@
 Exposes /v1/chat/completions and /v1/models so that Open WebUI
 (or any OpenAI-compatible client) can talk to the Oasis reasoning pipeline.
 
-Also logs every interaction to Langfuse for observability.
 """
 
 from __future__ import annotations
@@ -27,31 +26,6 @@ from pydantic import BaseModel, Field
 logger = logging.getLogger(__name__)
 
 OASIS_API_URL = os.getenv("OASIS_API_URL", "http://localhost:8000")
-LANGFUSE_ENABLED = os.getenv("LANGFUSE_ENABLED", "true").lower() == "true"
-LANGFUSE_HOST = os.getenv("LANGFUSE_HOST", "http://localhost:3100")
-LANGFUSE_PUBLIC_KEY = os.getenv("LANGFUSE_PUBLIC_KEY", "")
-LANGFUSE_SECRET_KEY = os.getenv("LANGFUSE_SECRET_KEY", "")
-
-# Langfuse client (lazy init)
-_langfuse = None
-
-
-def get_langfuse():
-    global _langfuse
-    if _langfuse is None and LANGFUSE_ENABLED:
-        try:
-            from langfuse import Langfuse
-            _langfuse = Langfuse(
-                public_key=LANGFUSE_PUBLIC_KEY,
-                secret_key=LANGFUSE_SECRET_KEY,
-                host=LANGFUSE_HOST,
-            )
-            logger.info("Langfuse tracing enabled at %s", LANGFUSE_HOST)
-        except Exception as e:
-            logger.warning("Langfuse unavailable: %s", e)
-    return _langfuse
-
-
 # --- Models ---
 
 class ChatMessage(BaseModel):
@@ -118,11 +92,7 @@ class StreamChunk(BaseModel):
 async def lifespan(app: FastAPI):
     logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(name)s | %(levelname)s | %(message)s")
     logger.info("OpenAI Adapter started (oasis_api=%s)", OASIS_API_URL)
-    get_langfuse()
     yield
-    lf = get_langfuse()
-    if lf:
-        lf.flush()
 
 
 app = FastAPI(title="Oasis OpenAI Adapter", lifespan=lifespan)
@@ -189,64 +159,6 @@ async def _call_oasis(user_message: str, context: dict[str, Any], session_id: st
         return _parse_ndjson_interaction(resp.text)
 
 
-def _trace_to_langfuse(
-    session_id: str,
-    user_message: str,
-    oasis_response: dict[str, Any],
-    latency_ms: float,
-):
-    """Log the full interaction to Langfuse."""
-    lf = get_langfuse()
-    if not lf:
-        return
-
-    try:
-        trace = lf.trace(
-            name="oasis-interaction",
-            session_id=session_id,
-            input=user_message,
-            output=oasis_response.get("response", ""),
-            metadata={
-                "confidence": oasis_response.get("confidence", 0),
-                "reasoning_trace": oasis_response.get("reasoning_trace", []),
-                "latency_ms": latency_ms,
-            },
-        )
-
-        # Log reasoning steps as spans
-        reasoning_trace = oasis_response.get("reasoning_trace", [])
-        for i, step in enumerate(reasoning_trace):
-            trace.span(
-                name=f"reasoning-step-{i}",
-                input=step,
-                metadata={"step_index": i},
-            )
-
-        # Log the reasoning graph summary
-        graph = oasis_response.get("reasoning_graph", {})
-        if graph:
-            trace.span(
-                name="reasoning-graph",
-                input=json.dumps({
-                    "node_count": len(graph.get("nodes", [])),
-                    "edge_count": len(graph.get("edges", [])),
-                }),
-                metadata={"graph_id": graph.get("id", "")},
-            )
-
-        # Log as a generation for cost/token tracking
-        trace.generation(
-            name="oasis-response",
-            model="oasis-cognition",
-            input=user_message,
-            output=oasis_response.get("response", ""),
-            metadata={"confidence": oasis_response.get("confidence", 0)},
-        )
-
-    except Exception as e:
-        logger.warning("Langfuse trace failed: %s", e)
-
-
 # --- Endpoints ---
 
 @app.get("/v1/models")
@@ -280,8 +192,6 @@ async def chat_completions(req: ChatCompletionRequest):
 
     logger.info("Chat request: model=%s, message=%s...", req.model, user_message[:80])
 
-    start = time.time()
-
     try:
         oasis_resp = await _call_oasis(user_message, context, session_id)
     except httpx.HTTPStatusError as e:
@@ -304,7 +214,6 @@ async def chat_completions(req: ChatCompletionRequest):
             "session_id": session_id,
         }
 
-    latency_ms = (time.time() - start) * 1000
     response_text = oasis_resp.get("response", "No response generated.")
 
     # Append reasoning metadata as a note
@@ -313,9 +222,6 @@ async def chat_completions(req: ChatCompletionRequest):
     if reasoning_trace and confidence > 0:
         trace_summary = "\n".join(f"  {step}" for step in reasoning_trace[-3:])
         response_text += f"\n\n---\nConfidence: {confidence:.0%} | Session: {session_id}\nReasoning:\n{trace_summary}"
-
-    # Log to Langfuse
-    _trace_to_langfuse(session_id, user_message, oasis_resp, latency_ms)
 
     if req.stream:
         return _stream_response(response_text, session_id)

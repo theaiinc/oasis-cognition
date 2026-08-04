@@ -39,24 +39,6 @@ services:
       timeout: 3s
       retries: 3
 
-  # Postgres for Langfuse
-  langfuse-db:
-    image: postgres:16-alpine
-    restart: unless-stopped
-    ports:
-      - "5433:5432"
-    environment:
-      POSTGRES_DB: langfuse
-      POSTGRES_USER: langfuse
-      POSTGRES_PASSWORD: ${LANGFUSE_DB_PASSWORD:-langfuse}
-    volumes:
-      - ./data/postgres-langfuse:/var/lib/postgresql/data
-    healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U langfuse"]
-      interval: 5s
-      timeout: 3s
-      retries: 5
-
   # ==========================================================================
   # OASIS CORE MICROSERVICES
   # ==========================================================================
@@ -66,6 +48,8 @@ services:
       context: .
       dockerfile: services/interpreter/Dockerfile
     restart: unless-stopped
+    volumes:
+      - ${HOME:-/Users}:/host-home:ro
     ports:
       - "8001:8001"
     environment:
@@ -76,6 +60,10 @@ services:
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
       - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
       - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LEYLINE_BASE_URL=${OASIS_LEYLINE_BASE_URL:-http://host.docker.internal:3417/v1}
+      - OASIS_LEYLINE_MAX_BUDGET_USD=${OASIS_LEYLINE_MAX_BUDGET_USD:-0}
+      - OASIS_LEYLINE_DAILY_BUDGET_USD=${OASIS_LEYLINE_DAILY_BUDGET_USD:-0}
+      - OASIS_HOST_HOME=${HOME:-/Users}
       - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8001/health')\""]
@@ -160,6 +148,7 @@ services:
       - OASIS_NEO4J_USER=neo4j
       - OASIS_NEO4J_PASSWORD=oasis-cognition
       - OASIS_WORKSPACE_PATH=/workspace
+      - OASIS_HOST_HOME_PATH=${HOME:-/Users}
       - OASIS_CODE_INDEXER_INDEX_ON_START=${OASIS_CODE_INDEXER_INDEX_ON_START:-false}
       - OASIS_CODE_INDEXER_WATCH=${OASIS_CODE_INDEXER_WATCH:-false}
       - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
@@ -196,8 +185,13 @@ services:
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
-      - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
+      - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-leyline}
       - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LLM_ROUTING_PROVIDER=${OASIS_LLM_ROUTING_PROVIDER:-leyline}
+      - OASIS_LEYLINE_BASE_URL=${OASIS_LEYLINE_BASE_URL:-http://host.docker.internal:3417/v1}
+      - OASIS_LEYLINE_MODEL=${OASIS_LEYLINE_MODEL:-gpt-5.6-luna}
+      - OASIS_LEYLINE_MAX_BUDGET_USD=${OASIS_LEYLINE_MAX_BUDGET_USD:-0}
+      - OASIS_LEYLINE_DAILY_BUDGET_USD=${OASIS_LEYLINE_DAILY_BUDGET_USD:-0}
       - OASIS_VISION_LLM_MODEL=${OASIS_VISION_LLM_MODEL:-}
       - OASIS_COMPUTER_USE_LLM_MODEL=${OASIS_COMPUTER_USE_LLM_MODEL:-}
       - OASIS_COMPUTER_USE_LLM_BASE_URL=${OASIS_COMPUTER_USE_LLM_BASE_URL:-}
@@ -216,6 +210,8 @@ services:
       context: .
       dockerfile: services/teaching-service/Dockerfile
     restart: unless-stopped
+    volumes:
+      - ${HOME:-/Users}:/host-home:ro
     ports:
       - "8006:8006"
     environment:
@@ -226,6 +222,10 @@ services:
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
       - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
       - OASIS_OPENAI_BASE_URL=${OASIS_OPENAI_BASE_URL:-}
+      - OASIS_LEYLINE_BASE_URL=${OASIS_LEYLINE_BASE_URL:-http://host.docker.internal:3417/v1}
+      - OASIS_LEYLINE_MAX_BUDGET_USD=${OASIS_LEYLINE_MAX_BUDGET_USD:-0}
+      - OASIS_LEYLINE_DAILY_BUDGET_USD=${OASIS_LEYLINE_DAILY_BUDGET_USD:-0}
+      - OASIS_HOST_HOME=${HOME:-/Users}
       - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
       - OASIS_WEB_SEARCH_PROVIDER=${OASIS_WEB_SEARCH_PROVIDER:-duckduckgo}
     healthcheck:
@@ -331,19 +331,12 @@ services:
       - YGGDRASIL_URL=http://yggdrasil:3100
       - YGGDRASIL_API_KEY=${YGGDRASIL_API_KEY:-}
       - YGGDRASIL_MAX_CONCURRENCY=${YGGDRASIL_MAX_CONCURRENCY:-8}
-      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-true}
-      - LANGFUSE_HOST=http://langfuse:3000
-      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}
-      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-oasis}
       # Frequent NDJSON chunks during long tool_use so proxies don’t see an idle POST
       - OASIS_INTERACTION_KEEPALIVE_MS=${OASIS_INTERACTION_KEEPALIVE_MS:-12000}
       # Optional: set to 1 to also abort on res/socket stream "close" (can false-positive with NDJSON)
       - OASIS_STRICT_STREAM_CLOSE_ABORT=${OASIS_STRICT_STREAM_CLOSE_ABORT:-0}
       # Observer runs graph-builder then logic-engine; allow headroom over OBSERVER_HTTP_TIMEOUT_SECONDS*2
       - OBSERVER_VALIDATE_TIMEOUT_MS=${OBSERVER_VALIDATE_TIMEOUT_MS:-180000}
-      # Langfuse tool-plan spans: set true to attach truncated full request + model output (PII / size)
-      - OASIS_DEBUG_TOOL_PLAN_PAYLOAD=${OASIS_DEBUG_TOOL_PLAN_PAYLOAD:-false}
-      - OASIS_DEBUG_TOOL_PLAN_MAX_CHARS=${OASIS_DEBUG_TOOL_PLAN_MAX_CHARS:-16000}
       # Neo4j code index → tool-plan knowledge_summary (memory-service /internal/memory/code/symbols)
       - OASIS_CONTEXT_WINDOW=${OASIS_CONTEXT_WINDOW:-131072}
       - OASIS_CONTEXT_WINDOW_TOOL_PLAN=${OASIS_CONTEXT_WINDOW_TOOL_PLAN:-131072}
@@ -417,38 +410,6 @@ services:
       voice-agent:
         condition: service_healthy
 
-  # Langfuse — Observability dashboard
-  langfuse:
-    image: langfuse/langfuse:2
-    restart: unless-stopped
-    ports:
-      - "3100:3000"
-    environment:
-      - DATABASE_URL=postgresql://langfuse:${LANGFUSE_DB_PASSWORD:-langfuse}@langfuse-db:5432/langfuse
-      - NEXTAUTH_SECRET=${NEXTAUTH_SECRET:-oasis-langfuse-secret-change-me}
-      - NEXTAUTH_URL=http://localhost:3100
-      - SALT=${LANGFUSE_SALT:-oasis-salt-change-me}
-      - TELEMETRY_ENABLED=false
-      # Seed initial project API keys for Oasis integration
-      - LANGFUSE_INIT_ORG_ID=oasis-org
-      - LANGFUSE_INIT_ORG_NAME=Oasis Cognition
-      - LANGFUSE_INIT_PROJECT_ID=oasis-project
-      - LANGFUSE_INIT_PROJECT_NAME=Oasis Reasoning
-      - LANGFUSE_INIT_PROJECT_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}
-      - LANGFUSE_INIT_PROJECT_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-oasis}
-      - LANGFUSE_INIT_USER_EMAIL=${LANGFUSE_INIT_USER_EMAIL:-admin@oasis.local}
-      - LANGFUSE_INIT_USER_NAME=${LANGFUSE_INIT_USER_NAME:-admin}
-      - LANGFUSE_INIT_USER_PASSWORD=${LANGFUSE_INIT_USER_PASSWORD:-changeme}
-    depends_on:
-      langfuse-db:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD-SHELL", "wget --no-verbose --tries=1 --spider http://localhost:3000/api/public/health || exit 1"]
-      interval: 10s
-      timeout: 5s
-      retries: 10
-      start_period: 30s
-
   # LiveKit — Real-time voice and video server
   livekit:
     image: livekit/livekit-server:latest
@@ -490,10 +451,6 @@ services:
       - OASIS_OPENAI_API_KEY=${OASIS_OPENAI_API_KEY:-}
       - TRANSCRIPTION_URL=http://host.docker.internal:8099
       - XTTS_URL=${XTTS_URL:-http://localhost:8020}
-      - LANGFUSE_ENABLED=${LANGFUSE_ENABLED:-true}
-      - LANGFUSE_HOST=http://langfuse:3000
-      - LANGFUSE_PUBLIC_KEY=${LANGFUSE_PUBLIC_KEY:-pk-lf-oasis}
-      - LANGFUSE_SECRET_KEY=${LANGFUSE_SECRET_KEY:-sk-lf-oasis}
       - VOICE_PROFILE_PATH=/data/voice-profile.npy
     volumes:
       - ./data/voice-agent:/data
@@ -508,4 +465,4 @@ services:
       start_period: 20s
 
 # All persistent data is bind-mounted to ./data/ so it survives container destruction.
-# See: data/neo4j, data/postgres-langfuse, data/artifacts, data/voice-agent
+# See: data/neo4j, data/artifacts, data/voice-agent

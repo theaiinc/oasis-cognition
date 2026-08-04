@@ -5,7 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from packages.shared_utils.config import Settings
+from packages.shared_utils.config import Settings, _load_active_project_overrides
 
 logger = logging.getLogger(__name__)
 
@@ -28,9 +28,78 @@ class LLMClient:
         self._openai_client: Any = None
         self._ollama_client: Any = None
 
+    def _leyline_base_url(self) -> str | None:
+        url = (self._settings.leyline_base_url or "").strip().rstrip("/")
+        return url or None
+
+    def _is_routed_via_leyline(self) -> bool:
+        return (
+            self._settings.llm_routing_provider == "leyline"
+            and self._leyline_base_url() is not None
+        )
+
+    def _effective_openai_base_url(self) -> str:
+        leyline_url = self._leyline_base_url() if self._is_routed_via_leyline() else None
+        return leyline_url or (self._settings.openai_base_url or "https://api.openai.com/v1").rstrip("/")
+
+    def _leyline_budget_headers(self) -> dict[str, str]:
+        headers: dict[str, str] = {}
+        if self._settings.leyline_provider.strip():
+            headers["X-Leyline-Provider"] = self._settings.leyline_provider.strip()
+        if self._settings.leyline_max_budget_usd > 0:
+            headers["X-Leyline-Max-Budget-USD"] = str(self._settings.leyline_max_budget_usd)
+        if self._settings.leyline_daily_budget_usd > 0:
+            headers["X-Leyline-Daily-Budget-USD"] = str(self._settings.leyline_daily_budget_usd)
+        return headers
+
+    def _refresh_project_overrides(self) -> None:
+        """Pick up UI-saved active-project settings without exposing secrets."""
+        for key, value in _load_active_project_overrides().items():
+            if hasattr(self._settings, key):
+                setattr(self._settings, key, value)
+        # A changed endpoint/provider must not reuse a client created for the
+        # previous configuration.
+        self._openai_client = None
+        self._anthropic_client = None
+        self._ollama_client = None
+
+    def apply_profile_config(self, config: dict[str, Any]) -> None:
+        """Apply an internal agent-profile config without project persistence."""
+        mapping = {
+            "provider": "llm_provider",
+            "model": "llm_model",
+            "base_url": "openai_base_url",
+            "max_tokens": "llm_max_tokens",
+            "context_window": "context_window",
+            "context_output_reserve": "context_output_reserve",
+            "routing_provider": "llm_routing_provider",
+            "leyline_base_url": "leyline_base_url",
+            "leyline_provider": "leyline_provider",
+            "leyline_model": "leyline_model",
+            "leyline_max_budget_usd": "leyline_max_budget_usd",
+            "leyline_daily_budget_usd": "leyline_daily_budget_usd",
+            "openai_api_key": "openai_api_key",
+            "anthropic_api_key": "anthropic_api_key",
+        }
+        for source, target in mapping.items():
+            if source in config and config[source] is not None:
+                setattr(self._settings, target, config[source])
+        self._openai_client = None
+        self._anthropic_client = None
+        self._ollama_client = None
+
     @property
     def provider(self) -> str:
+        if self._is_routed_via_leyline() and self._settings.llm_routing_provider == "leyline":
+            return "openai"
         return self._settings.llm_provider
+
+    def _effective_model(self, model: str | None) -> str:
+        if model:
+            return model
+        if self._is_routed_via_leyline() and self._settings.leyline_model.strip():
+            return self._settings.leyline_model.strip()
+        return self._settings.llm_model
 
     # ------------------------------------------------------------------
     # Lazy client construction
@@ -46,13 +115,36 @@ class LLMClient:
             )
         return self._anthropic_client
 
+    @staticmethod
+    def _is_max_tokens_unsupported_error(exc: Exception) -> bool:
+        """True for the newer OpenAI-family models (o1/o3/gpt-5.x reasoning
+        models) that reject `max_tokens` in favor of `max_completion_tokens`.
+        Detected by message rather than a model-name allowlist so it keeps
+        working as new models/providers are added behind Leyline."""
+        message = str(getattr(exc, "message", "") or exc)
+        return "max_tokens" in message and "max_completion_tokens" in message
+
+    def _create_chat_completion(self, client: Any, **kwargs: Any) -> Any:
+        """`client.chat.completions.create(...)` with one automatic retry
+        using `max_completion_tokens` instead of `max_tokens` if the model
+        rejects the latter."""
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as e:
+            if "max_tokens" in kwargs and self._is_max_tokens_unsupported_error(e):
+                retry_kwargs = {k: v for k, v in kwargs.items() if k != "max_tokens"}
+                retry_kwargs["max_completion_tokens"] = kwargs["max_tokens"]
+                return client.chat.completions.create(**retry_kwargs)
+            raise
+
     def _get_openai(self) -> Any:
         if self._openai_client is None:
             import openai
 
             kwargs: dict[str, Any] = {"api_key": self._settings.openai_api_key}
-            if self._settings.openai_base_url:
-                kwargs["base_url"] = self._settings.openai_base_url
+            kwargs["base_url"] = self._effective_openai_base_url()
+            if self._leyline_budget_headers():
+                kwargs["default_headers"] = self._leyline_budget_headers()
             self._openai_client = openai.OpenAI(**kwargs, timeout=self._timeout)
         return self._openai_client
 
@@ -88,7 +180,8 @@ class LLMClient:
 
         Works identically regardless of the configured provider.
         """
-        model = model or self._settings.llm_model
+        self._refresh_project_overrides()
+        model = self._effective_model(model)
         max_tokens = max_tokens or self._settings.llm_max_tokens
 
         if self.provider == "openai":
@@ -107,7 +200,8 @@ class LLMClient:
         history: list[dict[str, str]] | None = None,
     ):
         """Yield chat chunks as they arrive."""
-        model = model or self._settings.llm_model
+        self._refresh_project_overrides()
+        model = self._effective_model(model)
         max_tokens = max_tokens or self._settings.llm_max_tokens
 
         if self.provider == "openai":
@@ -133,7 +227,8 @@ class LLMClient:
           data URLs (``data:image/jpeg;base64,...``) or raw base64 JPEG.
         - Other providers: text-only fallback.
         """
-        model = model or self._settings.llm_model
+        self._refresh_project_overrides()
+        model = self._effective_model(model)
         max_tokens = max_tokens or self._settings.llm_max_tokens
 
         if self.provider == "openai":
@@ -184,7 +279,8 @@ class LLMClient:
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
-        response = client.chat.completions.create(
+        response = self._create_chat_completion(
+            client,
             model=model,
             max_tokens=max_tokens,
             messages=messages,
@@ -222,7 +318,8 @@ class LLMClient:
         messages: list[dict[str, Any]] = [
             {"role": "user", "content": content},
         ]
-        response = client.chat.completions.create(
+        response = self._create_chat_completion(
+            client,
             model=model,
             max_tokens=max_tokens,
             messages=messages,
@@ -300,7 +397,8 @@ class LLMClient:
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(history or [])
         messages.append({"role": "user", "content": user_message})
-        response = client.chat.completions.create(
+        response = self._create_chat_completion(
+            client,
             model=model,
             max_tokens=max_tokens,
             messages=messages,

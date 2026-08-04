@@ -15,6 +15,20 @@ export interface AgentProfileConfig {
   /** For internal profiles only — which LLM provider to use.
    *  'openai' → any OpenAI-compatible API (OpenAI, DeepSeek, LLM API, vLLM, etc.) */
   provider?: 'ollama' | 'openai' | 'anthropic';
+  /** Internal routing precedence: Leyline by default, or explicit direct pin. */
+  routing_provider?: 'leyline' | 'direct';
+  /** Optional internal-provider transport and budgeting controls. */
+  base_url?: string;
+  openai_api_key?: string;
+  anthropic_api_key?: string;
+  max_tokens?: number;
+  context_window?: number;
+  context_output_reserve?: number;
+  leyline_base_url?: string;
+  leyline_provider?: string;
+  leyline_model?: string;
+  leyline_max_budget_usd?: number;
+  leyline_daily_budget_usd?: number;
   /** External-only. Default `acceptEdits`. */
   permission_mode?: PermissionMode;
   /** External-only. Whether the Oasis MCP server should be auto-wired.

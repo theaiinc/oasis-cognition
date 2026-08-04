@@ -44,6 +44,7 @@ export interface WorkflowEdge {
 
 export interface Workflow {
   workflow_id: string;
+  project_id?: string;
   name: string;
   description?: string;
   version: number;
@@ -97,6 +98,7 @@ export interface NodeState {
 export interface WorkflowRun {
   run_id: string;
   workflow_id: string;
+  project_id?: string;
   trigger_id?: string;
   trigger_type?: TriggerType;
   status: RunStatus;
@@ -105,6 +107,7 @@ export interface WorkflowRun {
   /** Session-level context propagated to all nodes. */
   context: {
     active_project_id?: string;
+    project_id?: string;
     trace_id?: string;
   };
   node_states: Record<string, NodeState>;
@@ -118,6 +121,7 @@ export interface WorkflowRun {
 /* ── DTOs ──────────────────────────────────────────────────────────── */
 
 export interface CreateWorkflowDto {
+  project_id?: string;
   name: string;
   description?: string;
   enabled?: boolean;
@@ -135,5 +139,6 @@ export interface CreateTriggerDto {
 
 export interface RunWorkflowDto {
   input?: any;
+  project_id?: string;
   context?: Record<string, any>;
 }

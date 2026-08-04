@@ -12,6 +12,7 @@ export class TimelineController {
   @Sse('timeline')
   timeline(
     @Query('session_id') sessionId: string,
+    @Query('project_id') projectId?: string,
     @Query('backlog') backlog: string = '50',
   ): Observable<MessageEvent> {
     const backlogN = Math.max(0, Math.min(parseInt(backlog, 10) || 50, 200));
@@ -32,6 +33,7 @@ export class TimelineController {
             const items = await this.events.getBacklog(sessionId, backlogN);
             for (const e of items) {
               if (closed) return;
+              if (projectId && e.project_id !== projectId) continue;
               subscriber.next({ data: e });
             }
           }
@@ -46,6 +48,7 @@ export class TimelineController {
               lastId = item.id;
               if (closed) return;
               if (item.event.session_id !== sessionId) continue;
+              if (projectId && item.event.project_id !== projectId) continue;
               subscriber.next({ data: item.event });
             }
           }

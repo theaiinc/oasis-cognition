@@ -11,6 +11,7 @@ import json
 import logging
 import os
 import re
+from contextvars import ContextVar
 import shutil
 import uuid
 from collections import defaultdict
@@ -88,6 +89,16 @@ FRAMEWORK_DETECTORS: dict[str, str] = {
 }
 
 PROJECT_ROOT = os.getenv("PROJECT_ROOT", os.getcwd())
+_REQUEST_PROJECT_ROOT: ContextVar[str | None] = ContextVar("oasis_request_project_root", default=None)
+
+
+def _current_project_root() -> str:
+    """Resolve the request-scoped root, falling back to legacy active-project state."""
+    return _REQUEST_PROJECT_ROOT.get() or PROJECT_ROOT
+
+
+def set_request_project_root(project_root: str | None) -> None:
+    _REQUEST_PROJECT_ROOT.set(project_root or None)
 
 
 def _get_worktree_dir() -> str:
@@ -96,7 +107,7 @@ def _get_worktree_dir() -> str:
     This must be a function (not a module-level constant) because
     PROJECT_ROOT is updated at runtime when the user switches projects.
     """
-    return os.path.join(PROJECT_ROOT, ".oasis-worktrees")
+    return os.path.join(_current_project_root(), ".oasis-worktrees")
 
 
 def set_project_root(new_root: str) -> None:
@@ -228,7 +239,7 @@ class DevAgentService:
             "git", *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=cwd or PROJECT_ROOT,
+            cwd=cwd or _current_project_root(),
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
         return (
@@ -1048,14 +1059,14 @@ class DevAgentService:
                 "reason": "package_install_requires_worktree",
             }
 
-        root = Path(PROJECT_ROOT).resolve()
+        root = Path(_current_project_root()).resolve()
         cwd = str(root)
         if worktree_id:
             wt = self._worktree_path(worktree_id)
             if wt.is_dir():
                 cwd = str(wt.resolve())
             else:
-                logger.warning("run_bash: worktree %r missing; using PROJECT_ROOT", worktree_id)
+                logger.warning("run_bash: worktree %r missing; using request project root", worktree_id)
 
         # Rewrite /workspace references in the command to the actual cwd.
         # The LLM thinks it's in a container with /workspace as the project root,
@@ -1157,7 +1168,7 @@ class DevAgentService:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
-            cwd=PROJECT_ROOT,
+            cwd=_current_project_root(),
         )
         stdout, stderr_bytes = await asyncio.wait_for(
             proc.communicate(input=patch.encode("utf-8")), timeout=30
@@ -1555,9 +1566,23 @@ class DevAgentService:
     def save_project_settings(project_id: str, settings: dict[str, Any]) -> dict[str, Any]:
         """Save per-project settings to ~/.oasis/projects/{project_id}/settings.json."""
         try:
+            allowed = {
+                "project_path", "project_type", "git_url", "last_indexed",
+                "context_summary", "tech_stack", "frameworks",
+            }
+            settings = {key: value for key, value in settings.items() if key in allowed}
             path = DevAgentService._project_settings_path(project_id)
             path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(json.dumps(settings, indent=2), encoding="utf-8")
+            existing: dict[str, Any] = {}
+            if path.exists():
+                try:
+                    existing = json.loads(path.read_text(encoding="utf-8"))
+                except Exception:
+                    existing = {}
+            # The UI sends partial updates. Merge so a code-index save cannot
+            # erase LLM settings or a redacted secret.
+            existing.update(settings)
+            path.write_text(json.dumps(existing, indent=2), encoding="utf-8")
             logger.info("Saved project settings for %s", project_id)
             return {"success": True, "error": ""}
         except Exception as e:

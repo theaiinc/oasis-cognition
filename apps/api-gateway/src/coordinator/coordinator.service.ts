@@ -74,8 +74,9 @@ export class CoordinatorService {
     parentSessionId: string,
     interactionId: string,
     autoApproveFree: boolean,
+    projectId?: string,
   ): Promise<PreflightResult> {
-    const result = await this.preflight.preflight(plan, parentSessionId, interactionId, autoApproveFree);
+    const result = await this.preflight.preflight(plan, parentSessionId, interactionId, autoApproveFree, projectId);
 
     // Persist job + budget
     result.job.status = result.approval_required ? 'awaiting_approval' : 'draft';
@@ -178,9 +179,12 @@ export class CoordinatorService {
     return null;
   }
 
-  async listJobs(parentSessionId?: string): Promise<CoordinatorJob[]> {
+  async listJobs(parentSessionId?: string, projectId?: string): Promise<CoordinatorJob[]> {
     const all = Array.from(this.jobCache.values());
-    const filtered = parentSessionId ? all.filter(j => j.parent_session_id === parentSessionId) : all;
+    const filtered = all.filter((job) =>
+      (!parentSessionId || job.parent_session_id === parentSessionId) &&
+      (!projectId || job.project_id === projectId),
+    );
     return filtered.sort((a, b) => b.created_at.localeCompare(a.created_at));
   }
 

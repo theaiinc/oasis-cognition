@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
-import { Terminal, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog } from 'lucide-react';
+import { Terminal, Bot, Settings, History, ArrowDown, Workflow, BookOpen, Monitor, Smartphone, FileStack, UserCog, LayoutDashboard } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { Toaster } from "@/components/ui/toaster";
@@ -30,7 +30,7 @@ import { ActiveMissionsBar, type MissionRow } from '@/components/chat/ActiveMiss
 import { EmptyChatHints } from '@/components/chat/EmptyChatHints';
 import type { SessionUsage as BudgetUsage, SessionBudget } from '@/components/chat/SessionBudgetPill';
 import { GraphPanel } from '@/components/graph';
-import { SettingsPanel, HistoryPanel, ArtifactsPanel } from '@/components/panels';
+import { SettingsPanel, HistoryPanel, ArtifactsPanel, ProjectOperationsPanel } from '@/components/panels';
 import { AgentsPanel } from '@/components/agents/AgentsPanel';
 import { RolePicker } from '@/components/chat/RolePicker';
 import { WorkflowsPanel } from '@/components/workflows/WorkflowsPanel';
@@ -81,6 +81,7 @@ export default function App() {
   const [showWorkflowsPanel, setShowWorkflowsPanel] = useState(false);
   const [showMobilePairingPanel, setShowMobilePairingPanel] = useState(false);
   const [showArtifactsPanel, setShowArtifactsPanel] = useState(false);
+  const [showProjectOperationsPanel, setShowProjectOperationsPanel] = useState(false);
   // Missions visible inline in the chat — not in a separate panel. The map is the source of
   // truth; the SSE handlers below mutate it as Mission* events arrive.
   const [missionsById, setMissionsById] = useState<Record<string, MissionRow>>({});
@@ -1218,6 +1219,15 @@ export default function App() {
           >
             <FileStack className="w-5 h-5" />
           </Button>
+          <Button
+            variant="ghost"
+            size="icon"
+            className={cn("text-slate-400 hover:text-white", showProjectOperationsPanel && "text-cyan-400")}
+            onClick={() => setShowProjectOperationsPanel(v => !v)}
+            title="Project Operations"
+          >
+            <LayoutDashboard className="w-5 h-5" />
+          </Button>
         </div>
         <Button
           variant="ghost"
@@ -1241,6 +1251,11 @@ export default function App() {
         </Button>
       </div>
 
+      <AnimatePresence>
+        {showProjectOperationsPanel && (
+          <ProjectOperationsPanel onClose={() => setShowProjectOperationsPanel(false)} />
+        )}
+      </AnimatePresence>
       <AnimatePresence>
         {showHistoryPanel && <HistoryPanel sessions={historySessions} currentSessionId={textSessionId} activeSessionIds={activeSessionIds} onNewChat={handleNewChat} onLoadSession={(id) => { loadSession(id); setGraphsBySessionId({}); }} onDeleteSession={deleteSession} />}
       </AnimatePresence>
@@ -1324,7 +1339,7 @@ export default function App() {
       <main className={cn(
         "flex-1 flex flex-col overflow-hidden relative",
         // Full-canvas panels replace the chat area entirely.
-        (showWorkflowsPanel || showAgentsPanel) && "hidden",
+        (showWorkflowsPanel || showAgentsPanel || showProjectOperationsPanel) && "hidden",
       )}>
 <ChatHeader statusText={voice.statusText} isConnected={voice.isConnected} isConnecting={voice.isConnecting} micEnabled={voice.micEnabled} isSharing={voice.isSharing} cuScreenSharing={cuScreenSharing} projectConfig={projectConfig} showSidebar={showSidebar} autonomousMode={autonomousMode} contextBudget={contextBudget} onToggleSidebar={() => setShowSidebar(v => !v)} onToggleMic={voice.toggleMic} onToggleScreenShare={voice.toggleScreenShare} onToggleVision={() => { if (cuScreenSharing) { setCuScreenSharing(false); setCaptureTarget(undefined); } else { setShowCaptureTargetPicker(true); } }} onConnect={voice.handleConnect} onVoiceIdClick={handleVoiceIdClick} onOpenSettings={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} activeProjectName={activeProjectName} ruleCount={memoryRules.length} onOpenRules={() => { setShowGraphPanel(true); }} missionCount={Object.values(missionsById).filter(m => m.enabled).length} runningMissionCount={Object.values(missionsById).filter(m => m.state === 'running').length} onOpenMissions={() => { const v = scrollRef.current?.querySelector('[data-radix-scroll-area-viewport]') as HTMLElement | null; if (v) v.scrollTop = 0; }} sessionUsage={sessionUsage} sessionBudget={sessionBudget} sessionBudgetPct={sessionBudgetPct} onOpenBudget={() => { setShowSettingsPanel(true); setShowHistoryPanel(false); }} />
 

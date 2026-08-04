@@ -71,6 +71,10 @@ export interface ProjectSettings {
   vision_llm_model?: string;
   context_window?: number;
   context_output_reserve?: number;
+  leyline_base_url?: string;
+  leyline_max_budget_usd?: number;
+  leyline_daily_budget_usd?: number;
+  openai_api_key_configured?: boolean;
   embedding_model?: string;
   log_level?: string;
 }

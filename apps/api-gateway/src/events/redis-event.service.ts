@@ -1,6 +1,7 @@
 import { Injectable, OnModuleDestroy, Logger } from '@nestjs/common';
 import Redis from 'ioredis';
 import { v4 as uuidv4 } from 'uuid';
+import { ProjectContextService } from '../context/project-context.service';
 
 const STREAM_KEY = 'oasis:events';
 const MAX_BACKLOG_EVENTS = 200;
@@ -15,6 +16,7 @@ export interface OasisEvent {
   event_id: string;
   event_type: string;
   session_id: string;
+  project_id?: string;
   trace_id: string;
   timestamp: string;
   payload: Record<string, any>;
@@ -29,7 +31,7 @@ export class RedisEventService implements OnModuleDestroy {
   /** After ping once; reset if reader is torn down. */
   private streamReaderVerified = false;
 
-  constructor() {
+  constructor(private readonly projectContext: ProjectContextService) {
     const redisUrl = process.env.REDIS_URL || 'redis://localhost:6379';
     try {
       this.redis = new Redis(redisUrl, {
@@ -57,10 +59,12 @@ export class RedisEventService implements OnModuleDestroy {
   }
 
   async publish(eventType: string, sessionId: string, payload: Record<string, any>): Promise<void> {
+    const projectId = this.projectContext.get()?.project_id || payload.project_id;
     const event: OasisEvent = {
       event_id: uuidv4(),
       event_type: eventType,
       session_id: sessionId,
+      ...(projectId ? { project_id: projectId } : {}),
       trace_id: uuidv4(),
       timestamp: new Date().toISOString(),
       payload,
@@ -92,6 +96,7 @@ export class RedisEventService implements OnModuleDestroy {
           'event_id', event.event_id,
           'event_type', event.event_type,
           'session_id', event.session_id,
+          ...(event.project_id ? ['project_id', event.project_id] : []),
           'trace_id', event.trace_id,
           'timestamp', event.timestamp,
           'payload', JSON.stringify(event.payload),
@@ -134,7 +139,7 @@ export class RedisEventService implements OnModuleDestroy {
   }
 
   /** Snapshot of every session currently mid-interaction. Stale entries are pruned on read. */
-  async getActiveSessions(): Promise<Array<{ session_id: string; started_at: string }>> {
+  async getActiveSessions(projectId?: string): Promise<Array<{ session_id: string; started_at: string; project_id?: string }>> {
     const r = this.redis;
     if (!r || !(await this.ensureRedisReady())) return [];
     try {
@@ -154,7 +159,14 @@ export class RedisEventService implements OnModuleDestroy {
       if (stale.length > 0) {
         void r.hdel(ACTIVE_SESSIONS_KEY, ...stale).catch(() => undefined);
       }
-      return fresh;
+      if (!projectId) return fresh;
+      const projectSessions = await Promise.all(
+        fresh.map(async (session) => {
+          const events = await this.getBacklog(session.session_id, 1);
+          return events[0]?.project_id === projectId ? { ...session, project_id: projectId } : null;
+        }),
+      );
+      return projectSessions.filter((session): session is { session_id: string; started_at: string; project_id: string } => session !== null);
     } catch (err) {
       this.logger.warn(`getActiveSessions failed: ${err}`);
       return [];
@@ -176,6 +188,23 @@ export class RedisEventService implements OnModuleDestroy {
       return events.slice(-Math.min(Math.max(limit, 1), MAX_BACKLOG_EVENTS));
     } catch (err) {
       this.logger.warn(`Failed to read backlog from Redis: ${err}`);
+      return [];
+    }
+  }
+
+  async getProjectEvents(projectId: string, limit: number = 100): Promise<OasisEvent[]> {
+    const r = this.redis;
+    if (!r || !(await this.ensureRedisReady()) || !projectId) return [];
+    const boundedLimit = Math.min(Math.max(limit, 1), MAX_BACKLOG_EVENTS);
+    try {
+      const rows = await r.xrevrange(STREAM_KEY, '+', '-', 'COUNT', MAX_BACKLOG_EVENTS * 4);
+      return rows
+        .map(([_id, fields]) => this._parseStreamFields(fields))
+        .filter((event): event is OasisEvent => event !== null && event.project_id === projectId)
+        .slice(0, boundedLimit)
+        .reverse();
+    } catch (err) {
+      this.logger.warn(`Failed to read project events from Redis: ${err}`);
       return [];
     }
   }
@@ -252,6 +281,7 @@ export class RedisEventService implements OnModuleDestroy {
         event_id: obj.event_id,
         event_type: obj.event_type,
         session_id: obj.session_id,
+        ...(obj.project_id ? { project_id: obj.project_id } : {}),
         trace_id: obj.trace_id,
         timestamp: obj.timestamp,
         payload: obj.payload ? JSON.parse(obj.payload) : {},

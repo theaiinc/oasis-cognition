@@ -1,4 +1,4 @@
-import { Controller, Get } from '@nestjs/common';
+import { Controller, Get, Query } from '@nestjs/common';
 import { RedisEventService } from '../events/redis-event.service';
 
 /**
@@ -14,7 +14,7 @@ export class SessionsActivityController {
   constructor(private readonly events: RedisEventService) {}
 
   @Get('active')
-  async getActive() {
-    return { active: await this.events.getActiveSessions() };
+  async getActive(@Query('project_id') projectId?: string) {
+    return { active: await this.events.getActiveSessions(projectId?.trim() || undefined) };
   }
 }

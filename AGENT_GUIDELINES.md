@@ -946,3 +946,111 @@ A proper model registry now lives at `apps/api-gateway/src/models/model-variants
 
 - **Problem**: The Yggdrasil monorepo uses Nx workspaces with `package-lock.json` at root, but Dockerfiles ran `npm ci` which requires a local lock file. Builds failed.
 - **Fix**: Changed all `RUN npm ci` / `RUN npm ci --omit=dev` to `RUN npm install` / `RUN npm install --omit=dev` in both `packages/yggdrasil/Dockerfile` and `packages/ratatoskr/Dockerfile`. Also added `*.tgz` to `.gitignore` and ran `git rm --cached` for already-tracked tarballs.
+
+### 2026-07-30 — Full-stack startup dependency alignment
+
+- **Aha**: The gateway Docker build context is `apps/api-gateway`, so local
+  file dependencies must be explicitly copied before `npm install`.
+- **Fix**: Aligned the gateway dependency from the unavailable
+  `theaiinc-yggdrasil-0.2.3.tgz` to the repository's `0.3.8` artifact and copied
+  that artifact in `apps/api-gateway/Dockerfile`.
+
+### 2026-07-30 — Use released Yggdrasil package
+
+- **Correction**: `@theaiinc/yggdrasil@0.3.8` is published on npm and is the
+  current `latest`; the gateway must use the registry dependency rather than a
+  checked-in tarball.
+- **Fix**: Changed the gateway dependency to `^0.3.8`, regenerated its lockfile,
+  and removed the Dockerfile tarball copy workaround.
+
+### 2026-07-30 — Remove Langfuse runtime
+
+- **Decision**: Model-service ownership and Redis timelines are sufficient;
+  Langfuse is no longer required by the Oasis runtime.
+- **Fix**: Removed Langfuse from the gateway dependency/module, OpenAI adapter,
+  Compose services and environment, and current architecture/getting-started
+  documentation. Existing pipeline instrumentation remains a local no-op.
+- **Verification**: Gateway tests and build pass; the gateway health endpoint
+  remains healthy after recreating the affected containers.
+
+### 2026-07-30 — Internal agent LLM settings and Leyline routing
+
+- **Aha**: Project settings persistence already existed, but the Cognition
+  settings panel only edited code-index fields; saved LLM values were neither
+  visible nor consistently applied to the long-lived Python LLM clients.
+- **Contract**: The built-in internal profile defaults to Leyline at the
+  configurable `http://localhost:3417/v1` endpoint. It forwards only numeric
+  budget headers; blank budgets emit no headers. Direct routing is explicit.
+- **Safety**: Profile GET/list/update responses redact API keys and expose only
+  configured flags. Project settings remain code-index metadata and cannot
+  persist LLM or credential fields.
+- **Ownership correction**: Internal Agent LLM configuration belongs only to
+  the built-in `internal-default` agent profile and is edited through
+  `/agent-profiles/:id`. Project `settings.json` remains code-index/project
+  metadata only; do not add provider, credential, context, or Leyline fields
+  there. Profile reads redact API keys and return configured flags.
+
+- **Docker path contract**: Project settings live under the host
+  `~/.oasis`; internal LLM containers must receive `OASIS_HOST_HOME` and mount
+  that host directory at `/host-home`. Shared config resolves this variable
+  dynamically, while native runs continue using `Path.home()`.
+
+### 2026-08-04 — Align Oasis with desktop Leyline port
+
+- **Aha**: Oasis was configured for stale Leyline ports (`8080` defaults and
+  `3000` Docker examples), while the Leyline desktop app now listens on
+  `127.0.0.1:3417` to avoid the Oasis UI's Docker mapping on port 3000.
+- **Contract**: Native Oasis clients use `http://localhost:3417/v1`;
+  Dockerized services use `http://host.docker.internal:3417/v1`.
+
+### 2026-07-30 — Project creation UX and activation contract
+
+- **Aha**: Creating a project is a metadata operation; source paths must remain
+  in the separate code-index configuration flow so browser UI cannot fabricate
+  or weaken host-path handling.
+- **Contract**: Project names are trimmed and must contain non-whitespace
+  content at the gateway boundary. Empty descriptions are omitted rather than
+  persisted as optional-field noise.
+- **Synchronization**: The UI awaits backend activation after creation before
+  publishing the new active-project selection; if dev-agent is temporarily
+  unavailable, the local selection remains and the existing startup/switch
+  retry path can resynchronize it.
+
+### 2026-07-30 — Separate production and Vite UI workflows
+
+- **Port contract**: Production `oasis-ui` serves the built React app through
+  Nginx on host port 3000. Local Vite development serves HMR on host port
+  5173 by default; `VITE_DEV_PORT` may override it.
+- **Compose contract**: `docker-compose.dev.yml` assigns `oasis-ui` to the
+  `production-ui` profile, so the dev backend command does not start a second
+  UI container. Stop an already-running `oasis-ui` before starting Vite, and
+  use the same override for backend shutdown.
+- **Network contract**: Vite binds to `0.0.0.0` and the browser keeps calling
+  the gateway at `http://localhost:8000`; do not move the gateway to the UI
+  development port.
+
+### 2026-08-03 — Multi-project execution context
+
+- **Aha**: `active_project` is a UI convenience and cannot be authoritative for
+  concurrent work. Interactions now establish an AsyncLocalStorage-backed
+  `ProjectContextService` scope from `context.project_id`, preventing one
+  request from overwriting another request's project identity.
+- **Event contract**: `project_id` is now a first-class field on gateway
+  `OasisEvent` and Python `BaseEvent`, and timeline/active-session reads can
+  filter by project.
+- **Execution contract**: Gateway tool payloads, dev-agent requests, missions,
+  workflows, and coordinator jobs now carry project identity where those
+  records already exist. Pantheon remains the planning/governance plane;
+  Cognition is the project-scoped execution plane.
+- **Workspace isolation**: Project paths are resolved from the project record
+  for each interaction and passed to dev-agent/tool-executor requests. The
+  dev-agent uses a Python `ContextVar` for request-local roots, while the
+  legacy active-project root remains only as a compatibility fallback.
+- **UI**: The Project Operations panel is intentionally separate from the
+  existing single-project workspace and currently provides cross-project
+  activity monitoring without duplicating Pantheon planning.
+- **Verification**: Gateway tests pass (66), Python tests pass (41), and both
+  gateway/UI production builds pass. The concurrency regression uses two
+  simultaneous project contexts; full browser/integration harness execution
+  remains environment-dependent because this checkout has no runnable
+  `tests/e2e` source/configuration.

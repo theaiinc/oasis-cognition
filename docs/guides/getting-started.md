@@ -44,7 +44,6 @@ This ensures transcription is available when configured, then runs `docker compo
 |-----|---------|
 | http://localhost:3000 | Oasis UI |
 | http://localhost:8000/api/v1/health | API gateway health |
-| http://localhost:3100 | Langfuse (default seeded keys in compose) |
 | http://localhost:7474 | Neo4j Browser |
 
 ### Useful Make targets
@@ -57,6 +56,36 @@ This ensures transcription is available when configured, then runs `docker compo
 | `make logs` | Tail recent logs |
 | `make status` | `docker compose ps` + transcription health |
 | `make install` / `make uninstall` | Transcription LaunchAgent (macOS) |
+
+## Local UI development (Vite + HMR)
+
+`make up` runs the production `oasis-ui` Nginx container on port 3000. For
+React development, stop that UI container and use the development Compose
+override so Docker runs the backend only:
+
+```bash
+docker compose stop oasis-ui
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+cd apps/oasis-ui-react
+npm run dev
+```
+
+Vite serves http://localhost:5173 with HMR and binds to `0.0.0.0`. The UI
+continues to reach the Dockerized gateway at
+http://localhost:8000/api/v1/health. To use another free port:
+
+```bash
+VITE_DEV_PORT=5174 npm run dev
+```
+
+Stop Vite with Ctrl+C, then stop the backend using the same Compose files:
+
+```bash
+docker compose -f docker-compose.yml -f docker-compose.dev.yml down
+```
+
+Return to production with `make up` (UI at http://localhost:3000). Do not
+run the production and local UI workflows on the same host port.
 
 ## Dev agent (required for worktree / file tools)
 

@@ -21,6 +21,7 @@ class BaseEvent(BaseModel):
     event_id: str = Field(default_factory=_uuid)
     event_type: str = ""
     session_id: str = ""
+    project_id: str | None = None
     timestamp: datetime = Field(default_factory=_utcnow)
     trace_id: str = Field(default_factory=_uuid)
     payload: dict[str, Any] = Field(default_factory=dict)

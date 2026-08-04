@@ -18,6 +18,7 @@ const API = `${GATEWAY_SELF}/api/v1/missions`;
 
 export interface NativeMissionPlan {
   tool: string;
+  project_id?: string;
   /** Mission id for get/update/delete/pause/resume/run */
   mission_id?: string;
   /** Free-form description of what the mission should do */
@@ -78,6 +79,7 @@ async function doCreate(plan: NativeMissionPlan, sessionId: string): Promise<Nat
   if (!plan.goal) return { success: false, output: 'mission_create requires PARAM_GOAL' };
   if (!plan.schedule) return { success: false, output: 'mission_create requires PARAM_SCHEDULE (cron expression)' };
   const res = await axios.post(API, {
+    project_id: plan.project_id,
     goal: plan.goal,
     prompt: plan.prompt,
     schedule: plan.schedule,

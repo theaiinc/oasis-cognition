@@ -78,7 +78,7 @@ flowchart LR
 
 | Layer | Service | Role |
 |-------|---------|------|
-| Edge | **api-gateway** (NestJS) | Single public API (`/api/v1/...`). Orchestrates interpreter routing, teaching, tool-use loops, streaming NDJSON to the UI, Redis pub/sub, and optional Langfuse traces. |
+| Edge | **api-gateway** (NestJS) | Single public API (`/api/v1/...`). Orchestrates interpreter routing, teaching, tool-use loops, streaming to the UI, and Redis event timelines. |
 | Parsing | **interpreter** | Turns natural language into structured `semantic_structure` (intent, entities, route). |
 | Generation | **response-generator** | Tool-plan streaming, thought layer, validation, and calls into dev-agent / tool-executor for actions. |
 | Teaching | **teaching-service** | Guided teaching flows and web search integration. |
@@ -88,13 +88,12 @@ flowchart LR
 | Memory | **memory-service** | Neo4j-backed session memory, rules snapshots, code-symbol queries, and **CU learning memory** (Skill, UIElement, Action nodes for action replay and self-improvement). |
 | Index | **code-indexer** | Tree-sitter indexing of the repo into Neo4j (`CodeFile`, `CodeSymbol`, `CodeModule`); optional file watcher. |
 | Voice | **voice-agent** + **LiveKit** | Real-time audio; transcription may call host **transcription** (MLX) on macOS. |
-| Adapter | **openai-adapter** | OpenAI-compatible REST API (`/v1/chat/completions`, `/v1/models`). Bridges external clients (e.g. Open WebUI) to the Oasis pipeline; Langfuse tracing built-in. |
+| Adapter | **openai-adapter** | OpenAI-compatible REST API (`/v1/chat/completions`, `/v1/models`). Bridges external clients (e.g. Open WebUI) to the Oasis pipeline. |
 | Vision | **ui-parser** | Deterministic UI component parser for the computer-use pipeline. Converts YOLO detections + Tesseract OCR into structured/hierarchical UI component trees (buttons, inputs, text, etc.). |
 | Browser | **Chrome Bridge** (extension) | Manifest V3 Chrome extension connecting to dev-agent via WebSocket (`ws://localhost:8008/ws/chrome-bridge`). Provides reliable DOM text extraction, meta tag reading, navigation, and element interaction for the computer-use pipeline. Falls back to AppleScript when not installed. See `extensions/oasis-chrome-bridge/`. |
 | Artifacts | **artifact-service** | File upload, document processing (PDF, DOCX, PPTX), text extraction, embedding generation, and transcription integration. Delegates metadata to memory-service (Neo4j). |
 | Diarization | **diarization** (host) | Speaker diarization using PyAnnote — identifies speaker segments from audio. Runs on host via `scripts/start-diarization.sh`. |
 | Transcription | **transcription-gipformer** (host) | Alternative transcription backend using Sherpa-ONNX + PyAnnote. Runs on host via `scripts/start-gipformer.sh`. Best suited for Vietnamese audio. |
-| Observability | **Langfuse** + Postgres | Traces and dashboards (default port **3100** on host). |
 
 ## Typical tool-use request flow
 
@@ -109,10 +108,8 @@ flowchart LR
 | Port | Service |
 |------|---------|
 | 3000 | oasis-ui (nginx serving React build) |
-| 3100 | Langfuse UI |
 | 7474 / 7687 | Neo4j browser / Bolt |
 | 6379 | Redis |
-| 5433 | Langfuse Postgres (host-mapped) |
 | 7880 / 7881 | LiveKit |
 | 8000 | api-gateway |
 | 8001 | interpreter |

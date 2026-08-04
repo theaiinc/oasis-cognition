@@ -6,7 +6,7 @@
 
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { gwGet, gwPost } from '../lib/gateway.js';
+import { gwGet, gwPost, gwDelete } from '../lib/gateway.js';
 import { handle } from '../lib/tool-utils.js';
 
 const BASE = '/api/v1/project';
@@ -31,6 +31,31 @@ export function registerProjectTools(server: McpServer) {
     'Get the current project configuration (project_path, project_type, git_url).',
     {},
     async () => handle(() => gwGet(`${BASE}/config`)),
+  );
+
+  server.tool(
+    'project_create',
+    'Register a new project in the multi-project registry (memory-service/Neo4j). Purely additive — does not touch the currently active dev-agent project or trigger re-indexing. Use project_activate afterwards to make it the active working context.',
+    {
+      name: z.string(),
+      description: z.string().optional(),
+      project_path: z.string().optional(),
+    },
+    async (args) => handle(() => gwPost(`${BASE}/create`, args)),
+  );
+
+  server.tool(
+    'project_list',
+    'List all projects registered in the multi-project registry (memory-service/Neo4j), independent of which one is currently active.',
+    {},
+    async () => handle(() => gwGet(`${BASE}/list`)),
+  );
+
+  server.tool(
+    'project_remove_from_registry',
+    'Remove a project from the multi-project registry by id. Does not affect the active dev-agent project even if it is the one being removed.',
+    { project_id: z.string() },
+    async ({ project_id }) => handle(() => gwDelete(`${BASE}/registry/${project_id}`)),
   );
 
   server.tool(

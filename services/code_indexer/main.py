@@ -17,6 +17,7 @@ from services.code_indexer.models import (
     IndexResponse,
     SearchQuery,
     IndexRequest,
+    IndexProjectRequest,
     SymbolType,
 )
 from services.code_indexer.service import CodeIndexerService
@@ -98,12 +99,14 @@ async def health() -> dict[str, Any]:
 
 
 @app.get("/symbols/search", response_model=SymbolSearchResult)
-async def search_symbols(q: str, type: str | None = None, limit: int = 10) -> SymbolSearchResult:
+async def search_symbols(
+    q: str, type: str | None = None, limit: int = 10, project_id: str | None = None
+) -> SymbolSearchResult:
     try:
         indexer = get_indexer()
         symbol_type = SymbolType(type) if type else None
         query = SearchQuery(q=q, type=symbol_type, limit=limit)
-        return indexer.search_symbols(query)
+        return indexer.search_symbols(query, project_id=project_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=f"Invalid symbol type: {e}") from e
     except Exception as e:
@@ -157,9 +160,9 @@ async def get_component_hierarchy(root: str) -> ComponentNode:
 
 
 @app.get("/index/status", response_model=IndexStatus)
-async def get_index_status() -> IndexStatus:
+async def get_index_status(project_id: str | None = None) -> IndexStatus:
     try:
-        return get_indexer().get_index_status()
+        return get_indexer().get_index_status(project_id=project_id)
     except Exception as e:
         logger.error("Get status failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e
@@ -183,11 +186,25 @@ async def full_reindex() -> IndexResponse:
         raise HTTPException(status_code=500, detail=str(e)) from e
 
 
+@app.post("/index/project", response_model=IndexResponse)
+async def index_project(request: IndexProjectRequest) -> IndexResponse:
+    """Index a specific project's workspace, scoped by project_id.
+
+    Independent of the active workspace — safe to call for a newly
+    registered project without disturbing whatever is currently active.
+    """
+    try:
+        return get_indexer().index_project(request.project_id, request.workspace_path, request.force)
+    except Exception as e:
+        logger.error("Project index failed: %s", e)
+        raise HTTPException(status_code=500, detail=str(e)) from e
+
+
 @app.get("/graph")
-async def get_full_code_graph(max_symbols: int = 300) -> dict[str, Any]:
+async def get_full_code_graph(max_symbols: int = 300, project_id: str | None = None) -> dict[str, Any]:
     """Return all CodeFile + CodeSymbol nodes and their relationships for the UI."""
     try:
-        return get_indexer().get_full_graph(max_symbols=max_symbols)
+        return get_indexer().get_full_graph(max_symbols=max_symbols, project_id=project_id)
     except Exception as e:
         logger.error("Get code graph failed: %s", e)
         raise HTTPException(status_code=500, detail=str(e)) from e

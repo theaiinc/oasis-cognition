@@ -257,9 +257,12 @@ export class ProjectsController {
 
   @Post()
   async create(@Body() body: { name: string; description?: string }) {
-    if (!body.name) throw new HttpException('name is required', HttpStatus.BAD_REQUEST);
+    const name = typeof body.name === 'string' ? body.name.trim() : '';
+    if (!name) throw new HttpException('name is required', HttpStatus.BAD_REQUEST);
     try {
-      const res = await axios.post(`${MEMORY_URL}/internal/memory/projects`, body);
+      const description = typeof body.description === 'string' ? body.description.trim() : '';
+      const payload = description ? { name, description } : { name };
+      const res = await axios.post(`${MEMORY_URL}/internal/memory/projects`, payload);
       return res.data;
     } catch (err: any) {
       throw new HttpException(

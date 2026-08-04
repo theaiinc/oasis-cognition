@@ -80,6 +80,7 @@ export class WorkflowsService implements OnModuleInit {
     const now = iso();
     const wf: Workflow = {
       workflow_id: uuidv4(),
+      project_id: dto.project_id?.trim() || undefined,
       name: dto.name.trim(),
       description: dto.description,
       version: 1,
@@ -100,9 +101,11 @@ export class WorkflowsService implements OnModuleInit {
     return wf;
   }
 
-  async listWorkflows(): Promise<Workflow[]> {
+  async listWorkflows(projectId?: string): Promise<Workflow[]> {
     const list = await this.store.listWorkflows();
-    return list.sort((a, b) => b.updated_at.localeCompare(a.updated_at));
+    return list
+      .filter((workflow) => !projectId || workflow.project_id === projectId)
+      .sort((a, b) => b.updated_at.localeCompare(a.updated_at));
   }
 
   async updateWorkflow(id: string, patch: UpdateWorkflowDto): Promise<Workflow> {
@@ -139,11 +142,12 @@ export class WorkflowsService implements OnModuleInit {
     const run: WorkflowRun = {
       run_id: uuidv4(),
       workflow_id: wf.workflow_id,
+      project_id: wf.project_id || opts.context?.project_id,
       trigger_id: opts.trigger_id,
       trigger_type: opts.trigger_type ?? 'manual',
       status: 'queued',
       input,
-      context: opts.context || {},
+      context: { ...(opts.context || {}), project_id: wf.project_id || opts.context?.project_id },
       node_states: {},
       created_at: iso(),
     };
@@ -168,7 +172,7 @@ export class WorkflowsService implements OnModuleInit {
   async runNow(workflowId: string, dto: RunWorkflowDto): Promise<WorkflowRun> {
     return this.enqueueRun(workflowId, dto?.input, {
       trigger_type: 'manual',
-      context: dto?.context || {},
+      context: { ...(dto?.context || {}), ...(dto?.project_id ? { project_id: dto.project_id } : {}) },
     });
   }
 

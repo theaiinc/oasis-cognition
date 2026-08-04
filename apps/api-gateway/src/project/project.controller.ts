@@ -1,5 +1,7 @@
-import { Controller, Post, Get, Param, Body, Logger, HttpException, HttpStatus } from '@nestjs/common';
+import { Controller, Post, Get, Delete, Param, Body, Query, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import axios from 'axios';
+import { RedisEventService } from '../events/redis-event.service';
+import { CoordinatorService } from '../coordinator/coordinator.service';
 
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
 const MEMORY_URL = process.env.MEMORY_SERVICE_URL || 'http://memory-service:8004';
@@ -7,6 +9,11 @@ const MEMORY_URL = process.env.MEMORY_SERVICE_URL || 'http://memory-service:8004
 @Controller('project')
 export class ProjectController {
   private readonly logger = new Logger(ProjectController.name);
+
+  constructor(
+    private readonly events: RedisEventService,
+    private readonly coordinator: CoordinatorService,
+  ) {}
 
   @Get('config')
   async getConfig() {
@@ -20,6 +27,21 @@ export class ProjectController {
       this.logger.warn(`Dev-agent unavailable: ${err.message}`);
       throw new HttpException('Dev-agent is not running', HttpStatus.SERVICE_UNAVAILABLE);
     }
+  }
+
+  @Get('operations')
+  async operations(@Query('project_id') projectId: string, @Query('limit') limit = '100') {
+    if (!projectId?.trim()) {
+      throw new HttpException('project_id is required', HttpStatus.BAD_REQUEST);
+    }
+    const project = projectId.trim();
+    const boundedLimit = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 200);
+    return {
+      project_id: project,
+      active_sessions: await this.events.getActiveSessions(project),
+      events: await this.events.getProjectEvents(project, boundedLimit),
+      jobs: await this.coordinator.listJobs(undefined, project),
+    };
   }
 
   @Post('configure')
@@ -57,6 +79,55 @@ export class ProjectController {
     } catch (err: any) {
       throw new HttpException(
         err.response?.data || 'Failed to get project context',
+        err.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  // ── Project registry (multi-project, memory-service/Neo4j-backed) ──────
+  // Distinct from configure/activate above: those mutate the single active
+  // dev-agent working context. These just create/list/remove registry
+  // entries in memory-service and never touch the active project.
+
+  @Post('create')
+  async create(@Body() body: { name: string; description?: string; project_path?: string }) {
+    if (!body?.name?.trim()) {
+      throw new HttpException('name is required', HttpStatus.BAD_REQUEST);
+    }
+    this.logger.log(`Creating project registry entry: ${body.name}`);
+    try {
+      const res = await axios.post(`${MEMORY_URL}/internal/memory/projects`, body, { timeout: 10000 });
+      return res.data;
+    } catch (err: any) {
+      throw new HttpException(
+        err.response?.data || 'Failed to create project',
+        err.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Get('list')
+  async list() {
+    try {
+      const res = await axios.get(`${MEMORY_URL}/internal/memory/projects`, { timeout: 10000 });
+      return res.data;
+    } catch (err: any) {
+      throw new HttpException(
+        err.response?.data || 'Failed to list projects',
+        err.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  @Delete('registry/:project_id')
+  async removeFromRegistry(@Param('project_id') projectId: string) {
+    this.logger.log(`Removing project registry entry: ${projectId}`);
+    try {
+      const res = await axios.delete(`${MEMORY_URL}/internal/memory/projects/${projectId}`, { timeout: 10000 });
+      return res.data;
+    } catch (err: any) {
+      throw new HttpException(
+        err.response?.data || 'Failed to delete project',
         err.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
     }

@@ -7,7 +7,7 @@ Index of curated docs for operators and contributors. For day-to-day agent conve
 
 | Document                                                 | What it covers                                                                               |
 | -------------------------------------------------------- | -------------------------------------------------------------------------------------------- |
-| [Architecture overview](architecture/overview.md)        | How services connect, ports, request flow, infrastructure (Neo4j, Redis, Langfuse, LiveKit). |
+| [Architecture overview](architecture/overview.md)        | How services connect, ports, request flow, infrastructure (Neo4j, Redis, LiveKit). |
 | [System Architecture Document (SAD)](SAD.md)             | Long-form neuro-symbolic vision, reasoning graph, and design rationale (LogicCopilot era).   |
 | [Code indexing service](code-indexing-service-design.md) | Tree-sitter indexing, Neo4j schema (`CodeFile`, `CodeSymbol`, `CodeModule`), APIs, watcher.  |
 

@@ -1436,7 +1436,14 @@ class MemoryService:
     # CODE KNOWLEDGE GRAPH QUERIES
     # ==========================================================================
 
-    async def search_code_symbols(self, query: str, symbol_type: str | None = None, limit: int = 10, path_prefixes: list[str] | None = None) -> list[dict[str, Any]]:
+    async def search_code_symbols(
+        self,
+        query: str,
+        symbol_type: str | None = None,
+        limit: int = 10,
+        path_prefixes: list[str] | None = None,
+        project_id: str | None = None,
+    ) -> list[dict[str, Any]]:
         """Search for code symbols by name in the code knowledge graph.
 
         Args:
@@ -1444,6 +1451,9 @@ class MemoryService:
             symbol_type: Optional filter by type (function, class, interface, etc.)
             limit: Maximum results to return
             path_prefixes: Optional list of path prefixes to scope results (e.g. ['services/code_indexer', 'apps/oasis-ui-react'])
+            project_id: Optional project registry id (see /internal/memory/projects) to scope
+                results to a specific project's index. Omit for the legacy/active-workspace
+                index (untagged CodeSymbol nodes), matching pre-existing behavior.
 
         Returns:
             List of symbol information dictionaries
@@ -1460,19 +1470,26 @@ class MemoryService:
                 for i in range(len(path_prefixes))
             )
             path_clause = f" AND ({path_conditions})"
+        scope_clause = " AND s.project_id = $project_id" if project_id else " AND s.project_id IS NULL"
 
-        params: dict[str, Any] = {"query": query, "limit": limit}
+        # NOTE: the search text is deliberately named "search_query", not "query" — the neo4j
+        # driver's Session.run(query, **kwargs) has its own positional "query" parameter, and
+        # spreading a kwarg literally named "query" collides with it (TypeError: got multiple
+        # values for argument 'query'), silently swallowed by callers' try/except.
+        params: dict[str, Any] = {"search_query": query, "limit": limit}
         if symbol_type:
             params["stype"] = symbol_type
         if path_prefixes:
             for i, pp in enumerate(path_prefixes):
                 params[f"pp{i}"] = pp
+        if project_id:
+            params["project_id"] = project_id
 
         with self._driver.session() as session:
             result = session.run(
                 f"""
                 MATCH (s:CodeSymbol)
-                WHERE (s.name CONTAINS $query OR coalesce(s.file_path, '') CONTAINS $query){type_clause}{path_clause}
+                WHERE (s.name CONTAINS $search_query OR coalesce(s.file_path, '') CONTAINS $search_query){type_clause}{path_clause}{scope_clause}
                 RETURN s.name AS name, s.type AS type, s.signature AS signature,
                        coalesce(s.file_path, '') AS file_path, s.line_start AS line_start,
                        s.docstring AS docstring, s.is_exported AS is_exported

@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Post, HttpException, HttpStatus, Logger } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Post, Query, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { MissionsService } from './missions.service';
 import type { CreateMissionDto, UpdateMissionDto } from './missions.types';
 
@@ -8,8 +8,8 @@ export class MissionsController {
   constructor(private readonly missions: MissionsService) {}
 
   @Get()
-  async list() {
-    return { missions: await this.missions.list() };
+  async list(@Query('project_id') projectId?: string) {
+    return { missions: await this.missions.list(projectId?.trim() || undefined) };
   }
 
   @Get(':id')

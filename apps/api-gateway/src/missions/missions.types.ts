@@ -16,6 +16,7 @@ export type MissionState = 'idle' | 'running' | 'paused' | 'failed';
 
 export interface Mission {
   mission_id: string;
+  project_id?: string;
   goal: string;
   /** What gets sent to the agent on each tick. Often identical to goal but may include extra instructions. */
   prompt: string;
@@ -47,6 +48,7 @@ export interface Mission {
 }
 
 export interface CreateMissionDto {
+  project_id?: string;
   goal: string;
   prompt?: string;
   schedule: string;
@@ -58,6 +60,7 @@ export interface CreateMissionDto {
 }
 
 export interface UpdateMissionDto {
+  project_id?: string;
   goal?: string;
   prompt?: string;
   schedule?: string;

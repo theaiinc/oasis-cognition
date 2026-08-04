@@ -21,6 +21,13 @@ export function registerInteractionTools(server: McpServer) {
         .string()
         .optional()
         .describe('Optional existing Oasis chat session to continue. Omit to start a new one.'),
+      project_id: z
+        .string()
+        .optional()
+        .describe(
+          'Optional project registry id (see project_create/project_list) to scope reasoning ' +
+            'to that project\'s own indexed code, rather than whatever is currently active.',
+        ),
       system_override: z
         .string()
         .optional()
@@ -32,9 +39,10 @@ export function registerInteractionTools(server: McpServer) {
         .default(90_000)
         .describe('Max time to wait for a response, in ms.'),
     },
-    async ({ message, session_id, system_override, max_tokens, timeout_ms }) =>
+    async ({ message, session_id, project_id, system_override, max_tokens, timeout_ms }) =>
       handle(() => {
         const context: Record<string, any> = {};
+        if (project_id) context.project_id = project_id;
         if (system_override) context.system_override = system_override;
         if (typeof max_tokens === 'number') context.max_tokens = max_tokens;
         return gwInteract(message, session_id, Object.keys(context).length ? context : undefined, timeout_ms);

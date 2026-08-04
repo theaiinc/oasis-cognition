@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
@@ -17,31 +18,24 @@ from pydantic_settings import BaseSettings
 
 logger = logging.getLogger(__name__)
 
-_OASIS_CONFIG_DIR = Path.home() / ".oasis"
-_ACTIVE_PROJECT_PATH = _OASIS_CONFIG_DIR / "active-project.json"
-_PROJECTS_DIR = _OASIS_CONFIG_DIR / "projects"
+DEFAULT_LEYLINE_BASE_URL = "http://localhost:3417/v1"
+
+def _oasis_config_paths() -> tuple[Path, Path, Path]:
+    """Resolve config paths, honoring the Docker host-home mount when set."""
+    config_dir = Path(os.environ.get("OASIS_HOST_HOME") or Path.home()) / ".oasis"
+    return config_dir, config_dir / "active-project.json", config_dir / "projects"
+
 
 # Fields that can be overridden per-project via project settings.
 # Maps settings.json key → Settings field name.
 PROJECT_OVERRIDABLE_FIELDS: set[str] = {
-    "llm_provider",
-    "llm_model",
-    "llm_max_tokens",
-    "openai_api_key",
-    "openai_base_url",
-    "anthropic_api_key",
-    "ollama_host",
-    "response_llm_provider",
-    "response_llm_model",
-    "tool_plan_llm_provider",
-    "tool_plan_llm_model",
-    "vision_llm_model",
-    "computer_use_llm_model",
-    "computer_use_llm_base_url",
-    "context_window",
-    "context_output_reserve",
-    "embedding_model",
-    "log_level",
+    "project_path",
+    "project_type",
+    "git_url",
+    "last_indexed",
+    "context_summary",
+    "tech_stack",
+    "frameworks",
 }
 
 
@@ -54,8 +48,11 @@ class Settings(BaseSettings):
     # LLM provider: "anthropic", "openai" (also works with any OpenAI-compatible
     # endpoint like DeepSeek / LLM API / vLLM / LM Studio), or "ollama"
     llm_provider: str = "openai"
+    # Routing default is Leyline; "direct" explicitly pins llm_provider.
+    llm_routing_provider: str = "leyline"
     llm_model: str = "google/gemma-4-26b-a4b-qat"
     llm_max_tokens: int = 8192
+    router_model: str = ""
 
     # Anthropic
     anthropic_api_key: str = ""
@@ -87,6 +84,14 @@ class Settings(BaseSettings):
     # Optional separate base URL for the computer-use model (e.g. a local ScreenAI/CogAgent server).
     # Empty = uses the same base URL as the vision model.
     computer_use_llm_base_url: str = ""
+
+    # Leyline OpenAI-compatible gateway. Override for the deployed gateway;
+    # empty explicitly disables routing and preserves direct-provider behavior.
+    leyline_base_url: str = DEFAULT_LEYLINE_BASE_URL
+    leyline_provider: str = ""
+    leyline_model: str = ""
+    leyline_max_budget_usd: float = 0.0
+    leyline_daily_budget_usd: float = 0.0
 
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
@@ -134,26 +139,32 @@ class Settings(BaseSettings):
     weight_rule_match: float = 0.25
     weight_contradiction_penalty: float = 0.1
 
-    model_config = {"env_prefix": "OASIS_", "env_file": ".env"}
+    model_config = {"env_prefix": "OASIS_", "env_file": ".env", "extra": "ignore"}
 
 
 def _load_active_project_overrides() -> dict[str, Any]:
     """Read the active project's settings and return overridable fields."""
     try:
-        if not _ACTIVE_PROJECT_PATH.exists():
+        _, active_project_path, projects_dir = _oasis_config_paths()
+        if not active_project_path.exists():
             return {}
-        active = json.loads(_ACTIVE_PROJECT_PATH.read_text(encoding="utf-8"))
+        active = json.loads(active_project_path.read_text(encoding="utf-8"))
         pid = active.get("project_id")
         if not pid:
             return {}
-        settings_path = _PROJECTS_DIR / pid / "settings.json"
+        settings_path = projects_dir / pid / "settings.json"
         if not settings_path.exists():
             return {}
         project_settings = json.loads(settings_path.read_text(encoding="utf-8"))
-        # Only return fields that are in the overridable set and have non-empty values
+        # Only return fields that are in the overridable set and have non-empty
+        # values. A saved empty Leyline URL is meaningful: it explicitly
+        # disables an environment-level default for that project. Other blank
+        # values are ignored so redacted/optional fields cannot erase defaults.
         overrides = {}
         for key, value in project_settings.items():
-            if key in PROJECT_OVERRIDABLE_FIELDS and value not in (None, ""):
+            if key in PROJECT_OVERRIDABLE_FIELDS and (
+                value not in (None, "") or key == "leyline_base_url"
+            ):
                 overrides[key] = value
         if overrides:
             logger.info("Applying project overrides for %s: %s", pid, list(overrides.keys()))

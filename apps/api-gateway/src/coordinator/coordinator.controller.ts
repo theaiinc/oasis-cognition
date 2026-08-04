@@ -45,13 +45,13 @@ export class CoordinatorController {
 
   @Post('jobs')
   async createJob(
-    @Body() body: { plan: PlannerPlan; parent_session_id: string; interaction_id: string; auto_approve_free?: boolean },
+    @Body() body: { plan: PlannerPlan; parent_session_id: string; interaction_id: string; project_id?: string; auto_approve_free?: boolean },
   ) {
     if (!body.plan || !body.parent_session_id) {
       throw new HttpException('plan and parent_session_id are required', HttpStatus.BAD_REQUEST);
     }
     const autoApprove = body.auto_approve_free !== false; // default true
-    const result = await this.service.createJob(body.plan, body.parent_session_id, body.interaction_id || '', autoApprove);
+    const result = await this.service.createJob(body.plan, body.parent_session_id, body.interaction_id || '', autoApprove, body.project_id);
     return {
       ok: true,
       job_id: result.job.job_id,
@@ -68,8 +68,8 @@ export class CoordinatorController {
   }
 
   @Get('jobs')
-  async listJobs(@Query('parent_session_id') parentSessionId?: string) {
-    return this.service.listJobs(parentSessionId);
+  async listJobs(@Query('parent_session_id') parentSessionId?: string, @Query('project_id') projectId?: string) {
+    return this.service.listJobs(parentSessionId, projectId);
   }
 
   @Get('jobs/:id')

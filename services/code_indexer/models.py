@@ -145,6 +145,17 @@ class IndexRequest(BaseModel):
     force: bool = False  # reindex even if hash matches
 
 
+class IndexProjectRequest(BaseModel):
+    """Request to index a specific project's workspace, scoped by project_id.
+
+    Independent of the active workspace — does not touch or switch it.
+    """
+
+    project_id: str
+    workspace_path: str
+    force: bool = True
+
+
 class IndexResponse(BaseModel):
     """Response from indexing operation."""
 

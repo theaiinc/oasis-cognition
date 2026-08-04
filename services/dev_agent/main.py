@@ -26,7 +26,11 @@ from pydantic import BaseModel
 
 from services.dev_agent.chrome_bridge import chrome_bridge
 
-from services.dev_agent.service import DevAgentService, set_project_root as _svc_set_project_root
+from services.dev_agent.service import (
+    DevAgentService,
+    set_project_root as _svc_set_project_root,
+    set_request_project_root as _svc_set_request_project_root,
+)
 from services.dev_agent.tunnel import TunnelManager
 
 logger = logging.getLogger(__name__)
@@ -97,6 +101,10 @@ class RestoreSnapshotRequest(BaseModel):
 
 class ToolRequest(BaseModel):
     tool: str  # "create_worktree", "write_file", "edit_file", "apply_patch", "read_worktree_file", "get_diff", "bash", "computer_action"
+    project_id: str | None = None
+    session_id: str | None = None
+    interaction_id: str | None = None
+    project_path: str | None = None
     worktree_id: str | None = None
     name: str | None = None
     path: str | None = None
@@ -825,6 +833,7 @@ async def cu_diag_find_and_click(query: str = "", dry_run: bool = True):
 @app.post("/internal/dev-agent/execute")
 async def execute_tool(req: ToolRequest) -> dict[str, Any]:
     """Execute a dev-agent tool call. Called by the API gateway."""
+    _svc_set_request_project_root(req.project_path)
 
     if req.tool == "create_worktree":
         result = await dev_agent.create_worktree(name=req.name)
@@ -1235,8 +1244,16 @@ async def activate_project(req: ActivateProjectRequest):
 
 @app.get("/internal/dev-agent/project/settings/{project_id}")
 async def get_project_settings(project_id: str):
-    """Return per-project settings."""
+    """Return per-project settings without exposing credential values."""
     result = dev_agent.load_project_settings(project_id)
+    settings = result.get("settings")
+    if isinstance(settings, dict):
+        safe = dict(settings)
+        for key in ("openai_api_key", "anthropic_api_key"):
+            if safe.get(key):
+                safe[key] = ""
+                safe[f"{key}_configured"] = True
+        result["settings"] = safe
     return result
 
 
@@ -1275,10 +1292,15 @@ async def get_active_project():
     """Return the active project ID and its settings."""
     result = dev_agent.get_active_project_settings()
     resolved = _resolve_active_project_path() or PROJECT_ROOT
+    safe_settings = dict(result.get("settings") or {})
+    for key in ("openai_api_key", "anthropic_api_key"):
+        if safe_settings.get(key):
+            safe_settings[key] = ""
+            safe_settings[f"{key}_configured"] = True
     return {
         "success": True,
         "project_id": result.get("project_id"),
-        "settings": result.get("settings", {}),
+        "settings": safe_settings,
         "project_root": resolved,
     }
 

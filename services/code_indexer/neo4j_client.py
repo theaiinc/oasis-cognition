@@ -47,9 +47,26 @@ class CodeGraphClient:
     def close(self) -> None:
         self._driver.close()
 
+    @staticmethod
+    def _scope_clause(alias: str, project_id: str | None) -> tuple[str, dict[str, Any]]:
+        """WHERE fragment scoping a node alias to a project_id (or the legacy/untagged set)."""
+        if project_id:
+            return f"{alias}.project_id = $scope_project_id", {"scope_project_id": project_id}
+        return f"{alias}.project_id IS NULL", {}
+
+    @staticmethod
+    def scoped_key(value: str, project_id: str | None) -> str:
+        """Namespace a path/id by project_id so multiple projects can't collide.
+
+        Untagged (project_id=None) values are left exactly as before for full
+        backward compatibility with pre-existing data.
+        """
+        return f"{project_id}:{value}" if project_id else value
+
     def get_full_graph(
         self,
         max_symbols: int = 300,
+        project_id: str | None = None,
     ) -> dict:
         """Return all CodeFile + CodeSymbol nodes and their relationships.
 
@@ -61,11 +78,14 @@ class CodeGraphClient:
         nodes: list[dict] = []
         edges: list[dict] = []
         seen_nodes: set[str] = set()
+        scope, scope_params = self._scope_clause("f", project_id)
+        sym_scope, sym_scope_params = self._scope_clause("s", project_id)
 
         with self._driver.session() as session:
             # ── Files ──────────────────────────────────────────────────────
             file_result = session.run(
-                "MATCH (f:CodeFile) RETURN f.path AS path, f.name AS name ORDER BY f.path"
+                f"MATCH (f:CodeFile) WHERE {scope} RETURN f.path AS path, f.name AS name ORDER BY f.path",
+                **scope_params,
             )
             file_paths: list[str] = []
             for rec in file_result:
@@ -83,14 +103,16 @@ class CodeGraphClient:
 
             # ── Symbols (capped) ───────────────────────────────────────────
             sym_result = session.run(
-                """
+                f"""
                 MATCH (s:CodeSymbol)
+                WHERE {sym_scope}
                 RETURN s.id AS id, s.name AS name, s.type AS type,
                        s.file_path AS file_path, s.line_start AS line
                 ORDER BY s.file_path, s.line_start
                 LIMIT $limit
                 """,
                 limit=max_symbols,
+                **sym_scope_params,
             )
             symbol_count = 0
             for rec in sym_result:
@@ -167,8 +189,13 @@ class CodeGraphClient:
             "stats": {"files": file_count, "symbols": symbol_count},
         }
 
-    def store_file(self, file: File) -> None:
-        """Store or update a file node."""
+    def store_file(self, file: File, project_id: str | None = None) -> None:
+        """Store or update a file node.
+
+        `file.path` must already be namespaced by the caller (via `scoped_key`)
+        when `project_id` is set, so it can't collide with another project's
+        file at the same relative path.
+        """
         with self._driver.session() as session:
             session.run(
                 """
@@ -179,7 +206,8 @@ class CodeGraphClient:
                     f.last_indexed = $last_indexed,
                     f.line_count = $line_count,
                     f.is_test = $is_test,
-                    f.is_entry_point = $is_entry_point
+                    f.is_entry_point = $is_entry_point,
+                    f.project_id = $project_id
                 """,
                 path=file.path,
                 name=file.name,
@@ -189,10 +217,15 @@ class CodeGraphClient:
                 line_count=file.line_count,
                 is_test=file.is_test,
                 is_entry_point=file.is_entry_point,
+                project_id=project_id,
             )
 
-    def store_symbol(self, symbol: Symbol) -> None:
-        """Store or update a symbol node."""
+    def store_symbol(self, symbol: Symbol, project_id: str | None = None) -> None:
+        """Store or update a symbol node.
+
+        `symbol.id` and `symbol.file_path` must already be namespaced by the
+        caller when `project_id` is set (same rationale as `store_file`).
+        """
         with self._driver.session() as session:
             session.run(
                 """
@@ -208,7 +241,8 @@ class CodeGraphClient:
                     s.column_end = $column_end,
                     s.is_exported = $is_exported,
                     s.is_default_export = $is_default_export,
-                    s.visibility = $visibility
+                    s.visibility = $visibility,
+                    s.project_id = $project_id
                 WITH s
                 MATCH (f:CodeFile {path: $file_path})
                 MERGE (f)-[:CONTAINS {order: $line_start}]->(s)
@@ -226,6 +260,7 @@ class CodeGraphClient:
                 is_default_export=symbol.is_default_export,
                 visibility=symbol.visibility.value,
                 file_path=symbol.file_path,
+                project_id=project_id,
             )
 
     def store_import(self, file_path: str, import_info: ImportInfo) -> None:
@@ -251,17 +286,20 @@ class CodeGraphClient:
                 line=import_info.line,
             )
 
-    def search_symbols(self, query: str, symbol_type: str | None = None, limit: int = 10) -> SymbolSearchResult:
+    def search_symbols(
+        self, query: str, symbol_type: str | None = None, limit: int = 10, project_id: str | None = None
+    ) -> SymbolSearchResult:
         """Search symbols by name."""
         with self._driver.session() as session:
             type_filter = " AND s.type = $type" if symbol_type else ""
-            params: dict[str, Any] = {"query": query, "limit": limit}
+            scope, scope_params = self._scope_clause("s", project_id)
+            params: dict[str, Any] = {"search_query": query, "limit": limit, **scope_params}
             if symbol_type:
                 params["type"] = symbol_type
             result = session.run(
                 f"""
                 MATCH (s:CodeSymbol)
-                WHERE (s.name CONTAINS $query OR coalesce(s.file_path, '') CONTAINS $query){type_filter}
+                WHERE (s.name CONTAINS $search_query OR coalesce(s.file_path, '') CONTAINS $search_query){type_filter} AND {scope}
                 RETURN s
                 ORDER BY s.name
                 LIMIT $limit
@@ -415,17 +453,24 @@ class CodeGraphClient:
             parent_node.children.append(child_node)
             self._build_component_tree(session, child.id, child_node, depth + 1, max_depth)
 
-    def get_index_status(self) -> IndexStatus:
+    def get_index_status(self, project_id: str | None = None) -> IndexStatus:
         """Get indexing status."""
         with self._driver.session() as session:
-            file_result = session.run("MATCH (f:CodeFile) RETURN count(f) as count")
+            file_scope, file_scope_params = self._scope_clause("f", project_id)
+            sym_scope, sym_scope_params = self._scope_clause("s", project_id)
+
+            file_result = session.run(
+                f"MATCH (f:CodeFile) WHERE {file_scope} RETURN count(f) as count", **file_scope_params
+            )
             file_count = file_result.single()["count"]
 
-            symbol_result = session.run("MATCH (s:CodeSymbol) RETURN count(s) as count")
+            symbol_result = session.run(
+                f"MATCH (s:CodeSymbol) WHERE {sym_scope} RETURN count(s) as count", **sym_scope_params
+            )
             symbol_count = symbol_result.single()["count"]
 
             last_index_result = session.run(
-                "MATCH (f:CodeFile) RETURN max(f.last_indexed) as last"
+                f"MATCH (f:CodeFile) WHERE {file_scope} RETURN max(f.last_indexed) as last", **file_scope_params
             )
             last_record = last_index_result.single()
             last_indexed = None

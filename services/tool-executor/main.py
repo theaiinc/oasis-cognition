@@ -27,7 +27,7 @@ _active_workspace: str = os.environ.get("OASIS_WORKSPACE_PATH", "/workspace")
 _HOST_HOME_MOUNT = "/host-home"
 
 
-def _translate_path(path: str | None) -> str | None:
+def _translate_path(path: str | None, workspace: str | None = None) -> str | None:
     """Translate host-absolute paths to Docker-visible paths.
 
     The docker-compose volume mounts ${HOME}:/host-home:ro, so
@@ -38,11 +38,12 @@ def _translate_path(path: str | None) -> str | None:
         return path
     # Rewrite /workspace → active workspace (the LLM often uses /workspace
     # as a default, but the active project may be mounted elsewhere).
-    if _active_workspace != "/workspace":
+    effective_workspace = workspace or _active_workspace
+    if effective_workspace != "/workspace":
         if path == "/workspace" or path == "/workspace/":
-            return _active_workspace
+            return effective_workspace
         if path.startswith("/workspace/"):
-            return _active_workspace + path[len("/workspace"):]
+            return effective_workspace + path[len("/workspace"):]
     # Rewrite relative "." to active workspace
     if path in (".", "./"):
         return _active_workspace
@@ -68,6 +69,10 @@ def _translate_path(path: str | None) -> str | None:
 
 class ExecuteRequest(BaseModel):
     tool: str  # "bash", "read_file", "list_dir", "grep", "browse_url", "find_files"
+    project_id: str | None = None
+    session_id: str | None = None
+    interaction_id: str | None = None
+    project_path: str | None = None
     command: str | None = None  # for bash
     path: str | None = None  # for read_file / list_dir / grep / find_files
     pattern: str | None = None  # for grep / find_files
@@ -114,12 +119,13 @@ async def switch_workspace(body: dict[str, Any]) -> dict[str, Any]:
 @app.post("/internal/tool/execute")
 async def execute_tool(req: ExecuteRequest) -> dict[str, Any]:
     """Execute a tool call. Returns structured result."""
+    request_workspace = _translate_path(req.project_path) if req.project_path else _active_workspace
     # Translate host-absolute paths to Docker-visible paths
-    req.path = _translate_path(req.path)
-    req.working_dir = _translate_path(req.working_dir)
+    req.path = _translate_path(req.path, request_workspace)
+    req.working_dir = _translate_path(req.working_dir, request_workspace)
     # Default working_dir to active workspace
     if not req.working_dir and req.tool == "bash":
-        req.working_dir = _active_workspace
+        req.working_dir = request_workspace
 
     if req.tool == "bash":
         if not req.command:
@@ -155,7 +161,7 @@ async def execute_tool(req: ExecuteRequest) -> dict[str, Any]:
         return out
 
     elif req.tool == "list_dir":
-        effective_path = req.path or _active_workspace
+        effective_path = req.path or request_workspace
         result = await executor.list_directory(effective_path, recursive=req.recursive)
         if result["success"]:
             return {"success": True, "output": "\n".join(result["entries"]), "blocked": False, "reason": ""}
@@ -164,7 +170,7 @@ async def execute_tool(req: ExecuteRequest) -> dict[str, Any]:
     elif req.tool == "find_files":
         if not req.pattern:
             return {"success": False, "output": "No pattern provided", "blocked": False, "reason": ""}
-        result = await executor.find_files(req.pattern, path=req.path or _active_workspace, file_type=req.file_type)
+        result = await executor.find_files(req.pattern, path=req.path or request_workspace, file_type=req.file_type)
         if result["success"]:
             return {"success": True, "output": result["output"], "blocked": False, "reason": ""}
         return {"success": False, "output": result.get("error", ""), "blocked": result.get("blocked", False), "reason": result.get("error", "")}
@@ -172,7 +178,7 @@ async def execute_tool(req: ExecuteRequest) -> dict[str, Any]:
     elif req.tool == "grep":
         if not req.pattern:
             return {"success": False, "output": "No pattern provided", "blocked": False, "reason": ""}
-        result = await executor.grep(req.pattern, path=req.path or _active_workspace)
+        result = await executor.grep(req.pattern, path=req.path or request_workspace)
         if result["success"]:
             return {"success": True, "output": result["output"], "blocked": False, "reason": ""}
         return {"success": False, "output": result.get("error", result["output"]), "blocked": result.get("blocked", False), "reason": result.get("error", "")}

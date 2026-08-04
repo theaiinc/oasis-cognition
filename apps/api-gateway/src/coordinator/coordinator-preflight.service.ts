@@ -43,6 +43,7 @@ export class CoordinatorPreflightService {
     parentSessionId: string,
     interactionId: string,
     autoApproveFree: boolean,
+    projectId?: string,
   ): Promise<PreflightResult> {
     const host = await this.hostCapacity.getCapacity();
     const admission = await this.yggdrasil.getAdmissionState();
@@ -115,6 +116,7 @@ export class CoordinatorPreflightService {
     // ── Build the job record (not persisted yet) ────────────────────
     const job: CoordinatorJob = {
       job_id: uuidv4(),
+      project_id: projectId,
       parent_session_id: parentSessionId,
       interaction_id: interactionId,
       plan,

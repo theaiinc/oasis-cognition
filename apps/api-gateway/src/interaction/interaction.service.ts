@@ -2,7 +2,6 @@ import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 import { RedisEventService } from '../events/redis-event.service';
-import { LangfuseService } from '../events/langfuse.service';
 import { SessionConfigService } from '../session/session.service';
 import { SessionWorktreeService } from '../session/session-worktree.service';
 import { SessionUsageService } from '../session/session-usage.service';
@@ -12,6 +11,7 @@ import { NATIVE_COORDINATOR_TOOLS, dispatchNativeCoordinatorTool } from './nativ
 import { AgentProfilesService } from '../agent-profiles/agent-profiles.service';
 import { ProjectRolesService } from '../project-roles/project-roles.service';
 import { lookupVariant } from '../models/model-variants';
+import { ProjectContextService } from '../context/project-context.service';
 
 export interface InteractionRequest {
   user_message: string;
@@ -58,11 +58,26 @@ const OBSERVER_URL = process.env.OBSERVER_URL || 'http://localhost:8009';
 const ARTIFACT_URL = process.env.ARTIFACT_SERVICE_URL || 'http://artifact-service:8012';
 
 const MAX_TOOL_ITERATIONS = parseInt(process.env.MAX_TOOL_ITERATIONS || '50', 10);
-/** When true, Langfuse tool-plan spans include truncated full request + model output (PII/size risk). */
+/** When true, debug metadata includes truncated request/model output. */
 const OASIS_DEBUG_TOOL_PLAN_PAYLOAD =
   process.env.OASIS_DEBUG_TOOL_PLAN_PAYLOAD === 'true' || process.env.OASIS_DEBUG_TOOL_PLAN_PAYLOAD === '1';
 const OASIS_DEBUG_TOOL_PLAN_MAX_CHARS = parseInt(process.env.OASIS_DEBUG_TOOL_PLAN_MAX_CHARS || '16000', 10);
 const KEEP_RECENT_MESSAGES = 12;
+
+// Tracing is intentionally handled by the external model service. Keep the
+// Preserve the existing instrumentation call sites as a local no-op; model
+// service telemetry is owned by the external inference service.
+interface TraceSink {
+  span(params?: unknown): TraceSink;
+  end(params?: unknown): void;
+  update(params?: unknown): void;
+}
+
+const NOOP_TRACE: TraceSink = {
+  span: (_params?: unknown) => NOOP_TRACE,
+  end: (_params?: unknown) => {},
+  update: (_params?: unknown) => {},
+};
 
 /** Rough token estimate: ~4 chars per token for English. */
 function estimateTokens(text: string): number {
@@ -1130,6 +1145,7 @@ function extractCodeSearchQueries(userMessage: string, semanticStructure: any): 
 async function fetchCodeKnowledgeSummaryBlock(
   userMessage: string,
   semanticStructure: any,
+  projectId?: string,
 ): Promise<string> {
   if (!CODE_KNOWLEDGE_IN_TOOL_PLAN) return '';
   const queries = extractCodeSearchQueries(userMessage, semanticStructure);
@@ -1144,7 +1160,7 @@ async function fetchCodeKnowledgeSummaryBlock(
   const results = await Promise.all(
     slices.map(async (q) => {
       try {
-        const params: Record<string, any> = { q, limit: 8 };
+        const params: Record<string, any> = { q, limit: 8, project_id: projectId };
         if (pathPrefixParam) params.path_prefix = pathPrefixParam;
 
         const res = await axiosWithRetry<{ symbols?: any[] }>(
@@ -1156,12 +1172,13 @@ async function fetchCodeKnowledgeSummaryBlock(
         );
         const syms = res.data?.symbols;
 
-        // If scoped search returned nothing, try unscoped as fallback
+        // If scoped search returned nothing, try unscoped-by-path-prefix (still
+        // project-scoped) as fallback
         if ((!syms || syms.length === 0) && pathPrefixParam) {
           const fallbackRes = await axiosWithRetry<{ symbols?: any[] }>(
             'get',
             `${MEMORY_URL}/internal/memory/code/symbols`,
-            { params: { q, limit: 8 } },
+            { params: { q, limit: 8, project_id: projectId } },
             undefined,
             { timeout: CODE_KNOWLEDGE_TIMEOUT_MS, retries: 0 },
           );
@@ -1292,12 +1309,12 @@ export class InteractionService {
 
   constructor(
     private readonly events: RedisEventService,
-    private readonly langfuse: LangfuseService,
     private readonly sessionConfig: SessionConfigService,
     private readonly sessionWorktree: SessionWorktreeService,
     private readonly sessionUsage: SessionUsageService,
     private readonly agentProfiles: AgentProfilesService,
     private readonly projectRoles: ProjectRolesService,
+    private readonly projectContext: ProjectContextService,
   ) {}
 
   /** Resolve role/profile hints into context overrides. Returns the fields to
@@ -1334,7 +1351,8 @@ export class InteractionService {
       if (preamble) hints.system_preamble = preamble;
       if (profile.config?.model) hints.model_override = profile.config.model;
       if (profile.config?.provider) hints.provider_override = profile.config.provider;
-      // Propagate ids so response-generator logs / langfuse can attribute them.
+      hints._profile_config = profile.config;
+      // Propagate ids so response-generator logs can attribute them.
       hints._role_id = roleId || undefined;
       hints._profile_id = profile.profile_id;
       return hints;
@@ -1373,6 +1391,30 @@ export class InteractionService {
 
   async execute(req: InteractionRequest, isAborted: () => boolean = () => false): Promise<InteractionResponse> {
     const sessionId = req.session_id || uuidv4();
+    const projectId = typeof req.context?.project_id === 'string' && req.context.project_id.trim()
+      ? req.context.project_id.trim()
+      : undefined;
+    let projectPath: string | undefined;
+    if (projectId) {
+      try {
+        const projectRes = await axios.get(`${MEMORY_URL}/internal/memory/projects/${projectId}`, { timeout: 5000 });
+        projectPath = typeof projectRes.data?.project_path === 'string' ? projectRes.data.project_path : undefined;
+      } catch (err: any) {
+        this.logger.warn(`Could not resolve project path for ${projectId}: ${err?.message || err}`);
+      }
+      req.context = { ...(req.context || {}), ...(projectPath ? { project_path: projectPath } : {}) };
+    }
+    return this.projectContext.run(
+      { project_id: projectId, project_path: projectPath, session_id: sessionId },
+      () => this.executeWithContext(req, sessionId, isAborted),
+    );
+  }
+
+  private async executeWithContext(
+    req: InteractionRequest,
+    sessionId: string,
+    isAborted: () => boolean,
+  ): Promise<InteractionResponse> {
     const interactionId = uuidv4();
     const clientMessageId = req.context?.client_message_id;
 
@@ -1434,12 +1476,7 @@ export class InteractionService {
       this.logger.log(`LLM context: ${chatHistory.length} prior chat turn(s) for session ${sessionId}`);
     }
 
-    const trace = this.langfuse.createTrace({
-      name: 'oasis-reasoning-pipeline',
-      sessionId,
-      input: { user_message: req.user_message, context: req.context },
-      metadata: { source: req.context?.source || 'api' },
-    });
+    const trace = NOOP_TRACE;
 
     try {
       await this.events.publish('InteractionReceived', sessionId, {
@@ -1804,6 +1841,19 @@ export class InteractionService {
       client_message_id: clientMessageId,
     });
 
+    // 4b. Project-scoped code knowledge (same source the tool-planning loop uses),
+    // so direct conversational questions about a project's code get real context too.
+    let codeKnowledgeBlock = '';
+    try {
+      codeKnowledgeBlock = await fetchCodeKnowledgeSummaryBlock(
+        req.user_message,
+        semanticStructure,
+        this.projectContext.get()?.project_id ?? req.context?.project_id,
+      );
+    } catch {
+      // best-effort only
+    }
+
     // 5. Generate natural language response (tolerate LLM / response-generator failures)
     let responseText = '';
     try {
@@ -1821,6 +1871,7 @@ export class InteractionService {
         memory_stale_hint: memoryStaleHint,
         artifact_search_results: artifactSearchResults.length > 0 ? artifactSearchResults : undefined,
         artifact_context: artifactContext || undefined,
+        code_knowledge: codeKnowledgeBlock || undefined,
       };
       responseText = await this.generateStreamingResponse(
         sessionId,
@@ -2330,7 +2381,11 @@ export class InteractionService {
     let codeKnowledgeBlock = '';
     if (CODE_KNOWLEDGE_IN_TOOL_PLAN) {
       try {
-        codeKnowledgeBlock = await fetchCodeKnowledgeSummaryBlock(req.user_message, semanticStructure);
+        codeKnowledgeBlock = await fetchCodeKnowledgeSummaryBlock(
+          req.user_message,
+          semanticStructure,
+          this.projectContext.get()?.project_id,
+        );
         if (codeKnowledgeBlock) {
           const n = codeKnowledgeBlock.split('\n').filter((l) => l.trim().startsWith('-')).length;
           this.logger.log(`Code knowledge block attached to tool-plan context (${n} symbols)`);
@@ -3670,6 +3725,7 @@ export class InteractionService {
           }
           const res = await dispatchNativeMissionTool({
             tool: toolName,
+            project_id: req.context?.project_id,
             mission_id: resolvedMissionId,
             goal: (plan as any).goal,
             prompt: (plan as any).prompt,
@@ -3704,6 +3760,7 @@ export class InteractionService {
               parallel_groups: (plan as any).parallel_groups,
               tasks: (plan as any).tasks,
               parent_session_id: sessionId,
+              project_id: req.context?.project_id,
               auto_approve_free: (plan as any).auto_approve_free !== false,
               ...(plan as any),
             }, sessionId);
@@ -3997,7 +4054,13 @@ export class InteractionService {
             ? `${DEV_AGENT_URL}/internal/dev-agent/execute`
             : `${TOOL_EXECUTOR_URL}/internal/tool/execute`;
 
-          const execPayload: Record<string, any> = { tool: toolName };
+          const execPayload: Record<string, any> = {
+            tool: toolName,
+            project_id: req.context?.project_id || undefined,
+            project_path: req.context?.project_path || undefined,
+            session_id: sessionId,
+            interaction_id: interactionId,
+          };
 
           // AUTO-ROUTE: If agent uses read_file but we have a worktree, route to read_worktree_file
           // This prevents the confusion of having to switch tools manually
@@ -5049,7 +5112,7 @@ export class InteractionService {
     }
   }
 
-  /** Serialize for Langfuse / debug; truncates to avoid huge observations. */
+  /** Serialize debug metadata, truncating large observations. */
   private truncateJsonForDebug(value: unknown, maxChars: number): string {
     try {
       const s = JSON.stringify(value);
@@ -5164,8 +5227,8 @@ export class InteractionService {
             }
             try {
               toolPlanObs.end({ output });
-            } catch (lfErr: any) {
-              this.logger.warn(`Langfuse tool-plan span end failed: ${lfErr?.message ?? lfErr}`);
+            } catch (traceErr: any) {
+              this.logger.warn(`Tool-plan instrumentation failed: ${traceErr?.message ?? traceErr}`);
             }
           };
 
@@ -5279,7 +5342,7 @@ export class InteractionService {
               })
               ?.end({ output: { error: err.message, raw_len: fullJsonText.length } });
           } catch {
-            // ignore Langfuse errors
+            // ignore instrumentation errors
           }
           resolve({ action: 'final_answer', answer: `Planning interrupted: ${err.message}` });
         });
@@ -5294,7 +5357,7 @@ export class InteractionService {
           })
           ?.end({ output: { error: err.message } });
       } catch {
-        // ignore Langfuse errors
+        // ignore instrumentation errors
       }
       return { action: 'final_answer', answer: `Call failed: ${err.message}` };
     }

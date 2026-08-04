@@ -41,8 +41,8 @@ export class WorkflowsController {
   }
 
   @Get()
-  async list() {
-    return this.workflows.listWorkflows();
+  async list(@Query('project_id') projectId?: string) {
+    return this.workflows.listWorkflows(projectId?.trim() || undefined);
   }
 
   @Get(':id')

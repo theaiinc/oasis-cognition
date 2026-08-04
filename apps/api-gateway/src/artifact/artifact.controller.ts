@@ -256,12 +256,17 @@ export class ProjectsController {
   private readonly logger = new Logger(ProjectsController.name);
 
   @Post()
-  async create(@Body() body: { name: string; description?: string }) {
+  async create(@Body() body: { name: string; description?: string; project_path?: string }) {
     const name = typeof body.name === 'string' ? body.name.trim() : '';
     if (!name) throw new HttpException('name is required', HttpStatus.BAD_REQUEST);
     try {
       const description = typeof body.description === 'string' ? body.description.trim() : '';
-      const payload = description ? { name, description } : { name };
+      const project_path = typeof body.project_path === 'string' ? body.project_path.trim() : '';
+      const payload = {
+        name,
+        ...(description ? { description } : {}),
+        ...(project_path ? { project_path } : {}),
+      };
       const res = await axios.post(`${MEMORY_URL}/internal/memory/projects`, payload);
       return res.data;
     } catch (err: any) {

@@ -1,10 +1,11 @@
 import {
   Menu, Wifi, WifiOff, Mic, MicOff, ScreenShare, ScreenShareOff,
-  Fingerprint, FolderOpen, Zap, Scale, Sparkles, Loader2,
+  Fingerprint, FolderOpen, Zap, Scale, Sparkles, Loader2, Bell, X,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
+import { useState, useRef, useEffect } from 'react';
 import type { ProjectConfig } from '@/lib/types';
 import { TokenUsageDonut } from './TokenUsageDonut';
 import type { ContextBudget } from '@/lib/types';
@@ -32,6 +33,7 @@ interface ChatHeaderProps {
   onConnect: () => void;
   onVoiceIdClick: () => void;
   onOpenSettings: () => void;
+  onOpenProjects: () => void;
   activeProjectName?: string;
   /** Number of project rules currently in scope (Logic engine memory rules). */
   ruleCount?: number;
@@ -51,6 +53,10 @@ interface ChatHeaderProps {
   sessionBudgetPct?: number;
   /** Open the Settings panel where the cap can be raised. */
   onOpenBudget?: () => void;
+  /** Recent agent completion notifications (newest first). */
+  notifications?: string[];
+  /** Remove a notification at the given index. */
+  onDismissNotification?: (idx: number) => void;
 }
 
 export function ChatHeader({
@@ -71,6 +77,7 @@ export function ChatHeader({
   onConnect,
   onVoiceIdClick,
   onOpenSettings,
+  onOpenProjects,
   activeProjectName,
   ruleCount,
   onOpenRules,
@@ -81,6 +88,8 @@ export function ChatHeader({
   sessionBudget,
   sessionBudgetPct,
   onOpenBudget,
+  notifications,
+  onDismissNotification,
 }: ChatHeaderProps) {
   // Vision button reflects native screen sharing (ComputerUsePanel) OR voice sharing
   const visionActive = cuScreenSharing || isSharing;
@@ -111,7 +120,7 @@ export function ChatHeader({
         {projectConfig.configured && (
           <div className="flex items-center gap-2">
             <button
-              onClick={onOpenSettings}
+              onClick={onOpenProjects}
               className="flex items-center gap-1.5 px-2.5 py-1 rounded-lg bg-slate-800/50 border border-slate-700/40 hover:border-slate-600 transition-colors group"
             >
               <FolderOpen className="w-3 h-3 text-slate-500 group-hover:text-blue-400" />
@@ -169,6 +178,14 @@ export function ChatHeader({
       </div>
 
       <div className="flex items-center gap-3">
+        {/* ── Notification bell with dropdown ── */}
+        {notifications && notifications.length > 0 && (
+          <NotificationDropdown
+            notifications={notifications}
+            onDismiss={onDismissNotification!}
+          />
+        )}
+
         <Button
           variant={micEnabled ? "default" : "secondary"}
           size="sm"
@@ -221,5 +238,88 @@ export function ChatHeader({
         </Button>
       </div>
     </header>
+  );
+}
+
+// ── NotificationDropdown: click-to-open popover with individual dismiss ─────
+
+interface NotificationDropdownProps {
+  notifications: string[];
+  onDismiss: (idx: number) => void;
+}
+
+function NotificationDropdown({ notifications, onDismiss }: NotificationDropdownProps) {
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Close on click outside
+  useEffect(() => {
+    if (!open) return;
+    const handleClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) {
+        setOpen(false);
+      }
+    };
+    // Delay adding the listener so the toggle click doesn't immediately close it
+    const timer = setTimeout(() => document.addEventListener('click', handleClick), 0);
+    return () => {
+      clearTimeout(timer);
+      document.removeEventListener('click', handleClick);
+    };
+  }, [open]);
+
+  return (
+    <div className="relative" ref={ref}>
+      <Button
+        variant="ghost"
+        size="icon"
+        onClick={() => setOpen(v => !v)}
+        className="text-yellow-400 hover:text-yellow-300 relative"
+        title={`${notifications.length} notification${notifications.length === 1 ? '' : 's'} — click to view`}
+      >
+        <Bell className="w-4 h-4" />
+        <span className="absolute -top-1 -right-1 flex items-center justify-center w-4 h-4 text-[9px] font-bold bg-yellow-500 text-black rounded-full">
+          {notifications.length}
+        </span>
+      </Button>
+
+      {open && (
+        <div className="absolute right-0 top-full mt-2 w-80 max-h-80 overflow-y-auto rounded-lg border border-slate-700/60 bg-slate-900 shadow-xl shadow-black/40 z-50">
+          <div className="flex items-center justify-between px-3 py-2 border-b border-slate-700/40">
+            <span className="text-xs font-semibold text-slate-300 uppercase tracking-wider">
+              Notifications
+            </span>
+            <button
+              onClick={() => {
+                // Dismiss all
+                for (let i = notifications.length - 1; i >= 0; i--) onDismiss(i);
+                setOpen(false);
+              }}
+              className="text-[10px] text-slate-500 hover:text-slate-300 transition-colors"
+            >
+              Dismiss all
+            </button>
+          </div>
+          {notifications.map((n, i) => (
+            <div
+              key={`${n}-${i}`}
+              className="group flex items-start gap-2 px-3 py-2.5 hover:bg-slate-800/60 transition-colors border-b border-slate-800/40 last:border-b-0"
+            >
+              <span className="mt-0.5 flex-shrink-0 w-1.5 h-1.5 rounded-full bg-yellow-400/60" />
+              <span className="flex-1 text-xs text-slate-300 leading-relaxed min-w-0 break-words">
+                {n}
+              </span>
+              <button
+                onClick={(e) => { e.stopPropagation(); onDismiss(i); }}
+                className="flex-shrink-0 opacity-0 group-hover:opacity-100 transition-opacity text-slate-500 hover:text-white"
+                title="Dismiss"
+              >
+                <X className="w-3 h-3" />
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+    </div>
   );
 }

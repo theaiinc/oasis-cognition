@@ -54,6 +54,7 @@ const RESPONSE_URL = process.env.RESPONSE_URL || 'http://localhost:8005';
 const TEACHING_URL = process.env.TEACHING_URL || 'http://localhost:8006';
 const TOOL_EXECUTOR_URL = process.env.TOOL_EXECUTOR_URL || 'http://localhost:8007';
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
+const MCP_SERVER_URL = process.env.OASIS_MCP_URL || 'http://mcp-server:8020';
 const OBSERVER_URL = process.env.OBSERVER_URL || 'http://localhost:8009';
 const ARTIFACT_URL = process.env.ARTIFACT_SERVICE_URL || 'http://artifact-service:8012';
 
@@ -95,6 +96,82 @@ function resolveContextWindow(provider?: string | null, model?: string | null): 
   return parseInt(process.env.OASIS_CONTEXT_WINDOW || '8192', 10);
 }
 
+/**
+ * Resolve the thought-layer timeout based on model parameter size.
+ * Small models (≤4B) are very slow and need more time to reason.
+ * Mid-size models (8-12B) can also be slow on cold starts or remote hosts.
+ * Large models (12B+) are usually fast but remote latency can vary.
+ * Falls back to FAST_TIMEOUT_MS (30s).
+ *
+ * Override with OASIS_THOUGHT_TIMEOUT_MS env var to bypass heuristics.
+ */
+function resolveThoughtTimeout(provider?: string | null, model?: string | null): number {
+  // Allow env var override for tuning without code changes
+  const envOverride = process.env.OASIS_THOUGHT_TIMEOUT_MS;
+  if (envOverride) {
+    const parsed = parseInt(envOverride, 10);
+    if (!isNaN(parsed) && parsed > 0) return parsed;
+  }
+  const variant = lookupVariant(provider, model);
+  if (!variant) return FAST_TIMEOUT_MS;
+  const size = variant.parameter_size_b;
+  // 0 = unknown/proprietary → use default
+  if (size <= 0) return FAST_TIMEOUT_MS;
+  if (size <= 4) return 300_000;   // ≤4B models: 5min (cold boot, remote LM Studio)
+  if (size <= 12) return 300_000;  // 8-12B models: 5min (slow structured output)
+  return 120_000;                   // >12B: 2min (fast but remote latency still real)
+}
+
+/**
+ * Resolve which tool capabilities a model has based on parameter size.
+ *
+ * Tiering:
+ *   ≤3B  → UTILITY: core only (search, read, edit, bash). NO delegation, NO get_rule, NO missions, NO workflows.
+ *   ≤6B  → OPERATIONAL: core + delegation + get_rule. NO workflow_create/delete, NO computer_action.
+ *   >6B  → COGNITIVE: full (everything).
+ *   0 (unknown/proprietary) → full (safest default).
+ */
+function resolveModelCapabilities(provider?: string | null, model?: string | null): {
+  canGetRule: boolean;
+  canDelegate: boolean;
+  tier: 'utility' | 'operational' | 'cognitive';
+  maxOutputTokens: number;
+} {
+  const variant = lookupVariant(provider, model);
+  if (!variant) return { canGetRule: true, canDelegate: true, tier: 'cognitive', maxOutputTokens: 4096 };
+  const size = variant.parameter_size_b;
+  if (size <= 0) return { canGetRule: true, canDelegate: true, tier: 'cognitive', maxOutputTokens: 4096 };
+  if (size <= 3) return { canGetRule: false, canDelegate: false, tier: 'utility', maxOutputTokens: 128 };
+  if (size <= 6) return { canGetRule: true, canDelegate: true, tier: 'operational', maxOutputTokens: 384 };
+  return { canGetRule: true, canDelegate: true, tier: 'cognitive', maxOutputTokens: 1024 };
+}
+
+// ── Execution modes ──────────────────────────────────────────
+// Thinking should be a scarce resource, not the default state.
+//   reactive:    no thinking at all. Act immediately. Default for 2B models (utility tier).
+//   guided:      minimal reasoning budget. Think only when stuck. Default for 4B models (operational).
+//   deliberative: full reasoning before each action. Default for 12B+ models (cognitive).
+//
+// The model can still opt into thinking by calling the `think` tool explicitly.
+type ExecutionMode = 'reactive' | 'guided' | 'deliberative';
+
+function resolveExecutionMode(provider?: string | null, model?: string | null): ExecutionMode {
+  // Environment override — set OASIS_EXECUTION_MODE=reactive|guided|deliberative
+  // to bypass model-size heuristics. Useful for local models where the pipeline
+  // should act immediately rather than spending minutes thinking.
+  const envMode = process.env.OASIS_EXECUTION_MODE as ExecutionMode | undefined;
+  if (envMode && ['reactive', 'guided', 'deliberative'].includes(envMode)) {
+    return envMode;
+  }
+  const variant = lookupVariant(provider, model);
+  if (!variant) return 'deliberative';
+  const size = variant.parameter_size_b;
+  if (size <= 0) return 'deliberative';  // unknown/proprietary → full (safest)
+  if (size <= 3) return 'reactive';      // 2B: act first, think only when explicitly needed
+  if (size <= 6) return 'guided';        // 4B: small reasoning budget
+  return 'deliberative';                  // 12B+: full reasoning
+}
+
 /** Interpreter context: always keep `Conversation summary` system rows plus recent turns. Plain `slice(-6)` can drop the summary when the condensed window grows. */
 function buildInterpreterChatHistory(
   chatHistory: Array<{ role: string; content: string }>,
@@ -134,7 +211,7 @@ async function condenseChatHistoryIfNeeded(
       `${RESPONSE_URL}/internal/response/summarize-history`,
       { messages: toSummarize },
       undefined,
-      { timeout: LLM_TIMEOUT_MS },
+      { timeout: 0 },
     );
     const summary = res.data?.summary || '[Conversation summary]';
     return [
@@ -264,6 +341,10 @@ const GATEWAY_HANDLED_TOOLS = new Set([
   'workflow_add_node', 'workflow_add_edge', 'workflow_remove_node',
   'node_catalog',
   'trigger_create', 'trigger_list', 'trigger_update', 'trigger_delete',
+  // Native coordinator tools (parallel sub-agent delegation) — see native-coordinator-tools.ts.
+  'delegate_tasks', 'delegate_job_status', 'delegate_job_cancel', 'delegate_job_results',
+  // Discovery tools — search MCP tools and skills on demand.
+  'search_mcp', 'search_skills',
 ]);
 
 const TOOL_NAME_ALIASES: Record<string, string> = {
@@ -302,6 +383,26 @@ const TOOL_NAME_ALIASES: Record<string, string> = {
   fetch_artifact: 'read_artifact',
   artifact_content: 'read_artifact',
   view_artifact: 'read_artifact',
+  // Coordinator aliases — parallel sub-agent delegation
+  delegate: 'delegate_tasks',
+  delegate_job: 'delegate_tasks',
+  parallel_tasks: 'delegate_tasks',
+  parallel: 'delegate_tasks',
+  spawn_subagents: 'delegate_tasks',
+  job_status: 'delegate_job_status',
+  task_status: 'delegate_job_status',
+  cancel_job: 'delegate_job_cancel',
+  cancel: 'delegate_job_cancel',
+  get_results: 'delegate_job_results',
+  job_results: 'delegate_job_results',
+  task_results: 'delegate_job_results',
+  // Discovery aliases
+  discover_mcp: 'search_mcp',
+  find_mcp: 'search_mcp',
+  mcp_search: 'search_mcp',
+  discover_skills: 'search_skills',
+  find_skills: 'search_skills',
+  skill_search: 'search_skills',
 };
 
 function isKnownExecutorTool(tool: string): boolean {
@@ -438,6 +539,35 @@ const DEV_AGENT_TOOLS_NEED_WORKTREE = new Set([
 ]);
 
 const EXPLORATION_TOOLS = new Set(['grep', 'find_files', 'list_dir', 'read_file', 'browse_url']);
+
+// ── JIT rule pack auto-injection ──────────────────────────────────
+// Instead of loading all rules up front, we inject rule packs just-in-time
+// based on the model's planned action type or explicit get_rule call.
+const RULE_PACK_NAMES = new Set([
+  'tool_rules', 'delegation_rules', 'memory_rules', 'safety_rules',
+  'recovery_rules', 'final_answer_rules', 'coding_rules', 'planning_rules',
+]);
+
+// Map from action type (tool name) → rule pack(s) to auto-inject
+const ACTION_TO_RULE_PACKS: Record<string, string[]> = {
+  // Tool execution
+  apply_patch:     ['tool_rules', 'coding_rules'],
+  edit_file:       ['tool_rules', 'coding_rules'],
+  write_file:      ['tool_rules', 'coding_rules'],
+  bash:            ['tool_rules', 'safety_rules'],
+  // Delegation
+  delegate_tasks:  ['delegation_rules'],
+  delegate_job_status:  ['delegation_rules'],
+  delegate_job_results: ['delegation_rules'],
+  mission_create:  ['delegation_rules'],
+  workflow_create: ['delegation_rules'],
+  // Safety
+  computer_action: ['safety_rules'],
+  // Recovery (planned tool)
+  get_rule:        [],  // handled specially
+};
+// Also auto-inject recovery_rules + tool_rules if last call failed
+// (done dynamically below).
 
 const EXPLORATION_BROADEN_STAGNATION_MIN = 2;
 const EXPLORATION_IMPLEMENT_STAGNATION_MIN = 3;
@@ -668,7 +798,7 @@ function buildExplorationEscalationGuidance(
   return null;
 }
 
-const EXPLORATION_GUIDANCE_BROADEN = `[EXPLORATION: BROADEN] You are exploring too much. Use the Knowledge Graph symbols you already have. Stop listing directories and START editing. Next action MUST be create_worktree → edit_file/write_file/apply_patch.`;
+const EXPLORATION_GUIDANCE_BROADEN = `[EXPLORATION: BROADEN] You are exploring too much. Use the Knowledge Graph symbols you already have. Stop listing directories and START editing. Next action MUST be create_worktree → edit_file/write_file.`;
 
 const EXPLORATION_GUIDANCE_IMPLEMENT = `[IMPLEMENTATION: STOP EXPLORING NOW] You have enough context. The Knowledge Graph contains the symbols you need. STOP reading files and START implementing: create_worktree (PARAM_NAME: short id), then edit_file or write_file on the target path, then get_diff. NO MORE EXPLORATION.`;
 
@@ -680,7 +810,7 @@ function autonomousExploreWithoutEditMessage(count: number): string {
   return (
     `[FORCE ACTION: STOP EXPLORING] ${count} read-only tools is TOO MANY. You are stalling. ` +
     `The Knowledge Graph already contains the symbols you need. ` +
-    `NEXT ACTION MUST BE: create_worktree → edit_file/write_file/apply_patch. ` +
+    `NEXT ACTION MUST BE: create_worktree → edit_file/write_file. ` +
     `NO MORE grep. NO MORE list_dir. IMPLEMENT NOW.`
   );
 }
@@ -689,7 +819,7 @@ function autonomousWorktreeButNoEditMessage(readsAfterWt: number): string {
   return (
     `[FORCE ACTION: EDIT NOW] Worktree exists but you did ${readsAfterWt} more read(s) instead of editing. ` +
     `STOP EXPLORING. NEXT ACTION MUST BE edit_file or write_file with the worktree_id. ` +
-    `Use apply_patch for multi-line changes. DO NOT read another file.`
+    `For multi-line changes use edit_file with exact old_string. DO NOT read another file.`
   );
 }
 
@@ -753,7 +883,7 @@ function extractToolFromProse(raw: string): string | undefined {
 }
 
 function canonicalizeToolAlias(rawTool: string): { tool?: string; reason?: string } {
-  const allowed = new Set<string>([...DEV_AGENT_TOOLS, ...TOOL_EXECUTOR_TOOLS]);
+  const allowed = new Set<string>([...DEV_AGENT_TOOLS, ...TOOL_EXECUTOR_TOOLS, ...GATEWAY_HANDLED_TOOLS]);
 
   let s = (rawTool ?? '').toString().trim();
   // Strip common quoting artifacts from LLM outputs, e.g. ACTION: "grep"
@@ -946,15 +1076,99 @@ function extractAndParseJson(text: string): any | null {
 }
 
 // Timeout for LLM-backed calls (interpreter, response-generator, teaching)
-const LLM_TIMEOUT_MS = 300_000;
+const LLM_TIMEOUT_MS = 600_000;
 const SESSION_CLEANUP_MS = 600_000;
 // Timeout for fast internal calls (graph-builder, logic-engine, memory)
 const FAST_TIMEOUT_MS = 30_000;
 // Observer chains graph-builder + logic-engine sequentially; must exceed per-hop service timeouts.
-const OBSERVER_VALIDATE_TIMEOUT_MS = Number(process.env.OBSERVER_VALIDATE_TIMEOUT_MS) || 180_000;
+
+// ── Model routing — service defaults + router override ──────────────────
+
+/** Per-service default model tiers (before router override). */
+const SERVICE_DEFAULT_TIERS: Record<string, string> = {
+  echo: '4b',
+  missive: '2b',
+  pathway: '12b',
+  yggdrasil: '2b',
+  ratatoskr: '',  // no LLM
+};
+
+/** Coarse service detection from route + semantic intent. */
+function detectServiceType(route: string, semanticStructure: any): string {
+  const intent = (semanticStructure?.intent || '').toLowerCase();
+  if (route === 'teaching') return 'echo';
+  if (intent.includes('workflow') || intent.includes('pipeline')) return 'pathway';
+  if (intent.includes('memory') || intent.includes('extract') || intent.includes('index')) return 'missive';
+  if (intent.includes('orchestrat') || intent.includes('monitor') || intent.includes('health')) return 'yggdrasil';
+  if (intent.includes('plan') || intent.includes('design') || intent.includes('architect') || intent.includes('code') || intent.includes('implement') || intent.includes('fix')) return 'echo';
+  return 'echo';
+}
+
+/** Resolve the model string for a given tier label (2b/4b/12b). */
+function resolveTierModel(tier: string): string | null {
+  const envKey =
+    tier === '2b' ? 'OASIS_MODEL_2B' :
+    tier === '4b' ? 'OASIS_MODEL_4B' :
+    tier === '12b' ? 'OASIS_MODEL_12B' : null;
+  return envKey ? (process.env[envKey] || null) : null;
+}
+
+/** Resolve effective model after service-default + router-override. */
+function resolveEffectiveModel(
+  curModel: string | null,
+  curProvider: string | null,
+  route: string,
+  semanticStructure: any,
+): { model: string | null; provider: string | null; routing: string } {
+  if (curModel) return { model: curModel, provider: curProvider, routing: 'profile' };
+  const service = detectServiceType(route, semanticStructure);
+  const defaultTier = SERVICE_DEFAULT_TIERS[service] || '4b';
+  if (!defaultTier) return { model: null, provider: null, routing: 'none' };
+  const model = resolveTierModel(defaultTier);
+  if (!model) return { model: curModel, provider: curProvider, routing: `${service}:${defaultTier}(unresolved)` };
+  return { model, provider: curProvider, routing: `${service}:${defaultTier}` };
+}
+
+/** Apply router classification using a code policy (not model prediction from the LLM).
+ *
+ *  The router describes the request; this function decides which model tier to use.
+ *  This way the routing policy can evolve without retraining the router.
+ *
+ *  Policy logic:
+ *    - memory / extraction      → 2b (these domains rarely need more)
+ *    - coding + medium/complex   → 12b (code quality matters)
+ *    - planning / workflow       → 12b (multi-step reasoning needed)
+ *    - reasoning                 → 12b
+ *    - simple                    → 2b (cheapest)
+ *    - medium                    → 4b (balanced)
+ *    - complex                   → 12b
+ */
+function selectModelByRouter(
+  routerResult: { complexity: string; domain: string; reasoning: string } | null,
+): string {
+  if (!routerResult) return '4b';  // default to operational if router fails
+  const d = routerResult.domain || 'chat';
+  const c = routerResult.complexity || 'simple';
+  const r = routerResult.reasoning === 'true';
+
+  // Domain-first rules
+  if (d === 'memory' || d === 'extraction') return '2b';
+  if (d === 'workflow') return '12b';
+  if (d === 'coding' && (c === 'medium' || c === 'complex')) return '12b';
+  if (d === 'planning') return '12b';
+
+  // Reasoning flag overrides complexity
+  if (r) return '12b';
+
+  // Complexity-based
+  if (c === 'simple') return '2b';
+  if (c === 'medium') return '4b';
+  return '12b';
+}
+const OBSERVER_VALIDATE_TIMEOUT_MS = Number(process.env.OBSERVER_VALIDATE_TIMEOUT_MS) || 300_000;
 // Max retries for transient failures (service restarting after crash)
-const MAX_RETRIES = 2;
-const RETRY_DELAY_MS = 2000;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 3000;
 
 /**
  * Axios call with timeout + retry. If a service crashes and Docker restarts it,
@@ -965,23 +1179,25 @@ async function axiosWithRetry<T = any>(
   url: string,
   dataOrConfig?: any,
   config?: any,
-  options: { timeout?: number; retries?: number } = {},
+  options: { timeout?: number; retries?: number; signal?: AbortSignal } = {},
 ): Promise<{ data: T }> {
   const timeout = options.timeout ?? FAST_TIMEOUT_MS;
   const maxRetries = options.retries ?? MAX_RETRIES;
 
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
+      if (options.signal?.aborted) throw new DOMException('Pipeline cancelled', 'AbortError');
       if (method === 'get') {
-        return await axios.get(url, { ...dataOrConfig, timeout });
+        return await axios.get(url, { ...dataOrConfig, timeout, signal: options.signal });
       } else if (method === 'delete') {
-        return await axios.delete(url, { ...dataOrConfig, timeout });
+        return await axios.delete(url, { ...dataOrConfig, timeout, signal: options.signal });
       } else if (method === 'patch') {
-        return await axios.patch(url, dataOrConfig, { ...config, timeout });
+        return await axios.patch(url, dataOrConfig, { ...config, timeout, signal: options.signal });
       } else {
-        return await axios.post(url, dataOrConfig, { ...config, timeout });
+        return await axios.post(url, dataOrConfig, { ...config, timeout, signal: options.signal });
       }
     } catch (err: any) {
+      if (err.name === 'AbortError' || err.name === 'CanceledError') throw err; // Don't retry aborts
       const isRetryable =
         err.code === 'ECONNREFUSED' ||
         err.code === 'ECONNRESET' ||
@@ -1307,6 +1523,14 @@ export class InteractionService {
   // on each `_setSessionWorktreeId` and on first lookup that misses (see _refreshSessionWorktree).
   private sessionWorktrees: Map<string, string> = new Map();
 
+  /**
+   * Per-session AbortControllers for in-flight pipeline requests.
+   * When a new interaction arrives for the same session, the previous
+   * pipeline is cancelled so LM Studio resources are freed immediately
+   * instead of waiting for the 300s timeout.
+   */
+  private pendingPipelineAbort: Map<string, AbortController> = new Map();
+
   constructor(
     private readonly events: RedisEventService,
     private readonly sessionConfig: SessionConfigService,
@@ -1352,7 +1576,10 @@ export class InteractionService {
       if (profile.config?.model) hints.model_override = profile.config.model;
       if (profile.config?.provider) hints.provider_override = profile.config.provider;
       hints._profile_config = profile.config;
-      // Propagate ids so response-generator logs can attribute them.
+      // Context window: profile override > model variant > env var default
+      if (profile.config?.context_window != null) hints.context_window_override = profile.config.context_window;
+      if (profile.config?.context_output_reserve != null) hints.context_output_reserve = profile.config.context_output_reserve;
+      // Propagate ids so response-generator logs / langfuse can attribute them.
       hints._role_id = roleId || undefined;
       hints._profile_id = profile.profile_id;
       return hints;
@@ -1373,7 +1600,20 @@ export class InteractionService {
    */
   private _setSessionWorktreeId(sessionId: string, worktreeId: string): void {
     this.sessionWorktrees.set(sessionId, worktreeId);
-    void this.sessionWorktree.claim(sessionId, worktreeId).catch((err) => {
+    this.sessionWorktree.claim(sessionId, worktreeId).catch(async (err) => {
+      // If another session claims our freshly-created worktree (stale Redis
+      // entry from an abandoned session), release the stale owner and retry.
+      if (err?.message?.includes('already owned')) {
+        this.logger.warn(`Stale worktree claim for ${worktreeId}: ${err.message} — releasing stale owner`);
+        try {
+          await this.sessionWorktree.releaseWorktree(worktreeId);
+          await this.sessionWorktree.claim(sessionId, worktreeId);
+          this.logger.log(`Reclaimed worktree ${worktreeId} for session ${sessionId} after releasing stale owner`);
+          return;
+        } catch (retryErr: any) {
+          this.logger.warn(`Retry claim also failed: ${retryErr?.message || retryErr}`);
+        }
+      }
       // Roll back the in-memory cache so we don't pretend the claim succeeded.
       const cached = this.sessionWorktrees.get(sessionId);
       if (cached === worktreeId) this.sessionWorktrees.delete(sessionId);
@@ -1416,7 +1656,24 @@ export class InteractionService {
     isAborted: () => boolean,
   ): Promise<InteractionResponse> {
     const interactionId = uuidv4();
-    const clientMessageId = req.context?.client_message_id;
+    const clientMessageId = req.context?.client_message_id || uuidv4();
+
+    // ── Cancel any in-flight pipeline for this session ──────────────
+    // If the user sends a new message while the previous request is still
+    // processing (e.g. interpreter hanging on LM Studio), abort the old one
+    // so LM Studio resources are freed immediately.
+    const prevController = this.pendingPipelineAbort.get(sessionId);
+    if (prevController) {
+      this.logger.warn(`Session ${sessionId}: cancelling stale pipeline (new interaction arrived)`);
+      prevController.abort();
+      this.pendingPipelineAbort.delete(sessionId);
+    }
+    const abortController = new AbortController();
+    const signal = abortController.signal;
+    this.pendingPipelineAbort.set(sessionId, abortController);
+
+    // Wrap isAborted so it also checks the signal
+    const combinedAborted = () => isAborted() || signal.aborted;
 
     // ── Budget enforcement ──────────────────────────────────────────
     // Refuse the interaction up-front if the session has already hit its
@@ -1461,8 +1718,8 @@ export class InteractionService {
       req.user_message = `[Feedback on your previous response]\n\n"${preview}"\n\nUser feedback: ${req.user_message}`;
     }
 
-    // Store user message in conversation history
-    await this.events.pushMessage(sessionId, 'user', req.user_message);
+    // Store user message in conversation history (with client_message_id for SSE correlation)
+    await this.events.pushMessage(sessionId, 'user', req.user_message, { clientMessageId });
 
     // Fetch recent conversation history for LLM context
     const recentMessages = await this.events.getRecentMessages(sessionId, 20);
@@ -1492,42 +1749,57 @@ export class InteractionService {
         return this.handleTeachingFollowup(sessionId, req, pending, trace, interactionId, clientMessageId);
       }
 
-      // ── Step 1: Interpret (always runs) ──────────────────────────────
-      this.logger.log('Calling interpreter service...');
+      // ── Step 1: Start thinking stream immediately + interpret in parallel ──
+      // Instead of blocking 4-5 min on the interpreter, kick off the LLM
+      // thinking stream right away so the user sees feedback.
+      this.logger.log('Calling interpreter service (parallel with thinking)...');
       const interpretSpan = trace?.span({ name: 'interpreter', input: { text: req.user_message } });
-      const llmStart = Date.now();
-      await this.events.publish('LlmCallStarted', sessionId, {
-        service: 'interpreter',
+      
+      // Warm up the thinking stream with a placeholder so UI shows activity immediately
+      await this.events.publish('ThinkingChunkGenerated', sessionId, {
+        chunk: 'Warming up model...',
+        full_reasoning: 'Warming up model...\n',
         interaction_id: interactionId,
         client_message_id: clientMessageId,
       });
-      const interpretRes = await axiosWithRetry('post', `${INTERPRETER_URL}/internal/interpret`, {
-        text: req.user_message,
-        context: req.context || {},
-        chat_history: chatHistory.length > 0 ? buildInterpreterChatHistory(chatHistory) : undefined,
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
-      await this.events.publish('LlmCallCompleted', sessionId, {
-        service: 'interpreter',
-        duration_ms: Date.now() - llmStart,
-        interaction_id: interactionId,
-        client_message_id: clientMessageId,
-      });
+
+      // Fire both the interpreter and the initial thinking stream in parallel
+      const interpretPromise = (async () => {
+        const llmStart = Date.now();
+        await this.events.publish('LlmCallStarted', sessionId, {
+          service: 'interpreter',
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        });
+        const res = await axiosWithRetry('post', `${INTERPRETER_URL}/internal/interpret`, {
+          text: req.user_message,
+          context: req.context || {},
+          chat_history: chatHistory.length > 0 ? buildInterpreterChatHistory(chatHistory) : undefined,
+        }, undefined, { timeout: 0, signal }); // 0 = no wall-clock limit — models can think for 10+ min
+        await this.events.publish('LlmCallCompleted', sessionId, {
+          service: 'interpreter',
+          duration_ms: Date.now() - llmStart,
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        });
+        return res;
+      })();
+
+      // Wait for interpreter to finish
+      const interpretRes = await interpretPromise;
       const semanticStructure = interpretRes.data.semantic_structure;
       let route = semanticStructure.route || 'complex';
       interpretSpan?.end({ output: { ...semanticStructure, route } });
 
-      // ── Route correction: if the previous turn was tool_use and this message is a
-      // short imperative follow-up (likely "continue", "do it", "fix that too"), override
-      // casual → tool_use.  But leave "complex" alone — follow-up questions asking for
-      // opinions, suggestions, or analysis should stay in the complex pipeline where chat
-      // history + knowledge graph provide the answer, not the tool-use loop.
+      // ── Route correction ────────────────────────────────────────────
+      let routerResult: { complexity: string; domain: string; reasoning: string } | null = null;
+
+      // Correction 1: Short follow-up after a tool-use turn (e.g. "fix that too")
       if (route === 'casual') {
         const prevAssistantTurn = chatHistory.filter(t => t.role === 'assistant').slice(-1)[0];
         const msgText = (req.user_message || '').trim();
         const msgLen = msgText.length;
-        // Only override very short imperative follow-ups (not questions)
         const looksLikeQuestion = /\?|suggest|would you|should|what|how|why|any other|anything extra/i.test(msgText);
-        // Check if previous assistant message looks like a tool_use response
         const prevLooksLikeToolUse = prevAssistantTurn?.content &&
           (/Tool calls:|```|worktree|applied patch|diff|created file|edited file/i.test(prevAssistantTurn.content) ||
            !!this._getSessionWorktreeId(sessionId));
@@ -1540,30 +1812,140 @@ export class InteractionService {
         }
       }
 
+      // Correction 2: Router model intent classification + keyword fallback
+      // The router is a lightweight model (2B) that classifies domain and complexity.
+      // Router KNOWLEDGE: domain=coding|planning|workflow means tool_use route.
+      // Fallback to keywords only when the router call fails.
+      if (route === 'complex') {
+        // Try the lightweight router model first
+        if (!curModel) {
+          try {
+            const routerResp = await axios.post(
+              `${RESPONSE_URL}/internal/route`,
+              { user_message: req.user_message, chat_history: chatHistory.slice(-4) },
+              { timeout: 30000 },
+            );
+            routerResult = routerResp.data as { complexity: string; domain: string; reasoning: string };
+
+            // Router domain = coding|planning|workflow → needs tool_use
+            const toolDomains = ['coding', 'planning', 'workflow'];
+            if (toolDomains.includes(routerResult.domain)) {
+              this.logger.warn(
+                `Route override: ${route} → tool_use (router domain=${routerResult.domain})`,
+              );
+              route = 'tool_use';
+              semanticStructure.route = 'tool_use';
+            }
+          } catch (err: any) {
+            this.logger.warn(`Route router call failed: ${err.message} — falling back to keyword/intent heuristic`);
+          }
+        }
+
+        // Keyword fallback: only when router didn't provide an override
+        if (route === 'complex') {
+          const toolUseIntents = ['implement', 'fix', 'explore', 'execute', 'diagnose', 'compare', 'create'];
+          const intent = (semanticStructure?.intent || '').toLowerCase().trim();
+          const msgText = (req.user_message || '').toLowerCase().trim();
+          const looksLikeCodeWork =
+            toolUseIntents.includes(intent) ||
+            /\b(add|fix|change|create|update|enable|implement|remove|refactor|build|make|write|edit|delete|show|find|check|run|investigate|debug|test)\b/i.test(msgText);
+          if (looksLikeCodeWork) {
+            this.logger.warn(
+              `Route override: ${route} → tool_use (keyword fallback — intent=${intent})`,
+            );
+            route = 'tool_use';
+            semanticStructure.route = 'tool_use';
+          }
+        }
+      }
+
       await this.events.publish('SemanticParsed', sessionId, { ...semanticStructure, route, interaction_id: interactionId, client_message_id: clientMessageId });
       this.logger.log(`Route classified: ${route}`);
 
-      // ── Step 2: Route-based dispatch ─────────────────────────────────
+      // ── Step 1.5: Model routing — service defaults + router agent override ──
+      // Resolve the base model from service defaults (Echo→4B, Missive→2B, etc.),
+      // then use the Router Agent (2B model) for descriptive request classification
+      // and apply a code policy (`selectModelByRouter`) to choose the final tier.
+      const effective = resolveEffectiveModel(curModel, curProvider, route, semanticStructure);
+      this.logger.log(`Model routing base: ${effective.routing} → model=${effective.model}`);
+      if (effective.model && effective.model !== curModel && !curModel) {
+        req.context = { ...(req.context || {}), model_override: effective.model };
+      }
+      // Call the Router Agent only if we haven't already called it above (route was already complex
+      // and router wasn't called, e.g. curModel was set). If curModel is set we skip the model
+      // router too — profile overrides take full control.
+      if (!curModel) {
+        try {
+          // Use cached routerResult from route correction if available to avoid a duplicate call
+          const routerResp = routerResult
+            ? { data: routerResult }
+            : await axios.post(
+                `${RESPONSE_URL}/internal/route`,
+                { user_message: req.user_message, chat_history: chatHistory.slice(-4) },
+                { timeout: 30000 },
+              );
+          const finalRouterResult = routerResp.data as { complexity: string; domain: string; reasoning: string };
+          // Apply code-based policy: the router describes, this function decides
+          const baseTier = selectModelByRouter(finalRouterResult);
+          // For tool_use routes (which involve coding/implementation), enforce
+          // at minimum the 12B tier — the router model is too small to reliably
+          // distinguish "simple chat" from "implement an app".
+          const selectedTier = route === 'tool_use' ? '12b' : baseTier;
+          const selectedModel = resolveTierModel(selectedTier);
+          if (selectedModel && selectedModel !== effective.model) {
+            this.logger.log(
+              `Router agent → policy override: ${effective.model} → ${selectedModel} ` +
+              `(complexity=${finalRouterResult.complexity}, domain=${finalRouterResult.domain}, reasoning=${finalRouterResult.reasoning})`,
+            );
+            req.context = { ...(req.context || {}), model_override: selectedModel };
+          } else {
+            this.logger.log(
+              `Router agent confirmed: ${effective.model || selectedModel} ` +
+              `(complexity=${finalRouterResult.complexity}, domain=${finalRouterResult.domain})`,
+            );
+          }
+          // Publish routing telemetry
+          this.events
+            .publish('ModelRoutingTelemetry', sessionId, {
+              ...finalRouterResult,
+              selected_tier: selectedTier,
+              selected_model: selectedModel,
+              default_tier: effective.routing,
+              default_model: effective.model,
+              route,
+              interaction_id: interactionId,
+              client_message_id: clientMessageId,
+            })
+            .catch(() => {});
+        } catch (err: any) {
+          this.logger.warn(`Model router call failed: ${err.message} — using service default ${effective.model}`);
+        }
+      }
+
+      // ── Step 2: Route-based dispatch ──
       let result: InteractionResponse;
       switch (route) {
         case 'casual':
-          result = await this.handleCasual(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory);
+          result = await this.handleCasual(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, signal);
           break;
         case 'teaching':
           result = await this.handleTeaching(sessionId, req, semanticStructure, trace, interactionId, clientMessageId);
           break;
         case 'tool_use':
-          result = await this.handleToolUse(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, isAborted);
+          // Only start the thinking stream after route is known,
+          // so we don't waste an LLM call on routes that don't use it.
+          result = await this.handleToolUse(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, combinedAborted, signal);
           break;
         case 'complex':
         default:
-          result = await this.handleComplex(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory);
+          // Complex route does its own response generation — no pre-thinking needed.
+          result = await this.handleComplex(sessionId, req, semanticStructure, trace, interactionId, clientMessageId, chatHistory, signal);
           break;
       }
 
-      // Store assistant response in conversation history
+      // Store assistant response in conversation history (with client_message_id for SSE correlation)
       if (result.response) {
-        await this.events.pushMessage(sessionId, 'assistant', result.response);
+        await this.events.pushMessage(sessionId, 'assistant', result.response, { clientMessageId });
       }
 
       // ── Cumulative session usage accounting ──────────────────────────
@@ -1592,6 +1974,21 @@ export class InteractionService {
 
       return result;
     } catch (err: any) {
+      const isAbortErr = err.name === 'AbortError' || err.name === 'CanceledError';
+      if (isAbortErr) {
+        this.logger.warn(`Session ${sessionId}: pipeline cancelled by new interaction`);
+        await this.events.publish('PipelineCancelled', sessionId, {
+          reason: 'New interaction arrived',
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        });
+        // Re-throw a CancelledError instead of AbortError so the controller
+        // can distinguish it from a regular error.
+        throw new HttpException(
+          { error: 'Pipeline cancelled', detail: 'Replaced by a new interaction for this session' },
+          HttpStatus.SERVICE_UNAVAILABLE,
+        );
+      }
       this.logger.error(`Pipeline failed: ${err.message}`);
       trace?.update({ output: { error: err.message } });
       const detail = err.response?.data || err.message;
@@ -1608,6 +2005,12 @@ export class InteractionService {
         { error: 'Reasoning pipeline failed', detail },
         err.response?.status || HttpStatus.INTERNAL_SERVER_ERROR,
       );
+    } finally {
+      // Clean up the AbortController from the session map
+      const current = this.pendingPipelineAbort.get(sessionId);
+      if (current === abortController) {
+        this.pendingPipelineAbort.delete(sessionId);
+      }
     }
   }
 
@@ -1638,9 +2041,10 @@ export class InteractionService {
     req: InteractionRequest,
     _semanticStructure: any,
     trace: any,
-    _interactionId: string,
-    _clientMessageId: string | undefined,
+    interactionId: string,
+    clientMessageId: string | undefined,
     chatHistory: Array<{ role: string; content: string }> = [],
+    signal?: AbortSignal,
   ): Promise<InteractionResponse> {
     this.logger.log('Casual route — direct LLM chat');
     const chatSpan = trace?.span({ name: 'casual-chat', input: { text: req.user_message } });
@@ -1654,11 +2058,15 @@ export class InteractionService {
     try {
       const projectId = req.context?.project_id;
       const mentionedIds: string[] = req.context?.mentioned_artifact_ids || [];
+      const queryParams: Record<string, any> = { q: req.user_message, limit: 5, session_id: sessionId };
+      if (projectId) queryParams.project_id = projectId;
       const [memRes, rulesRes, artSearchRes, artMentions] = await Promise.all([
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-          params: { q: req.user_message, limit: 5, session_id: sessionId },
+          params: queryParams,
         }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
-        axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
+        projectId
+          ? axiosWithRetry('get', `${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 })
+          : axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
         fetchArtifactSearchResults(req.user_message, projectId, 5),
         resolveArtifactMentions(mentionedIds),
       ]);
@@ -1675,8 +2083,8 @@ export class InteractionService {
     await this.events.publish('LlmCallStarted', sessionId, {
       service: 'response-generator',
       route: 'casual',
-      interaction_id: _interactionId,
-      client_message_id: _clientMessageId,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
     });
     const chatContext = {
       ...(req.context || {}),
@@ -1690,21 +2098,30 @@ export class InteractionService {
       user_message: req.user_message,
       context: chatContext,
       chat_history: chatHistory.length > 0 ? chatHistory : undefined,
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
+    }, undefined, { timeout: 0, signal }); // no wall-clock limit — LLM can think
     await this.events.publish('LlmCallCompleted', sessionId, {
       service: 'response-generator',
       route: 'casual',
       duration_ms: Date.now() - llmStart,
-      interaction_id: _interactionId,
-      client_message_id: _clientMessageId,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
     });
     const responseText = chatRes.data.response_text;
     chatSpan?.end({ output: { response_length: responseText.length } });
 
+    // Publish response as a thinking chunk too so the thinking overlay shows content
+    // even on the casual route (which has no separate reasoning token stream).
+    await this.events.publish('ThinkingChunkGenerated', sessionId, {
+      chunk: responseText,
+      full_reasoning: responseText,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
+    }).catch(err => this.logger.warn(`Failed to publish thinking chunk: ${err.message}`));
+
     await this.events.publish('ResponseGenerated', sessionId, {
       response_length: responseText.length,
-      interaction_id: _interactionId,
-      client_message_id: _clientMessageId,
+      interaction_id: interactionId,
+      client_message_id: clientMessageId,
     });
 
     trace?.update({ output: { response: responseText, route: 'casual' } });
@@ -1728,6 +2145,7 @@ export class InteractionService {
     interactionId: string,
     clientMessageId: string | undefined,
     chatHistory: Array<{ role: string; content: string }> = [],
+    signal?: AbortSignal,
   ): Promise<InteractionResponse> {
     this.logger.log('Complex route — full reasoning pipeline');
 
@@ -1736,7 +2154,7 @@ export class InteractionService {
     const graphRes = await axiosWithRetry('post', `${GRAPH_BUILDER_URL}/internal/graph/build`, {
       semantic_structure: semanticStructure,
       session_id: sessionId,
-    }, undefined, { timeout: FAST_TIMEOUT_MS });
+    }, undefined, { timeout: FAST_TIMEOUT_MS, signal });
     const reasoningGraph = graphRes.data.reasoning_graph;
     graphSpan?.end({ output: { graph_id: reasoningGraph.id, node_count: reasoningGraph.nodes?.length || 0 } });
 
@@ -1758,15 +2176,20 @@ export class InteractionService {
       const problemTitle = semanticStructure.problem || req.user_message;
       const projectId = req.context?.project_id;
       const mentionedIds: string[] = req.context?.mentioned_artifact_ids || [];
+      const queryParams: Record<string, any> = { q: problemTitle, limit: 5, session_id: sessionId };
+      if (projectId) queryParams.project_id = projectId;
       const [memRes, foundationalRes, rulesRes, artSearchRes, artMentions] = await Promise.all([
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-          params: { q: problemTitle, limit: 5, session_id: sessionId },
+          params: queryParams,
         }, undefined, { timeout: FAST_TIMEOUT_MS }),
         // Also fetch foundational graph nodes for grounded reasoning
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/nodes-by-tier`, {
-          params: { tier: 'foundational', session_id: sessionId, limit: 10 },
+          params: { tier: 'foundational', session_id: sessionId, project_id: projectId, limit: 10 },
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => ({ data: { nodes: [] } })),
-        axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS }),
+        // Use project-scoped rules when a project is active, otherwise global rules
+        projectId
+          ? axiosWithRetry('get', `${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS })
+          : axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS }),
         fetchArtifactSearchResults(req.user_message, projectId, 5),
         resolveArtifactMentions(mentionedIds),
       ]);
@@ -1873,7 +2296,7 @@ export class InteractionService {
         artifact_context: artifactContext || undefined,
         code_knowledge: codeKnowledgeBlock || undefined,
       };
-      responseText = await this.generateStreamingResponse(
+      responseText = await this.generateStreamingResponseStructured(
         sessionId,
         interactionId,
         clientMessageId,
@@ -1883,7 +2306,8 @@ export class InteractionService {
           context: responseContext,
           chat_history: chatHistory.length > 0 ? chatHistory : undefined,
         },
-        '/internal/response/generate-stream'
+        '/internal/response/generate-stream-structured',
+        signal,
       );
       responseSpan?.end({ output: { response_length: responseText.length } });
 
@@ -1913,6 +2337,8 @@ export class InteractionService {
       await axiosWithRetry('post', `${MEMORY_URL}/internal/memory/store`, {
         reasoning_graph: decisionTree.graph || reasoningGraph,
         user_id: 'default',
+        session_id: sessionId,
+        project_id: req.context?.project_id,
       }, undefined, { timeout: FAST_TIMEOUT_MS });
       storeSpan?.end({ output: { graph_id: reasoningGraph.id } });
       await this.events.publish('MemoryUpdated', sessionId, {
@@ -1947,6 +2373,7 @@ export class InteractionService {
     clientMessageId: string | undefined,
     chatHistory: Array<{ role: string; content: string }> = [],
     isAborted: () => boolean = () => false,
+    signal?: AbortSignal,
   ): Promise<InteractionResponse> {
     this.logger.log('Tool-use route — multi-agent loop (Plan → Execute → Observer)');
     const toolSpan = trace?.span({ name: 'tool-use', input: { text: req.user_message } });
@@ -1956,6 +2383,26 @@ export class InteractionService {
     const maxDurationMs = sessionCfg.autonomous_max_duration_hours * 3600 * 1000;
     const maxIterations = autonomousMode ? 10000 : MAX_TOOL_ITERATIONS;
     const loopStartTime = Date.now();
+
+    // Resolve model info for timeouts and prompt-tier
+    const curModel = ((req.context as Record<string, unknown> | undefined)?.model_override as string | undefined) ?? null;
+    const curProvider = ((req.context as Record<string, unknown> | undefined)?.provider_override as string | undefined) ?? null;
+    const THOUGHT_TIMEOUT_MS = resolveThoughtTimeout(curProvider, curModel);
+
+    // ── Model capabilities (used for tool-tiering throughout the loop) ────
+    const modelCaps = resolveModelCapabilities(curProvider, curModel);
+    this.logger.log(
+      `Model capabilities: tier=${modelCaps.tier} canGetRule=${modelCaps.canGetRule} canDelegate=${modelCaps.canDelegate} (model=${curModel}, provider=${curProvider})`,
+    );
+
+    // ── Execution mode (thinking budget) ──────────────────────────────────
+    // Reactive: no automatic thinking. Act immediately. The model can still call `think` explicitly.
+    // Guided:   minimal reasoning. Think only when stuck or on failure.
+    // Deliberative: full pre-loop thinking + mid-loop re-thinking.
+    const execMode = resolveExecutionMode(curProvider, curModel);
+    this.logger.log(
+      `Execution mode: ${execMode} (model=${curModel}) — reactive=act only, guided=think when stuck, deliberative=full reasoning`,
+    );
 
     // ── Restore (or auto-claim) the session's worktree ──────────────
     // First, hydrate from the persistent SessionWorktreeService — this survives
@@ -1983,60 +2430,96 @@ export class InteractionService {
       }
     }
 
-    // ── Pre-Phase: Free Thoughts (Free-form reasoning) ─────────────
-    let freeThoughts = await this.generateStreamingThoughts(
-      sessionId,
-      req.user_message,
-      req.context,
-      chatHistory,
-      interactionId,
-      clientMessageId,
-    );
+    // ── Pre-Phase: Free Thoughts (only for deliberative mode; reactive/guided act directly) ──
+    let freeThoughts = '';
+    let thoughtToolCalls = 0;
+
+    if (execMode === 'deliberative') {
+      // Deliberative mode: full pre-loop reasoning to decompose the goal
+      try {
+        const structuredResult = await this.generateStreamingThoughtsStructured(
+          sessionId,
+          req.user_message,
+          req.context,
+          chatHistory,
+          interactionId,
+          clientMessageId,
+          undefined,
+          undefined,
+          signal,
+        );
+        freeThoughts = structuredResult.thoughts;
+        thoughtToolCalls = structuredResult.toolCalls;
+
+        // Fallback: if structured returned nothing (e.g. endpoint not available),
+        // use the classic plain-text approach.
+        if (!freeThoughts && thoughtToolCalls === 0) {
+          freeThoughts = await this.generateStreamingThoughts(
+            sessionId,
+            req.user_message,
+            req.context,
+            chatHistory,
+            interactionId,
+            clientMessageId,
+            undefined,
+            undefined,
+            signal,
+          );
+        }
+      } catch {
+        this.logger.warn('Initial thinking stream failed, continuing with empty thoughts');
+      }
+
+      if (thoughtToolCalls > 0) {
+        this.logger.log(`Thought phase made ${thoughtToolCalls} tool call(s)`);
+      }
+    } else {
+      // Reactive/guided: no automatic pre-thinking. The model will use the `think` tool if needed.
+      this.logger.log(`Execution mode ${execMode}: skipping pre-loop thinking`);
+    }
 
     let consecutiveNeedInfo = 0;
 
-    // ── Pre-Phase: Decision Layer (Think → Decide → Act) ─────────────
-    const decisionStartTime = Date.now();
-    const decisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
-      thoughts: freeThoughts,
-      user_message: req.user_message,
-      context: { ...req.context, interactionId },
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
-    
-    let decision = decisionRes.data.decision;
-    const timeToDecision = Date.now() - decisionStartTime;
-    const timeToAction = Date.now() - loopStartTime;
-    
-    // Structured logging for metrics
-    this.logger.log(`[DECISION_LOG] decision_type=${decision} thought_count=1 time_to_decision_ms=${timeToDecision} time_to_action_ms=${timeToAction}`);
-    this.logger.log(`Decision Layer [pre-loop]: ${decision} (in ${timeToDecision}ms)`);
+    let decision: string;
+    let decisionReason = '';
 
-    if (decision === 'NEED_MORE_INFO') {
-      consecutiveNeedInfo++;
-      if (consecutiveNeedInfo >= 2) {
-        this.logger.warn(`Overthinking Recovery [pre-loop]: Forced ACT after ${consecutiveNeedInfo} consecutive NEED_MORE_INFO.`);
+    // ── Pre-Phase: Decision Layer (only for deliberative; reactive/guided skip to tool loop) ──
+    if (execMode === 'deliberative') {
+      if (!freeThoughts || freeThoughts.trim().length === 0) {
+        this.logger.warn('Thought stream returned empty — skipping decision layer, defaulting to ACT');
         decision = 'ACT';
+        decisionReason = 'Thought stream returned empty, defaulting to action.';
+      } else {
+        const decisionStartTime = Date.now();
+        const decisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
+          thoughts: freeThoughts,
+          user_message: req.user_message,
+          context: { ...req.context, interactionId },
+          chat_history: chatHistory.length > 0 ? chatHistory : undefined,
+        }, undefined, { timeout: 0, signal }).catch((err) => {
+          this.logger.warn(`Decision layer call failed: ${err.message} — defaulting to ACT`);
+          return { data: { decision: 'ACT', reason: '', confidence: 0.5 } };         });
+        decision = decisionRes.data?.decision || 'ACT';
+        decisionReason = decisionRes.data?.reason || '';
+        const timeToDecision = Date.now() - decisionStartTime;
+        this.logger.log(`[DECISION_LOG] pre-loop decision=${decision} time_to_decision_ms=${timeToDecision}`);
+        this.logger.log(`Decision Layer: ${decision}`);
       }
     } else {
-      consecutiveNeedInfo = 0;
+      // Reactive/guided: no decision layer — default to ACT and let the tool loop drive
+      decision = 'ACT';
+      decisionReason = `Execution mode ${execMode}: skipping decision layer, defaulting to ACT.`;
+      this.logger.log(decisionReason);
     }
 
-    await this.events.publish('DecisionLayerGenerated', sessionId, {
-      decision,
-      reason: decisionRes.data.reason,
-      confidence: decisionRes.data.confidence,
-      interaction_id: interactionId,
-      client_message_id: clientMessageId,
-      forced: consecutiveNeedInfo >= 2,
-    });
-
+    // If decided to answer directly (and had meaningful thoughts)
     if (decision === 'ANSWER_DIRECTLY') {
       this.logger.log('Decision: ANSWER_DIRECTLY — bypassing tool loop');
       const chatRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/response/chat`, {
         user_message: req.user_message,
         context: { ...(req.context || {}), thoughts: freeThoughts },
         chat_history: chatHistory.length > 0 ? chatHistory : undefined,
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
+      }, undefined, { timeout: 0, signal });
       const responseText =
         typeof chatRes.data.response_text === 'string' && chatRes.data.response_text.trim()
           ? chatRes.data.response_text.trim()
@@ -2053,25 +2536,6 @@ export class InteractionService {
         response: responseText,
         reasoning_graph: {},
         confidence: 1.0,
-        reasoning_trace: [`Route: tool_use (Decision: ${decision})`, freeThoughts].filter(Boolean),
-        route: 'tool_use',
-      };
-    }
-
-    if (decision === 'NEED_MORE_INFO') {
-      this.logger.log('Decision: NEED_MORE_INFO — requesting clarification');
-      const question = decisionRes.data.reason || "I need more information before I can act.";
-      const options: string[] = Array.isArray(decisionRes.data.options) ? decisionRes.data.options : [];
-      // Format with clickable options if available
-      let responseText = `🤔 **I need more info:** ${question}`;
-      if (options.length > 0) {
-        responseText += '\n\n' + options.map(o => `- ${o}`).join('\n');
-      }
-      return {
-        session_id: sessionId,
-        response: responseText,
-        reasoning_graph: {},
-        confidence: decisionRes.data.confidence || 0.5,
         reasoning_trace: [`Route: tool_use (Decision: ${decision})`, freeThoughts].filter(Boolean),
         route: 'tool_use',
       };
@@ -2109,17 +2573,24 @@ export class InteractionService {
 
       const projectId = req.context?.project_id;
       const mentionedIds: string[] = req.context?.mentioned_artifact_ids || [];
+      const queryParams: Record<string, any> = { q: memoryQuery, limit: 5, session_id: sessionId };
+      if (projectId) queryParams.project_id = projectId;
       const [memRes, foundationalRes, rulesRes, artSearchRes, artMentions] = await Promise.all([
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-          params: { q: memoryQuery, limit: 5, session_id: sessionId },
+          params: queryParams,
         }, undefined, { timeout: FAST_TIMEOUT_MS }),
         // Fetch foundational graph nodes — these should always inform tool-use planning
         axiosWithRetry('get', `${MEMORY_URL}/internal/memory/nodes-by-tier`, {
-          params: { tier: 'foundational', session_id: sessionId, limit: 10 },
+          params: { tier: 'foundational', session_id: sessionId, project_id: projectId, limit: 10 },
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => ({ data: { nodes: [] } })),
-        axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, {
-          params: rulesParams,
-        }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
+        // Use project-scoped rules when a project is active, otherwise global rules
+        projectId
+          ? axiosWithRetry('get', `${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}/rules`, {
+              params: rulesParams,
+            }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 })
+          : axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, {
+              params: rulesParams,
+            }, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
         // Fetch project artifacts via RAG search so tool-use planning has artifact context
         fetchArtifactSearchResults(req.user_message, projectId, 5),
         resolveArtifactMentions(mentionedIds),
@@ -2171,7 +2642,7 @@ export class InteractionService {
         memory_stale_hint: memoryStaleHint,
         free_thoughts: freeThoughts,
         // Artifacts are no longer auto-injected; the LLM uses search_artifacts tool
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
+      }, undefined, { timeout: 0 });
       upfrontPlan = {
         steps: planRes.data.steps || [],
         success_criteria: planRes.data.success_criteria || [],
@@ -2271,6 +2742,7 @@ export class InteractionService {
 
     const runObserverReplan = async (feedbackForPlanner: string, atIteration: number): Promise<boolean> => {
       try {
+        if (signal?.aborted) return false;
         const planRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/plan/tool-use`, {
           user_message: req.user_message,
           semantic_structure: semanticStructure,
@@ -2281,7 +2753,7 @@ export class InteractionService {
           observer_feedback: feedbackForPlanner,
           previous_plan: upfrontPlan.steps.length > 0 ? upfrontPlan : undefined,
           replan_after_observer: true,
-        }, undefined, { timeout: LLM_TIMEOUT_MS });
+        }, undefined, { timeout: 0, signal });
         upfrontPlan = {
           steps: planRes.data.steps || [],
           success_criteria: planRes.data.success_criteria || [],
@@ -2337,6 +2809,7 @@ export class InteractionService {
           reason,
           suggestion,
           session_id: sessionId,
+          project_id: req.context?.project_id,
         }, undefined, { timeout: FAST_TIMEOUT_MS }).catch(() => {});
         toolSpan?.end({ output: { feasibility: 'not_achievable' } });
         trace?.update({ output: { response: `This task appears not achievable: ${reason}. ${suggestion}`, route: 'tool_use' } });
@@ -2396,12 +2869,41 @@ export class InteractionService {
     }
 
     let maxDurationReached = false;
+    let hallucinationStartTime: number | null = null; // starts ticking on first duplicate detection
+    const HALLUCINATION_LOOP_TIMEOUT_MS = 300_000; // 5 min guard once hallucination is confirmed
+
+    // ── Stuck-loop auto-downgrade ─────────────────────────────────────
+    // Tracks consecutive iterations where the agent makes no progress
+    // (same clarification request, no new tool calls). After a threshold,
+    // we inject a "switch to simple mode" message into the next LLM call
+    // so the agent stops overthinking and starts executing.
+    let stuckIterations = 0;
+    let lastStuckAnswer = '';
+    let lastStuckActionsCount = 0;
+    const STUCK_DOWNGRADE_THRESHOLD = 5;  // downgrade after 5 stuck iterations
+    let promptDowngraded = false;
+
+    // ── JIT rule pack injection ─────────────────────────────────────────
+    // Instead of loading all rules up front, we auto-detect what's relevant
+    // and inject focused rule packs based on the model's planned action.
+    // The model can also explicitly call get_rule to request a specific pack.
+    let rulePacksToInject: string[] = [];
+    // Track the previous iteration's planned tool for auto-injection detection
+    let lastPlannedTool: string | null = null;
+
     for (let iteration = 0; iteration < maxIterations; iteration++) {
-      if (isAborted()) {
+      if (isAborted() || signal?.aborted) {
         this.logger.warn(
           'Connection closed before response was sent — stopping tool loop. Causes: user Stop, tab refresh/close, network drop, or proxy idle timeout during long gaps between tool rounds.',
         );
         throw new Error('Pipeline stopped by client');
+      }
+
+      // Only check the hallucination timeout if it has been armed by actual evidence of a loop.
+      if (hallucinationStartTime && Date.now() - hallucinationStartTime > HALLUCINATION_LOOP_TIMEOUT_MS) {
+        this.logger.warn(`Hallucination loop guard: exceeded 5 min since first duplicate — stopping loop`);
+        maxDurationReached = true;
+        break;
       }
 
       // Time limit (autonomous mode)
@@ -2495,15 +2997,20 @@ export class InteractionService {
         }
       }
 
-      // ── Generate & Validate Thoughts ─────────────────────────────────
+    // ── Generate & Validate Thoughts ─────────────────────────────────
       // Preserve previous agent thoughts if reasoning layer isn't refreshed —
       // this ensures commitments like "run npm install" survive across iterations
       // until the reasoning layer re-evaluates.
       const previousThoughts = validatedThoughts;
       const lastToolResult = iteration > 0 ? toolResults[toolResults.length - 1] : undefined;
-      const shouldRefreshReasoningLayer =
-        iteration > 0 &&
-        (!lastToolResult?.success || feedbackWarrantsReasoningRefresh(observerFeedback));
+      const isRecoveryOrStuck = !lastToolResult?.success || feedbackWarrantsReasoningRefresh(observerFeedback) || thoughtsOnlyStreak >= 2;
+      const shouldRefreshReasoningLayer = iteration > 0 && (
+        execMode === 'deliberative'
+          ? (!lastToolResult?.success || feedbackWarrantsReasoningRefresh(observerFeedback))
+          : execMode === 'guided'
+            ? isRecoveryOrStuck
+            : false  // reactive: never automatic thinking
+      );
       try {
         if (shouldRefreshReasoningLayer) {
           this.logger.log(`Generating thoughts for iteration ${iteration + 1}`);
@@ -2515,7 +3022,7 @@ export class InteractionService {
             rules: rules.length > 0 ? rules : undefined,
             walls_hit: wallsHit.length > 0 ? wallsHit : undefined,
             observer_feedback: observerFeedback,
-          }, undefined, { timeout: FAST_TIMEOUT_MS });
+          }, undefined, { timeout: THOUGHT_TIMEOUT_MS });
 
           if (thoughtsRes.data?.thoughts?.length) {
             const validateRes = await axiosWithRetry('post', `${LOGIC_ENGINE_URL}/internal/reason/validate-thoughts`, {
@@ -2642,13 +3149,14 @@ export class InteractionService {
           clientMessageId,
           toolResults.slice(-5),
           observerFeedback,
+          signal,
         );
 
         const iterationDecisionRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/decision`, {
           thoughts: freeThoughts,
           user_message: req.user_message,
-          context: { ...req.context, interactionId, iteration },
-        }, undefined, { timeout: LLM_TIMEOUT_MS });
+        context: { ...req.context, interactionId, iteration },
+      }, undefined, { timeout: 0, signal });
 
         let iterationDecision = iterationDecisionRes.data.decision;
         const timeToIterationDecision = Date.now() - iterationDecisionStartTime;
@@ -2766,6 +3274,40 @@ export class InteractionService {
         else if (t !== '_system' && t !== 'validation_error') toolDigest.push(`✓ ${t}`);
       }
 
+      // ── JIT auto-injection: determine relevant rule packs ──────────────
+      // Auto-detect based on the previous plan's action tool (stored from
+      // the prior iteration). Explicit get_rule requests are handled in the
+      // tool execution section below.
+      const lastPlanAction = lastPlannedTool;  // set at bottom of loop
+      if (rulePacksToInject.length === 0 && iteration > 0 && lastPlanAction) {
+        const detectedPacks = ACTION_TO_RULE_PACKS[lastPlanAction];
+        if (detectedPacks) {
+          // Filter out delegation rule packs for models that can't delegate
+          if (!modelCaps.canDelegate) {
+            rulePacksToInject = detectedPacks.filter(
+              p => p !== 'delegation_rules',
+            );
+          } else {
+            rulePacksToInject = [...detectedPacks];
+          }
+        }
+        // If last tool call failed, inject recovery_rules
+        const lastResult = toolResults.length > 0 ? toolResults[toolResults.length - 1] : null;
+        if (lastResult && !lastResult.success && !lastResult.blocked) {
+          if (!rulePacksToInject.includes('recovery_rules')) {
+            rulePacksToInject.push('recovery_rules');
+          }
+          if (!rulePacksToInject.includes('tool_rules')) {
+            rulePacksToInject.push('tool_rules');
+          }
+        }
+        if (rulePacksToInject.length > 0) {
+          this.logger.log(`JIT auto-injecting rule packs: ${rulePacksToInject.join(', ')}`);
+        }
+      } else if (rulePacksToInject.length > 0 && iteration === 0) {
+        // Keep explicit rule packs requested at start
+      }
+
       let plan = await this.generateStreamingToolPlan(
         sessionId,
         interactionId,
@@ -2773,9 +3315,6 @@ export class InteractionService {
         {
           user_message: req.user_message,
           tool_results: toolResults.length > 0 ? toolResults.slice(-8) : null,
-          // chat_history omitted: knowledge graph, code graph, memory context,
-          // validated thoughts, and tool results provide sufficient context
-          // without consuming extra tokens on conversation history.
           upfront_plan: upfrontPlan.steps.length > 0 ? upfrontPlan : undefined,
           active_step_index: hasPlanSteps ? activeStepIndex : undefined,
           active_step_description: activeStepDescription || undefined,
@@ -2790,7 +3329,12 @@ export class InteractionService {
           free_thoughts: freeThoughts,
           active_worktree_id: activeWorktreeId || undefined,
           tool_history_digest: toolDigest.length > 2 ? toolDigest : undefined,
-          // Artifacts accessed via search_artifacts tool, not auto-injected
+          model_override: curModel || undefined,
+          max_tokens: modelCaps.maxOutputTokens > 0 ? modelCaps.maxOutputTokens : undefined,
+          // JIT: inject rule packs based on last plan's action or explicit get_rule
+          rule_packs_to_inject: rulePacksToInject.length > 0 ? rulePacksToInject : undefined,
+          context_window_override: (req.context as any)?.context_window_override ?? undefined,
+          context_output_reserve: (req.context as any)?.context_output_reserve ?? undefined,
         },
         iteration,
         trace,
@@ -2816,6 +3360,49 @@ export class InteractionService {
         // context budget is best-effort
       }
 
+      // ── Stuck clarification loop detection ──────────────────────
+      // If the agent keeps asking for more info without making tool calls,
+      // inject a "switch to simple mode" hint that discourages overthinking.
+      if (plan?.action === 'final_answer' && (plan.answer || '').toLowerCase().includes('please provide')) {
+        const currentAnswer = (plan.answer || '').trim();
+        const noNewToolCalls = toolResults.length === toolResultsBeforeIteration;
+
+        if (noNewToolCalls && currentAnswer === lastStuckAnswer) {
+          stuckIterations++;
+        } else if (noNewToolCalls) {
+          stuckIterations = Math.max(1, stuckIterations + 1);
+        } else {
+          stuckIterations = 0;
+        }
+        lastStuckAnswer = currentAnswer;
+        lastStuckActionsCount = toolResults.length;
+
+        if (stuckIterations >= STUCK_DOWNGRADE_THRESHOLD && !promptDowngraded) {
+          promptDowngraded = true;
+          this.logger.warn(
+            `Stuck clarification loop: ${stuckIterations} consecutive clarification requests. Injecting downgrade hint.`,
+          );
+          observerFeedback = observerFeedback
+            ? `${observerFeedback}\n\n[SIMPLE MODE: You have been stuck in a clarification loop. Stop asking questions. Use grep to explore the codebase directly and find what you need. DO NOT ask for more information.]`
+            : `[SIMPLE MODE: You have been stuck in a clarification loop. Stop asking questions. Use grep to explore the codebase directly and find what you need. DO NOT ask for more information.]`;
+        } else if (stuckIterations >= STUCK_DOWNGRADE_THRESHOLD && promptDowngraded) {
+          this.logger.warn(`Stuck clarification loop (post-downgrade): ${stuckIterations} iterations. Forcing grep.`);
+          plan = {
+            action: 'call_tool',
+            tool: 'grep',
+            pattern: 'TODO|FIXME|function',
+            path: '/workspace',
+            reasoning: 'Forced action after stuck clarification loop',
+            _forced_recovery: true,
+          };
+        }
+      } else {
+        if (plan?.action === 'call_tool') {
+          stuckIterations = 0;
+          lastStuckAnswer = '';
+        }
+      }
+
       // Deterministic last-resort: if we've already observed a long "thoughts only" streak,
       // and the model tries to finalize without producing new tool_results, force a tool call.
       if (thoughtsOnlyStreak >= 3 && plan?.action === 'final_answer' && !plan?._retry_hint) {
@@ -2829,6 +3416,7 @@ export class InteractionService {
           pattern: fallbackPattern,
           path: '/workspace',
           reasoning: 'Forced action after repeated thoughts-only iterations',
+          _forced_recovery: true,  // skip duplicate detection & hallucination guard
         };
       }
 
@@ -2855,6 +3443,7 @@ export class InteractionService {
           name: wtName,
           reasoning:
             'Autonomous cap: many read-only tools without edits; create a worktree, then edit_file or write_file.',
+          _forced_recovery: true,  // skip duplicate detection & hallucination guard
         };
       }
 
@@ -2938,28 +3527,28 @@ export class InteractionService {
             isPunting = puntRes.data?.is_punt === true;
             puntReason = puntRes.data?.reason || 'LLM detected punt';
           } catch {
-            // Fallback: phrase-based detection
+            // Behavioral fallback: score behavior, not isolated phrases.
+            // A single "please provide" or "could you clarify" is NOT a punt —
+            // the model may be genuinely confused. Only flag as punt when:
+            //   1. Same or very similar answer appeared 3+ times (clarification loop)
+            //   2. Model made no tool calls in this iteration
+            //   3. Answer is a clarification request (question-like) not a cop-out excuse
             const ansLower = (plan.answer || '').toLowerCase();
-            const PUNT_PHRASES = [
-              'you\'ll need to', 'you will need to', 'you can ', 'i can guide',
-              'i was unable', 'i wasn\'t able', 'i couldn\'t', 'i could not',
-              'here\'s how', 'however, i can', 'unfortunately', 'however, you',
-              'you should ', 'you may want', 'you might want',
-              'would you like me to', 'shall i ', 'do you want me to',
-              'should i ', 'want me to ', 'if you\'d like me to',
-              'i can also ', 'i could also ', 'let me know if',
-              'i\'ll need to', 'the next step would be', 'the next step is',
-              'no modifications were made', 'no changes were made',
-              'due to size limitations', 'which is quite large',
-              'due to a tool limitation', 'requires careful handling',
-              'would you like me to focus', 'focus on any specific part',
-              // Announcing plans without executing
-              'let me proceed', 'i\'ll proceed', 'i will proceed',
-              'the task requires', 'based on the existing code',
-              'i noticed that', 'looking at the code',
-            ];
-            isPunting = PUNT_PHRASES.some(p => ansLower.includes(p));
-            puntReason = 'phrase match fallback';
+            const clarificationWords = ['please provide', 'what task', 'could you clarify', 'what would you like',
+              'what specific', 'please specify', 'tell me what', 'what information',
+              'do you want me to', 'would you like me to'];
+            const isClarification = clarificationWords.some(w => ansLower.includes(w));
+
+            // Count how many previous final_answers were similar clarification loops
+            const clarificationCount = toolResults.filter(r =>
+              r.tool === '_system' && (r.output || '').toLowerCase().includes('blocked')
+            ).length;
+
+            // Only flag as punt if we've already blocked 3+ times (model is stuck in loop)
+            // AND this answer is a clarification request with no tool calls
+            const noNewToolCalls = toolResults.length === toolResultsBeforeIteration;
+            isPunting = isClarification && noNewToolCalls && clarificationCount >= 3;
+            puntReason = isPunting ? 'behavioral: stuck clarification loop' : 'phrase-match fallback (not punting — passing through)';
           }
 
           if (isPunting) {
@@ -2974,7 +3563,7 @@ export class InteractionService {
                 `You have read files successfully — now ACT on them:\n` +
                 `1. If you haven't created a worktree yet → create_worktree\n` +
                 `2. If the file is too large to read fully → use start_line/end_line for chunked reads\n` +
-                `3. Apply your changes with apply_patch or edit_file\n` +
+                `3. Apply your changes with edit_file or apply_patch (prefer edit_file)\n` +
                 `4. Show the diff with get_diff\n` +
                 `Do NOT tell the user to do it. DO IT YOURSELF.`,
               blocked: false,
@@ -3025,26 +3614,21 @@ export class InteractionService {
                 isPunt = puntRes.data?.is_punt === true;
                 puntReason = puntRes.data?.reason || '';
               } catch (puntErr: any) {
-                // Fallback: phrase-based punt detection when LLM check fails
-                this.logger.warn(`LLM punt check failed: ${puntErr.message} — falling back to phrase match`);
+                // Behavioral fallback: same scoring as pre-observer check.
+                // Isolated "please provide" or "could you clarify" is NOT a punt —
+                // the model may be genuinely confused.
+                this.logger.warn(`LLM punt check failed: ${puntErr.message} — using behavioral scoring`);
                 const ansLower = (plan.answer || '').toLowerCase();
-                const PUNT_PHRASES = [
-                  'you\'ll need to', 'you will need to', 'you can ', 'i can guide',
-                  'i was unable to', 'i wasn\'t able to', 'i couldn\'t', 'i could not',
-                  'here\'s how', 'however, i can', 'unfortunately',
-                  'would you like me to', 'shall i ', 'do you want me to',
-                  'should i ', 'want me to ', 'let me know if',
-                  'no modifications were made', 'no changes were made',
-                  'due to size limitations', 'which is quite large',
-                  'due to a tool limitation', 'requires careful handling',
-                  'would you like me to focus', 'focus on any specific part',
-                  // Announcing plans without executing
-                  'let me proceed', 'i\'ll proceed', 'i will proceed',
-                  'the task requires', 'based on the existing code',
-                  'i noticed that', 'looking at the code',
-                ];
-                isPunt = PUNT_PHRASES.some(p => ansLower.includes(p));
-                puntReason = 'phrase match fallback';
+                const clarificationWords = ['please provide', 'what task', 'could you clarify',
+                  'what information', 'please specify', 'tell me what',
+                  'would you like me to', 'do you want me to'];
+                const isClarification = clarificationWords.some(w => ansLower.includes(w));
+                const clarificationCount = toolResults.filter(r =>
+                  r.tool === '_system' && (r.output || '').toLowerCase().includes('blocked')
+                ).length;
+                const noNewToolCalls = toolResults.length === toolResultsBeforeIteration;
+                isPunt = isClarification && noNewToolCalls && clarificationCount >= 3;
+                puntReason = isPunt ? 'behavioral: stuck clarification loop' : 'single clarification (not punting)';
               }
 
               if (isPunt) {
@@ -3053,7 +3637,7 @@ export class InteractionService {
                 );
                 observerFeedback =
                   'The observer accepted your answer but you are PUNTING the task to the user. ' +
-                  'You MUST implement it yourself: create_worktree → read the file with chunked reads (start_line/end_line) → apply_patch/edit_file → get_diff. ' +
+                  'You MUST implement it yourself: create_worktree → read the file with chunked reads (start_line/end_line) → edit_file/apply_patch → get_diff. ' +
                   'Do NOT tell the user how to do it — DO IT.';
                 taskGraph = obsRes.data.updated_graph || taskGraph;
                 updateThoughtsOnlyStreak();
@@ -3074,6 +3658,7 @@ export class InteractionService {
                   reasoning_graph: taskGraph,
                   user_id: 'default',
                   session_id: sessionId,
+                  project_id: req.context?.project_id,
                   walls: wallsHit.length > 0 ? wallsHit : undefined,
                 }, undefined, { timeout: FAST_TIMEOUT_MS });
               } catch {
@@ -3271,6 +3856,176 @@ export class InteractionService {
       // 2b. Execute the planned tool call
       if (plan.action === 'call_tool') {
         let toolName = plan.tool || 'bash';
+
+        // ── `think` tool handler ──
+        // When the model calls think, it's opting into reasoning.
+        // We call the free thoughts endpoint and store the result as freeThoughts
+        // for the next planner iteration. The model re-evaluates with fresh reasoning.
+        if (toolName === 'think') {
+          const reason = (plan as any).reason || (plan as any).PARAM_REASON || '';
+          this.logger.log(`Model requested explicit thinking: "${reason.slice(0, 200)}"`);
+          try {
+            const thinkingResult = await this.generateStreamingThoughts(
+              sessionId,
+              req.user_message,
+              { ...semanticStructure, interactionId, iteration, think_prompt: reason },
+              chatHistory,
+              interactionId,
+              clientMessageId,
+              toolResults.slice(-5),
+              observerFeedback,
+              signal,
+            );
+            freeThoughts = thinkingResult;
+            // Also store back-front so the client can display thinking
+            await this.events.publish('Thinking', sessionId, {
+              thoughts: freeThoughts,
+              iteration,
+              client_message_id: clientMessageId,
+            });
+          } catch (err: any) {
+            this.logger.warn(`think tool failed: ${err.message}`);
+            freeThoughts = '';
+          }
+          // Trigger re-evaluation with the new reasoning
+          toolResults.push({
+            tool: '_system',
+            success: true,
+            output: `Thinking complete. ${freeThoughts ? 'Reasoning injected for re-evaluation.' : 'No new reasoning generated.'}`,
+            blocked: false,
+          });
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── JIT get_rule handler ──
+        // When the model calls get_rule, inject the matching rule pack into the
+        // next plan iteration and skip execution (the model re-evaluates with rules).
+        // But only if the model tier supports get_rule (not available for ≤4B).
+        if (toolName === 'get_rule') {
+          if (!modelCaps.canGetRule) {
+            // Safety net: model shouldn't see get_rule, but if it somehow outputs it
+            this.logger.warn(`Model attempted get_rule but tier does not support it (≤4B) — ignoring`);
+            toolResults.push({
+              tool: '_system',
+              success: true,
+              output: `get_rule is not available for this model tier. Rules are already injected as needed by the system.`,
+              blocked: false,
+            });
+            updateThoughtsOnlyStreak();
+            continue;
+          }
+          const topic = (plan as any).topic || (plan as any).PARAM_TOPIC || '';
+          if (topic && RULE_PACK_NAMES.has(topic)) {
+            rulePacksToInject = [topic];
+            this.logger.log(`Model requested rule pack "${topic}" — injecting for next iteration`);
+          } else {
+            rulePacksToInject = ['tool_rules'];  // fallback
+            this.logger.warn(`Unknown rule pack "${topic}", injecting tool_rules`);
+          }
+          // Add a system-level result that triggers re-evaluation with the injected rules
+          toolResults.push({
+            tool: '_system',
+            success: true,
+            output: `Rule pack "${topic}" will be injected for re-evaluation. Continue planning with the new rules.`,
+            blocked: false,
+          });
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── Discovery: search_mcp handler ──
+        // Queries the MCP server's internal tool catalog by keyword.
+        if (toolName === 'search_mcp') {
+          const query = (plan as any).query || (plan as any).PARAM_QUERY || '';
+          if (!query) {
+            toolResults.push({
+              tool: '_system',
+              success: true,
+              output: 'No search query provided. Use PARAM_QUERY to describe what you\'re looking for (e.g. "github create issue").',
+              blocked: false,
+            });
+            updateThoughtsOnlyStreak();
+            continue;
+          }
+          try {
+            const res = await axios.post(`${MCP_SERVER_URL}/internal/tools/search`, { query, max_results: 10 }, { timeout: 5000 });
+            const data = res.data as { tools: Array<{ name: string; description: string; category: string }>; count: number };
+            if (!data.tools || data.tools.length === 0) {
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `No MCP tools found matching "${query}". Try a different query or use the built-in tools.`,
+                blocked: false,
+              });
+            } else {
+              const formatted = data.tools.map(t => `  • ${t.name} — ${t.description} (${t.category})`).join('\n');
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `Found ${data.count} MCP tool(s) matching "${query}":\n${formatted}\n\nUse these tools in subsequent tool plans.`,
+                blocked: false,
+              });
+            }
+          } catch (err: any) {
+            this.logger.warn(`search_mcp failed: ${err.message}`);
+            toolResults.push({
+              tool: '_system',
+              success: false,
+              output: `Failed to search MCP tools: ${err.message}. The MCP server may be unavailable.`,
+              blocked: false,
+            });
+          }
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
+        // ── Discovery: search_skills handler ──
+        // Queries the MCP server's internal skill catalog by goal/query.
+        if (toolName === 'search_skills') {
+          const query = (plan as any).query || (plan as any).PARAM_QUERY || '';
+          if (!query) {
+            toolResults.push({
+              tool: '_system',
+              success: true,
+              output: 'No search query provided. Use PARAM_QUERY to describe your goal (e.g. "facebook post", "debug nodejs").',
+              blocked: false,
+            });
+            updateThoughtsOnlyStreak();
+            continue;
+          }
+          try {
+            const res = await axios.post(`${MCP_SERVER_URL}/internal/skills/search`, { query, max_results: 10 }, { timeout: 5000 });
+            const data = res.data as { skills: Array<{ id: string; name: string; description: string; categories: string[] }>; count: number };
+            if (!data.skills || data.skills.length === 0) {
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `No skills found matching "${query}". Try a different query or proceed with general capabilities.`,
+                blocked: false,
+              });
+            } else {
+              const formatted = data.skills.map(s => `  • ${s.name} — ${s.description} [${s.categories.join(', ')}]`).join('\n');
+              toolResults.push({
+                tool: '_system',
+                success: true,
+                output: `Found ${data.count} skill(s) matching "${query}":\n${formatted}\n\nReview the relevant skill guidance and follow the recommended approach.`,
+                blocked: false,
+              });
+            }
+          } catch (err: any) {
+            this.logger.warn(`search_skills failed: ${err.message}`);
+            toolResults.push({
+              tool: '_system',
+              success: false,
+              output: `Failed to search skills: ${err.message}. The skill catalog may be unavailable.`,
+              blocked: false,
+            });
+          }
+          updateThoughtsOnlyStreak();
+          continue;
+        }
+
         const command = plan.command || '';
         const path = plan.path || '';
         const pattern = plan.pattern || '';
@@ -3312,6 +4067,8 @@ export class InteractionService {
                 'PARAM_KEYS: array of keys (for hotkey, e.g. ["command","c"])\n' +
                 'PARAM_DIRECTION: up|down (for scroll)\n' +
                 'PARAM_AMOUNT: scroll amount (default 3)',
+              search_mcp: 'PARAM_QUERY: <natural language query describing what tool you need, e.g. "github create issue">',
+              search_skills: 'PARAM_QUERY: <natural language query describing your goal, e.g. "debug nodejs" or "facebook post">',
             };
             const suggested = extractToolFromProse(toolName);
             const hintBlock = suggested
@@ -3410,7 +4167,8 @@ export class InteractionService {
         // otherwise the 2nd+ edit to the same file is wrongly blocked as "duplicate".
         const normCmd = (command || '').replace(/\s+/g, ' ').trim();
         const skipDuplicateCheck =
-          toolName === 'edit_file' || toolName === 'write_file' || toolName === 'apply_patch' || toolName === 'computer_action';
+          toolName === 'edit_file' || toolName === 'write_file' || toolName === 'apply_patch' || toolName === 'computer_action' ||
+          (plan as any)._forced_recovery === true;  // forced recovery calls are exempt
 
         // For read tools: skip duplicate check if the same path was edited since the last read.
         // Re-reading after an edit is mandatory (file content changed), not a duplicate.
@@ -3499,6 +4257,9 @@ export class InteractionService {
 
           if (priorSucceeded && CACHED_DUPLICATE_READ_TOOLS.has(toolName)) {
             consecutiveDuplicates++;
+            if (!hallucinationStartTime && consecutiveDuplicates >= 1) {
+              hallucinationStartTime = Date.now();
+            }
             this.logger.log(
               `Duplicate ${toolName} (same params) — returning cached output (${priorFullOutput.length} chars) [streak=${consecutiveDuplicates}]`,
             );
@@ -3542,6 +4303,9 @@ export class InteractionService {
           }
 
           consecutiveDuplicates++;
+          if (!hallucinationStartTime && consecutiveDuplicates >= 1) {
+            hallucinationStartTime = Date.now();
+          }
           this.logger.warn(
             `Duplicate tool call detected: ${toolName} ${path || pattern || command} — injecting redirect [streak=${consecutiveDuplicates}]`,
           );
@@ -3878,6 +4642,7 @@ export class InteractionService {
             interaction_id: interactionId, client_message_id: clientMessageId,
           });
           consecutiveDuplicates = 0;
+          hallucinationStartTime = null;
           consecutiveFailures = 0;
           updateThoughtsOnlyStreak();
           continue;
@@ -3934,6 +4699,7 @@ export class InteractionService {
             interaction_id: interactionId, client_message_id: clientMessageId,
           });
           consecutiveDuplicates = 0;
+          hallucinationStartTime = null;
           consecutiveFailures = 0;
           updateThoughtsOnlyStreak();
           continue;
@@ -4302,7 +5068,9 @@ export class InteractionService {
           }
 
           // Track consecutive failures and force teaching
-          consecutiveDuplicates = 0; // non-duplicate call executed — reset streak
+          consecutiveDuplicates = 0;
+          hallucinationStartTime = null;
+          // non-duplicate call executed — reset streak
           if (!result.success || result.blocked) {
             consecutiveFailures++;
           } else {
@@ -4476,6 +5244,7 @@ export class InteractionService {
               reasoning_graph: taskGraph,
               user_id: 'default',
               session_id: sessionId,
+              project_id: req.context?.project_id,
               walls: wallsHit.length > 0 ? wallsHit : undefined,
             }, undefined, { timeout: FAST_TIMEOUT_MS });
             const conclusion = obsRes.data.goal_met ? 'Goal met' : `Goal not met: ${obsRes.data.feedback || 'Continue working on the task.'}`;
@@ -4497,7 +5266,7 @@ export class InteractionService {
             try {
               const [memRes, rulesRefresh] = await Promise.all([
                 axiosWithRetry('get', `${MEMORY_URL}/internal/memory/query`, {
-                  params: { q: semanticStructure?.problem || req.user_message, limit: 5, session_id: sessionId },
+                  params: { q: semanticStructure?.problem || req.user_message, limit: 5, session_id: sessionId, project_id: req.context?.project_id },
                 }, undefined, { timeout: FAST_TIMEOUT_MS }),
                 axiosWithRetry('get', `${MEMORY_URL}/internal/memory/rules`, undefined, undefined, { timeout: FAST_TIMEOUT_MS, retries: 1 }),
               ]);
@@ -4539,7 +5308,7 @@ export class InteractionService {
             const sumRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/response/tool-summarize`, {
               user_message: req.user_message,
               tool_results: toolResults,
-            }, undefined, { timeout: LLM_TIMEOUT_MS });
+            }, undefined, { timeout: 0 });
             responseText = sumRes.data.response_text || 'Done.';
           } catch {
             responseText = toolResults.map((r, i) => `#${i + 1} [${r.tool}] ${r.success ? 'OK' : 'FAILED'}: ${(r.output || '').slice(0, 200)}`).join('\n');
@@ -4584,6 +5353,13 @@ export class InteractionService {
         this.logger.warn(`Observer validate failed: ${obsErr.message} — continuing`);
         observerFeedback = 'Observer unavailable. If you have exhausted options, explain to the user and give final_answer.';
       }
+
+      // Track the tool the model planned to execute (for JIT auto-injection on next iteration)
+      if (plan?.action === 'call_tool' && plan?.tool) {
+        lastPlannedTool = plan.tool;
+      } else {
+        lastPlannedTool = null;
+      }
     }
 
     // Max iterations or time limit reached — summarize what we have
@@ -4603,6 +5379,7 @@ export class InteractionService {
           reasoning_graph: taskGraph,
           user_id: 'default',
           session_id: sessionId,
+          project_id: req.context?.project_id,
           walls: wallsHit.length > 0 ? wallsHit : undefined,
         }, undefined, { timeout: FAST_TIMEOUT_MS });
       } catch {
@@ -4615,7 +5392,7 @@ export class InteractionService {
       const sumRes = await axiosWithRetry('post', `${RESPONSE_URL}/internal/response/tool-summarize`, {
         user_message: req.user_message,
         tool_results: toolResults,
-      }, undefined, { timeout: LLM_TIMEOUT_MS });
+      }, undefined, { timeout: 0 });
       responseText = sumRes.data.response_text || (maxDurationReached
         ? `I ran for ${sessionCfg.autonomous_max_duration_hours} hours (autonomous mode time limit).`
         : 'I ran several commands but reached the iteration limit.');
@@ -4670,7 +5447,7 @@ export class InteractionService {
     const teachRes = await axiosWithRetry('post', `${TEACHING_URL}/internal/teaching/validate`, {
       user_message: req.user_message,
       semantic_structure: semanticStructure,
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
+    }, undefined, { timeout: 0 });
     await this.events.publish('LlmCallCompleted', sessionId, {
       service: 'teaching-service',
       route: 'teaching',
@@ -4877,7 +5654,7 @@ export class InteractionService {
       assertion: pending.assertion || {},
       search_query: pending.search_query || '',
       prior_validation: pending.validation || null,
-    }, undefined, { timeout: LLM_TIMEOUT_MS });
+    }, undefined, { timeout: 0 });
     const assertion = teachRes.data.assertion;
     const searchQuery = teachRes.data.search_query || pending.search_query || '';
     const validation = teachRes.data.validation;
@@ -4975,6 +5752,7 @@ export class InteractionService {
     clientMessageId: string | undefined,
     toolResults?: any[],
     observerFeedback?: string | null,
+    signal?: AbortSignal,
   ): Promise<string> {
     let fullThoughts = '';
     const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
@@ -4991,16 +5769,32 @@ export class InteractionService {
           observer_feedback: observerFeedback,
         },
         responseType: 'stream',
-        timeout: LLM_TIMEOUT_MS,
+        // Use 0 = no wall-clock timeout for streaming. We add idle-timeout below.
+        timeout: 0,
+        signal,
       });
 
       const stream = response.data;
-      const MAX_THOUGHT_CHARS = 3000; // hard cap — thoughts should be concise
+      const MAX_THOUGHT_CHARS = 30_000; // increased — modern LLMs can output 10k+ reasoning chars
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // kill if no data for 5 min (slow 12B models)
       let aborted = false;
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+      const resetIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          this.logger.warn(`Thought stream idle for ${IDLE_TIMEOUT_MS}ms — aborting`);
+          aborted = true;
+          stream.destroy();
+        }, IDLE_TIMEOUT_MS);
+      };
 
       return new Promise((resolve) => {
         stream.on('data', (chunk: Buffer) => {
           if (aborted) return;
+          resetIdle(); // data arrived, reset idle timer
           const text = chunk.toString();
           fullThoughts += text;
 
@@ -5008,6 +5802,7 @@ export class InteractionService {
           if (fullThoughts.length > MAX_THOUGHT_CHARS) {
             this.logger.warn(`Thought stream exceeded ${MAX_THOUGHT_CHARS} chars — aborting (likely hallucination)`);
             fullThoughts = fullThoughts.slice(0, MAX_THOUGHT_CHARS) + '\n[Thoughts truncated — too long]';
+            if (idleTimer) clearTimeout(idleTimer);
             aborted = true;
             stream.destroy();
             return;
@@ -5019,9 +5814,9 @@ export class InteractionService {
             const earlier = fullThoughts.slice(0, fullThoughts.length - 200);
             if (earlier.includes(tail)) {
               this.logger.warn('Thought stream detected repetition — aborting');
-              // Trim to just before the repeated block
               const repeatStart = earlier.indexOf(tail);
               fullThoughts = fullThoughts.slice(0, repeatStart + 200) + '\n[Thoughts truncated — repetition detected]';
+              if (idleTimer) clearTimeout(idleTimer);
               aborted = true;
               stream.destroy();
               return;
@@ -5029,15 +5824,22 @@ export class InteractionService {
           }
 
           // Publish chunk for real-time UI animation
-          this.events.publish('ThoughtChunkGenerated', sessionId, {
+          this.events.publish('ThinkingChunkGenerated', sessionId, {
             chunk: text,
+            full_reasoning: fullThoughts,
             interaction_id: interactionId,
             client_message_id: clientMessageId,
           }).catch(err => this.logger.warn(`Failed to publish thought chunk: ${err.message}`));
         });
 
         stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.log(`Finished streaming thoughts (${fullThoughts.length} chars)`);
+          // NOTE: tool_call markers NOT stripped here — the caller (handleToolUse etc.)
+          // extracts them first via _extractToolCallsFromText, then strips them after.
+          if (!fullThoughts) {
+            fullThoughts = '(No thoughts produced by model)';
+          }
           // Final bulk event for reliability/persistence
           this.events.publish('ThoughtLayerGenerated', sessionId, {
             thoughts: fullThoughts,
@@ -5048,12 +5850,14 @@ export class InteractionService {
         });
 
         stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.error(`Thought stream error: ${err.message}`);
           resolve(fullThoughts);
         });
 
         // Also resolve on destroy (when we abort)
         stream.on('close', () => {
+          if (idleTimer) clearTimeout(idleTimer);
           if (aborted) resolve(fullThoughts);
         });
       });
@@ -5061,6 +5865,312 @@ export class InteractionService {
       this.logger.warn(`Streaming thoughts failed: ${err.message}`);
       return '';
     }
+  }
+
+  private async generateStreamingThoughtsStructured(
+    sessionId: string,
+    userMessage: string,
+    context: any,
+    chatHistory: any[],
+    interactionId: string,
+    clientMessageId: string | undefined,
+    initialToolResults?: any[],
+    observerFeedback?: string | null,
+    signal?: AbortSignal,
+  ): Promise<{ thoughts: string; toolCalls: number }> {
+    const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
+    const MAX_ITERATIONS = 5;
+    let fullThoughts = '';
+    let toolCallCount = 0;
+    let toolResults = initialToolResults || [];
+
+    for (let iter = 0; iter <= MAX_ITERATIONS; iter++) {
+      if (signal?.aborted) break;
+      const stream = await this._streamSingleThoughtRound(
+        sessionId, userMessage, context, chatHistory,
+        interactionId, clientMessageId, toolResults, observerFeedback,
+        responseUrl, fullThoughts, signal,
+      );
+      if (!stream) break; // stream failed
+
+      const { thoughts, toolCall } = stream;
+
+      // Accumulate reasoning
+      if (thoughts) {
+        // Only add if there's new content (avoid duplication)
+        if (!fullThoughts.endsWith(thoughts)) {
+          fullThoughts += (fullThoughts ? '\n' : '') + thoughts;
+        }
+      }
+
+      if (!toolCall) {
+        // No tool call — thinking is done
+        this.logger.log(`Finished structured streaming thoughts (${fullThoughts.length} chars, ${toolCallCount} tool calls)`);
+        this.events.publish('ThoughtLayerGenerated', sessionId, {
+          thoughts: fullThoughts,
+          interaction_id: interactionId,
+          client_message_id: clientMessageId,
+        }).catch(err => this.logger.warn(`Failed to publish full thoughts: ${err.message}`));
+        return { thoughts: fullThoughts, toolCalls: toolCallCount };
+      }
+
+      toolCallCount++;
+
+      // Execute the tool
+      const toolName = toolCall.function?.name;
+      let args: Record<string, any> = {};
+      try { args = JSON.parse(toolCall.function?.arguments || '{}'); } catch { /* ignore */ }
+
+      this.logger.log(`Thought-tool #${toolCallCount}: ${toolName}(${JSON.stringify(args).slice(0, 200)})`);
+
+      // Publish UI events
+      this.events.publish('ToolCallStarted', sessionId, {
+        tool: toolName, ...args,
+        reasoning: `[During reasoning] ${toolName}`,
+        iteration: -1,
+        interaction_id: interactionId,
+        client_message_id: clientMessageId,
+      }).catch(() => {});
+
+      let toolOutput = '';
+      let toolSuccess = false;
+      try {
+        const execResult = await this.executeToolCall(toolName, args, sessionId);
+        toolOutput = execResult.output?.toString() || '';
+        toolSuccess = execResult.success;
+      } catch (execErr: any) {
+        toolOutput = `Error: ${execErr.message}`;
+      }
+
+      this.logger.log(`Thought-tool result: ${toolName} success=${toolSuccess} (${(toolOutput || '').length} chars)`);
+
+      this.events.publish('ToolCallCompleted', sessionId, {
+        tool: toolName, ...args,
+        output: toolOutput.slice(0, 1000),
+        success: toolSuccess,
+        iteration: -1,
+        interaction_id: interactionId,
+        client_message_id: clientMessageId,
+      }).catch(() => {});
+
+      // Feed results back for the next round
+      toolResults = [
+        ...toolResults,
+        { tool: toolName, success: toolSuccess, output: toolOutput.slice(0, 5000) },
+      ];
+      // Continue loop → next API call with tool results
+    }
+
+    // Max iterations reached
+    this.logger.warn(`Structured thinking reached max ${MAX_ITERATIONS} iterations`);
+    return { thoughts: fullThoughts, toolCalls: toolCallCount };
+  }
+
+  /**
+   * Make a single streaming API call to /internal/thought/reason-stream-structured
+   * and return the accumulated reasoning plus any tool call found.
+   */
+  private async _streamSingleThoughtRound(
+    sessionId: string,
+    userMessage: string,
+    context: any,
+    chatHistory: any[],
+    interactionId: string,
+    clientMessageId: string | undefined,
+    toolResults: any[] | undefined,
+    observerFeedback: string | null | undefined,
+    responseUrl: string,
+    accumulatedThoughts: string, // running total from prior rounds
+    signal?: AbortSignal,
+  ): Promise<{ thoughts: string; toolCall: any } | null> {
+    try {
+      if (signal?.aborted) return null;
+      const response = await axios({
+        method: 'post',
+        url: `${responseUrl}/internal/thought/reason-stream-structured`,
+        data: {
+          user_message: userMessage,
+          context,
+          chat_history: chatHistory?.length > 0 ? chatHistory : undefined,
+          tool_results: toolResults,
+          observer_feedback: observerFeedback,
+        },
+        responseType: 'stream',
+        // No wall-clock timeout for streaming — idle timeout handled by caller
+        timeout: 0,
+        signal,
+      });
+
+      const stream = response.data;
+
+      return new Promise((resolve, reject) => {
+        let thoughts = '';
+        let toolCall: any = null;
+        let lineBuffer = '';
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // 5 min for slow models
+        let idleTimer: ReturnType<typeof setTimeout> | null = null;
+
+        const resetIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            stream.destroy();
+            resolve({ thoughts, toolCall });
+          }, IDLE_TIMEOUT_MS);
+        };
+
+        // Start idle timer immediately — if no data arrives, it fires and resolves
+        resetIdle();
+
+        const processLine = (line: string) => {
+          resetIdle();
+          try {
+            const item = JSON.parse(line);
+            if (item.type === 'tool_call') {
+              toolCall = item;
+              stream.destroy(); // stop reading — we'll handle it in the loop
+            } else if (item.type === 'done') {
+              thoughts = item.text || thoughts;
+              stream.destroy();
+            } else if (item.type === 'reasoning') {
+              thoughts += item.text;
+              const runningReasoning = accumulatedThoughts
+                ? accumulatedThoughts + '\n' + thoughts
+                : thoughts;
+              this.events.publish('ThinkingChunkGenerated', sessionId, {
+                chunk: item.text,
+                full_reasoning: runningReasoning,
+                interaction_id: interactionId,
+                client_message_id: clientMessageId,
+              }).catch(() => {});
+            } else if (item.type === 'content') {
+              thoughts += item.text;
+            }
+          } catch {
+            // skip invalid JSON
+          }
+        };
+
+        stream.on('data', (chunk: Buffer) => {
+          lineBuffer += chunk.toString();
+          const parts = lineBuffer.split('\n');
+          lineBuffer = parts.pop() || '';
+          for (const part of parts) {
+            const trimmed = part.trim();
+            if (trimmed) processLine(trimmed);
+          }
+        });
+
+        stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          const trimmed = lineBuffer.trim();
+          if (trimmed) processLine(trimmed);
+          resolve({ thoughts, toolCall });
+        });
+
+        stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
+          this.logger.warn(`Thought round stream error: ${err.message}`);
+          resolve({ thoughts, toolCall });
+        });
+
+        stream.on('close', () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          resolve({ thoughts, toolCall });
+        });
+      });
+    } catch (err: any) {
+      this.logger.warn(`Thought round failed: ${err.message}`);
+      return null;
+    }
+  }
+
+  /**
+   * Parse <|tool_call|> patterns from free-form thinking text (e.g. Gemma output).
+   * These models don't use native OpenAI API tool calls; they emit text markers like:
+   *   <|tool_call|>call:tools:grep_files{pattern:".*foo.*",recursive:true}<tool_call|>
+   * or older patterns like TOOL: read_file(/path).
+   */
+  private _extractToolCallsFromText(text: string): Array<{ tool: string; args: Record<string, any> }> {
+    const results: Array<{ tool: string; args: Record<string, any> }> = [];
+    if (!text) return results;
+
+    // Pattern 1: <|tool_call|>call:tools:tool_name{...json args...}<tool_call|>
+    const toolCallRe = /<\|tool_call\|>call:tools:(\w+)\{([^}]*)\}<tool_call\|>/g;
+    let m: RegExpExecArray | null;
+    while ((m = toolCallRe.exec(text)) !== null) {
+      const toolName = m[1];
+      let args: Record<string, any> = {};
+      try {
+        // Attempt to parse as JSON object literal (keys unquoted in Gemma output)
+        // e.g. {pattern:".*foo.*",recursive:true}
+        const raw = m[2].trim();
+        if (raw) {
+          // Wrap keys in quotes for JSON.parse and re-wrap with braces
+          const jsonStr = '{' + raw.replace(/(\w+):/g, '"$1":') + '}';
+          args = JSON.parse(jsonStr);
+        }
+      } catch {
+        // If parsing fails, use raw value as a single string arg
+        args = { value: m[2] };
+      }
+      results.push({ tool: toolName, args });
+    }
+
+    // Pattern 2: TOOL: read_file(path) or read_file(path)
+    if (results.length === 0) {
+      const simpleRe = /(?:TOOL:\s*)?(\w+)\(([^)]*)\)/g;
+      while ((m = simpleRe.exec(text)) !== null) {
+        results.push({ tool: m[1], args: { path: m[2].trim() } });
+      }
+    }
+
+    return results;
+  }
+
+  private async executeToolCall(
+    toolName: string,
+    args: Record<string, any>,
+    sessionId: string,
+  ): Promise<{ output: string; success: boolean }> {
+    // Determine routing
+    const isDevAgentTool = DEV_AGENT_TOOLS.has(toolName);
+    const targetUrl = isDevAgentTool
+      ? `${DEV_AGENT_URL}/internal/dev-agent/execute`
+      : `${TOOL_EXECUTOR_URL}/internal/tool/execute`;
+
+    const execPayload: Record<string, any> = { tool: toolName };
+
+    if (isDevAgentTool) {
+      const normalized = args.path ? normalizeDevAgentFilePath(args.path) || args.path : '';
+      execPayload.path = normalized ? repairAmbiguousDevPath(normalized) : undefined;
+      execPayload.content = args.content || undefined;
+      execPayload.old_string = args.old_string || undefined;
+      execPayload.new_string = args.new_string || undefined;
+      execPayload.patch = args.patch || undefined;
+      execPayload.command = args.command || undefined;
+      execPayload.name = args.name || undefined;
+      if (args.start_line != null) execPayload.start_line = args.start_line;
+      if (args.end_line != null) execPayload.end_line = args.end_line;
+    } else {
+      // Tool executor: read_file, list_dir, grep, find_files, browse_url
+      execPayload.path = args.path || undefined;
+      execPayload.pattern = args.pattern || undefined;
+      execPayload.recursive = args.recursive;
+      execPayload.start_line = args.start_line;
+      execPayload.end_line = args.end_line;
+      execPayload.url = args.url || undefined;
+      execPayload.query = args.query || undefined;
+      execPayload.limit = args.limit;
+    }
+
+    const response = await axiosWithRetry('post', targetUrl, execPayload, undefined, { timeout: LLM_TIMEOUT_MS });
+    const data = response.data;
+    return {
+      output: data.output ?? data.result ?? data.response_text ?? JSON.stringify(data),
+      success: data.success ?? true,
+    };
   }
 
   private async generateStreamingResponse(
@@ -5079,13 +6189,25 @@ export class InteractionService {
         url: `${responseUrl}${endpoint}`,
         data: payload,
         responseType: 'stream',
-        timeout: LLM_TIMEOUT_MS,
+        timeout: 0,
       });
 
       const stream = response.data;
-      
+
       return new Promise((resolve) => {
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // 5 min for slow models
+        let idleTimer: ReturnType<typeof setTimeout> | null = null;
+        const resetIdle = () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            try { stream.destroy(new Error(`stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
+          }, IDLE_TIMEOUT_MS);
+        };
+
         stream.on('data', (chunk: Buffer) => {
+          resetIdle();
           const text = chunk.toString();
           fullResponse += text;
           this.events.publish('ResponseChunkGenerated', sessionId, {
@@ -5097,11 +6219,13 @@ export class InteractionService {
         });
 
         stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.log(`Finished streaming response (${fullResponse.length} chars)`);
           resolve(fullResponse);
         });
 
         stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.error(`Response stream error: ${err.message}`);
           resolve(fullResponse);
         });
@@ -5112,7 +6236,105 @@ export class InteractionService {
     }
   }
 
-  /** Serialize debug metadata, truncating large observations. */
+  /**
+   * Same as generateStreamingResponse but reads NDJSON with "type" discrimination.
+   * - type="reasoning" → publishes ThinkingChunkGenerated (live thinking tokens for the frontend)
+   * - type="content"   → publishes ResponseChunkGenerated (visible response text)
+   * Falls back to plain-text mode if the response is not NDJSON (e.g. older endpoint).
+   */
+  private async generateStreamingResponseStructured(
+    sessionId: string,
+    interactionId: string,
+    clientMessageId: string | undefined,
+    payload: any,
+    endpoint: string, // '/internal/response/generate-stream-structured' or '/internal/response/chat-stream-structured'
+    signal?: AbortSignal,
+  ): Promise<string> {
+    let fullResponse = '';
+    let fullReasoning = '';
+    const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
+    try {
+      this.logger.log(`Starting structured streaming (${endpoint}) for session ${sessionId}`);
+      if (signal?.aborted) return '';
+      const response = await axios({
+        method: 'post',
+        url: `${responseUrl}${endpoint}`,
+        data: payload,
+        responseType: 'stream',
+        timeout: 0,
+        signal,
+      });
+
+      const stream = response.data;
+      const IDLE_TIMEOUT_MS = process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.THOUGHT_STREAM_IDLE_TIMEOUT_MS, 10)
+        : 300_000; // 5 min for slow models
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      const resetIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          try { stream.destroy(new Error(`structured-stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
+        }, IDLE_TIMEOUT_MS);
+      };
+
+      return new Promise((resolve) => {
+        stream.on('data', (chunk: Buffer) => {
+          resetIdle();
+          const raw = chunk.toString();
+          // NDJSON: each line is a JSON object
+          const lines = raw.split('\n').filter(Boolean);
+          for (const line of lines) {
+            try {
+              const item = JSON.parse(line);
+              if (item.type === 'reasoning') {
+                fullReasoning += item.text;
+                this.events.publish('ThinkingChunkGenerated', sessionId, {
+                  chunk: item.text,
+                  full_reasoning: fullReasoning,
+                  interaction_id: interactionId,
+                  client_message_id: clientMessageId,
+                }).catch(err => this.logger.warn(`Failed to publish thinking chunk: ${err.message}`));
+              } else if (item.type === 'content') {
+                fullResponse += item.text;
+                this.events.publish('ResponseChunkGenerated', sessionId, {
+                  chunk: item.text,
+                  interaction_id: interactionId,
+                  client_message_id: clientMessageId,
+                  full_text: fullResponse,
+                }).catch(err => this.logger.warn(`Failed to publish response chunk: ${err.message}`));
+              }
+            } catch {
+              // Not valid JSON — fall back to plain-text chunk (compatibility)
+              fullResponse += line;
+              this.events.publish('ResponseChunkGenerated', sessionId, {
+                chunk: line,
+                interaction_id: interactionId,
+                client_message_id: clientMessageId,
+                full_text: fullResponse,
+              }).catch(err => this.logger.warn(`Failed to publish response chunk: ${err.message}`));
+            }
+          }
+        });
+
+        stream.on('end', () => {
+          if (idleTimer) clearTimeout(idleTimer);
+          this.logger.log(`Finished structured streaming (response: ${fullResponse.length} chars, reasoning: ${fullReasoning.length} chars)`);
+          resolve(fullResponse);
+        });
+
+        stream.on('error', (err: any) => {
+          if (idleTimer) clearTimeout(idleTimer);
+          this.logger.error(`Structured streaming error: ${err.message}`);
+          resolve(fullResponse);
+        });
+      });
+    } catch (err: any) {
+      this.logger.warn(`Structured streaming failed: ${err.message}`);
+      return '';
+    }
+  }
+
+  /** Serialize for Langfuse / debug; truncates to avoid huge observations. */
   private truncateJsonForDebug(value: unknown, maxChars: number): string {
     try {
       const s = JSON.stringify(value);
@@ -5143,6 +6365,11 @@ export class InteractionService {
   ): Promise<any> {
     let fullJsonText = '';
     let lastReasoning = '';
+    // NDJSON accumulators (FC path)
+    let isNdjson = false;
+    let ndjsonPlan: any | null = null;
+    let ndjsonContent = '';
+    let ndjsonReasoning = '';
     const responseUrl = process.env.RESPONSE_URL || 'http://response-generator:8005';
 
     try {
@@ -5152,47 +6379,113 @@ export class InteractionService {
         url: `${responseUrl}/internal/response/tool-plan-stream`,
         data: payload,
         responseType: 'stream',
-        timeout: LLM_TIMEOUT_MS,
+        timeout: 0,
       });
 
       const stream = response.data;
+      const IDLE_TIMEOUT_MS = process.env.TOOL_PLAN_IDLE_TIMEOUT_MS
+        ? parseInt(process.env.TOOL_PLAN_IDLE_TIMEOUT_MS, 10)
+        : 300_000;  // 5 min — 12B model can be 2-3 min between chunks
+      let idleTimer: ReturnType<typeof setTimeout> | null = null;
+      let streamEnded = false;
 
       return new Promise((resolve) => {
+        // Start idle timer immediately to catch silent hangs where no data
+        // ever arrives (e.g. lmlink-connector drops before generating tokens).
+        idleTimer = setTimeout(() => {
+          if (!streamEnded) {
+            try { stream.destroy(new Error(`tool-plan-stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
+          }
+        }, IDLE_TIMEOUT_MS);
         stream.on('data', (chunk: Buffer) => {
+          if (idleTimer) clearTimeout(idleTimer);
+          idleTimer = setTimeout(() => {
+            if (!streamEnded) {
+              try { stream.destroy(new Error(`tool-plan-stream idle timeout (${IDLE_TIMEOUT_MS}ms)`)); } catch {}
+            }
+          }, IDLE_TIMEOUT_MS);
           const text = chunk.toString();
           fullJsonText += text;
 
-          // Prefer flat `REASONING:` line (tool-plan prompt); fall back to partial JSON "reasoning" string.
-          let currentReasoning = '';
-          const flatRe = /^\s*REASONING:\s*(.*)$/gim;
-          let fm: RegExpExecArray | null;
-          while ((fm = flatRe.exec(fullJsonText)) !== null) {
-            currentReasoning = (fm[1] ?? '').trimEnd();
-          }
-          if (!currentReasoning) {
-            const reasoningMatch = fullJsonText.match(/"reasoning":\s*"([^"]*)/);
-            if (reasoningMatch?.[1]) {
-              currentReasoning = reasoningMatch[1];
+          // Detect NDJSON mode from first data event
+          if (!isNdjson) {
+            const trimmed = text.trim();
+            if (trimmed.startsWith('{') && trimmed.endsWith('}')) {
+              try {
+                JSON.parse(trimmed);
+                isNdjson = true;
+              } catch {
+                isNdjson = false;
+              }
             }
           }
-          if (currentReasoning !== lastReasoning) {
-            const delta = currentReasoning.slice(lastReasoning.length);
-            if (delta) {
-              this.events
-                .publish('ToolReasoningChunkGenerated', sessionId, {
-                  chunk: delta,
-                  full_reasoning: currentReasoning,
-                  interaction_id: interactionId,
-                  client_message_id: clientMessageId,
-                  iteration,
-                })
-                .catch(err => this.logger.warn(`Failed to publish tool reasoning chunk: ${err.message}`));
-              lastReasoning = currentReasoning;
+
+          if (isNdjson) {
+            // ── NDJSON / FC mode: parse each line ──
+            const rawLines = text.split('\n');
+            for (let li = 0; li < rawLines.length - 1; li++) {
+              const line = rawLines[li].trim();
+              if (!line) continue;
+              try {
+                const item = JSON.parse(line);
+                if (item.type === 'reasoning') {
+                  ndjsonReasoning += item.text;
+                  if (item.text) {
+                    this.events
+                      .publish('ToolReasoningChunkGenerated', sessionId, {
+                        chunk: item.text,
+                        full_reasoning: ndjsonReasoning,
+                        interaction_id: interactionId,
+                        client_message_id: clientMessageId,
+                        iteration,
+                      })
+                      .catch(err => this.logger.warn(`Failed to publish tool reasoning chunk: ${err.message}`));
+                  }
+                  lastReasoning = ndjsonReasoning;
+                } else if (item.type === 'content') {
+                  ndjsonContent += item.text;
+                } else if (item.type === 'plan') {
+                  ndjsonPlan = item.plan;
+                }
+              } catch {
+                // skip unparseable lines (partial chunks)
+              }
+            }
+          } else {
+            // ── Flat-text (fallback): extract reasoning via regex ──
+            let currentReasoning = '';
+            const multiLineRe = /^\s*REASONING:\s*([\s\S]*?)(?=\n\s*(?:DECISION|ACTION|ANSWER|QUESTION|ANSWER_DIRECTLY|NEED_MORE_INFO|OPTIONS)\s*:|\n*$)/gim;
+            let mlMatch;
+            while ((mlMatch = multiLineRe.exec(fullJsonText)) !== null) {
+              currentReasoning = (mlMatch[1] ?? '').trimEnd();
+            }
+            if (!currentReasoning) {
+              const reasoningMatch = fullJsonText.match(/"reasoning":\s*"([^"]*)/);
+              if (reasoningMatch?.[1]) {
+                currentReasoning = reasoningMatch[1];
+              }
+            }
+            if (currentReasoning !== lastReasoning) {
+              const delta = currentReasoning.slice(lastReasoning.length);
+              if (delta) {
+                this.events
+                  .publish('ToolReasoningChunkGenerated', sessionId, {
+                    chunk: delta,
+                    full_reasoning: currentReasoning,
+                    interaction_id: interactionId,
+                    client_message_id: clientMessageId,
+                    iteration,
+                  })
+                  .catch(err => this.logger.warn(`Failed to publish tool reasoning chunk: ${err.message}`));
+                lastReasoning = currentReasoning;
+              }
             }
           }
         });
 
         stream.on('end', async () => {
+          streamEnded = true;
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.log(`Finished streaming tool-plan (${fullJsonText.length} chars)`);
 
           const spanInput: Record<string, unknown> = {
@@ -5222,9 +6515,7 @@ export class InteractionService {
           });
 
           const endToolPlanObs = (output: Record<string, unknown>) => {
-            if (!toolPlanObs) {
-              return;
-            }
+            if (!toolPlanObs) return;
             try {
               toolPlanObs.end({ output });
             } catch (traceErr: any) {
@@ -5232,6 +6523,21 @@ export class InteractionService {
             }
           };
 
+          // ═══ NDJSON fast path: plan was pre-parsed by the service ═══
+          if (ndjsonPlan) {
+            const out: Record<string, unknown> = {
+              raw_len: fullJsonText.length,
+              parse_path: 'ndjson-fc',
+              action: ndjsonPlan.action,
+              tool: ndjsonPlan.tool,
+              raw_preview: this.collapseWhitespacePreview(fullJsonText, 1200),
+            };
+            endToolPlanObs(out);
+            resolve(ndjsonPlan);
+            return;
+          }
+
+          // ═══ Flat-text fallback: parse the raw text ═══
           try {
             let result: any;
             let parsePath: string = 'parse-raw';
@@ -5307,8 +6613,6 @@ export class InteractionService {
                 ? { model_output_truncated: fullJsonText.slice(0, OASIS_DEBUG_TOOL_PLAN_MAX_CHARS) }
                 : {}),
             });
-            // Render the raw (non-parsable) tool-plan output in the thoughts UI so it
-            // doesn't feel like a silent failure.
             await this.events.publish('ThoughtChunkGenerated', sessionId, {
               chunk:
                 `⚠️ Tool-plan output not parsable. Rendering raw output as thought:\n` +
@@ -5318,7 +6622,6 @@ export class InteractionService {
               client_message_id: clientMessageId,
               iteration,
             }).catch(err => this.logger.warn(`Failed to publish thought chunk on parse failure: ${err.message}`));
-            // Non-fatal: keep the tool loop moving with a deterministic fallback tool call.
             const userMsg = typeof payload?.user_message === 'string' ? payload.user_message : String(payload?.user_message || '');
             const tokenMatch = userMsg.match(/[A-Za-z0-9_]{4,}/);
             const fallbackPattern = tokenMatch ? tokenMatch[0] : 'pattern';
@@ -5333,6 +6636,8 @@ export class InteractionService {
         });
 
         stream.on('error', (err: any) => {
+          streamEnded = true;
+          if (idleTimer) clearTimeout(idleTimer);
           this.logger.error(`Tool-plan stream error: ${err.message}`);
           try {
             trace
@@ -5346,6 +6651,7 @@ export class InteractionService {
           }
           resolve({ action: 'final_answer', answer: `Planning interrupted: ${err.message}` });
         });
+
       });
     } catch (err: any) {
       this.logger.warn(`Streaming tool-plan failed: ${err.message}`);

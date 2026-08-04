@@ -32,6 +32,7 @@ class StoreGraphRequest(BaseModel):
     user_id: str = "default"
     session_id: str | None = None  # thread/session for retrieval
     walls: list[str] | None = None  # wall/aha moments — paths that don't exist, patterns that found nothing
+    project_id: str | None = None  # project scope for retrieval
 
 
 class StoreNotAchievableRequest(BaseModel):
@@ -39,6 +40,7 @@ class StoreNotAchievableRequest(BaseModel):
     reason: str
     suggestion: str = ""
     session_id: str | None = None
+    project_id: str | None = None
     user_id: str = "default"
 
 
@@ -127,9 +129,10 @@ async def query_memory(
     q: str = Query(..., description="Search query"),
     limit: int = Query(10, ge=1, le=100),
     session_id: str | None = Query(None, description="Filter by session/thread"),
+    project_id: str | None = Query(None, description="Filter by project"),
     max_age_hours: float | None = Query(None, description="If set, entries older than this are flagged as stale"),
 ):
-    results = await memory.retrieve(q, limit=limit, session_id=session_id)
+    results = await memory.retrieve(q, limit=limit, session_id=session_id, project_id=project_id)
     max_h = max_age_hours if max_age_hours is not None else _settings.memory_max_age_hours
     now = datetime.now(timezone.utc)
     stale_count = 0
@@ -161,9 +164,10 @@ async def query_memory(
 async def query_nodes_by_tier(
     tier: str = Query(..., description="Graph tier: foundational or active"),
     session_id: str | None = Query(None, description="Filter by session"),
+    project_id: str | None = Query(None, description="Filter by project (resolved to sessions)"),
     limit: int = Query(50, ge=1, le=200),
 ):
-    nodes = await memory.retrieve_nodes_by_tier(tier, session_id=session_id, limit=limit)
+    nodes = await memory.retrieve_nodes_by_tier(tier, session_id=session_id, project_id=project_id, limit=limit)
     return {"tier": tier, "count": len(nodes), "nodes": nodes}
 
 
@@ -186,7 +190,7 @@ async def get_rules_graph():
 @app.post("/internal/memory/store")
 async def store_graph(req: StoreGraphRequest):
     graph = ReasoningGraph(**req.reasoning_graph)
-    await memory.store_graph(graph, req.user_id, session_id=req.session_id, walls=req.walls)
+    await memory.store_graph(graph, req.user_id, session_id=req.session_id, walls=req.walls, project_id=req.project_id)
     return {"status": "ok", "graph_id": graph.id}
 
 
@@ -197,6 +201,7 @@ async def store_not_achievable(req: StoreNotAchievableRequest):
         reason=req.reason,
         suggestion=req.suggestion,
         session_id=req.session_id,
+        project_id=req.project_id,
         user_id=req.user_id,
     )
     return {"status": "ok"}

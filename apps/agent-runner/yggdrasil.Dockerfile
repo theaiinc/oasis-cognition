@@ -3,9 +3,9 @@ FROM node:20-alpine
 WORKDIR /app
 
 # Install runtime deps + source (single stage — app is small)
-COPY package.json package-lock.json tsconfig.json ./
-COPY theaiinc-yggdrasil-0.2.3.tgz theaiinc-yggdrasil-ratatoskr-0.2.3.tgz ./
-RUN npm ci && npm cache clean --force
+COPY package.json tsconfig.json ./
+COPY theaiinc-yggdrasil-0.3.8.tgz theaiinc-yggdrasil-ratatoskr-0.3.8.tgz theaiinc-yggdrasil-runtime-0.3.8.tgz ./
+RUN npm install --no-package-lock && npm cache clean --force
 
 COPY src/ ./src/
 

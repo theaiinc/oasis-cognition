@@ -8,13 +8,14 @@
 
 import axios from 'axios';
 
-const GATEWAY_SELF = process.env.OASIS_GATEWAY_SELF_URL || 'http://localhost:8000';
-const API = `${GATEWAY_SELF}/api/v1/coordinator`;
+const OASIS_AGENT_URL = process.env.OASIS_AGENT_URL || 'http://oasis-agent:8020';
+const API = `${OASIS_AGENT_URL}/api/v1/coordinator`;
 
 export const NATIVE_COORDINATOR_TOOLS = new Set([
   'delegate_tasks',
   'delegate_job_status',
   'delegate_job_cancel',
+  'delegate_job_results',
 ]);
 
 export interface NativeCoordinatorPlan {
@@ -106,6 +107,31 @@ export async function dispatchNativeCoordinatorTool(
       return {
         success: d.ok,
         output: d.ok ? `Job ${jobId} cancelled.` : d.error || 'cancel failed',
+      };
+    }
+
+    case 'delegate_job_results': {
+      const jobId = (plan as any).job_id;
+      if (!jobId) return { success: false, output: 'job_id is required for delegate_job_results' };
+      const res = await axios.get(`${API}/jobs/${jobId}/results`, { timeout: 10_000 });
+      const d = res.data;
+      if (!d.ok) return { success: false, output: d.error || 'delegate_job_results failed' };
+      // Format results as a digest for the parent agent
+      const lines: string[] = [
+        `Job: ${d.job_id}`,
+        `Status: ${d.job_status}`,
+        `Tasks: ${d.tasks_completed} completed, ${d.tasks_failed} failed (${d.tasks_total} total)`,
+        '',
+      ];
+      for (const [taskId, result] of Object.entries(d.results) as [string, { status: string; final_message: string }][]) {
+        lines.push(`## Task: ${taskId}`);
+        lines.push(`Status: ${result.status}`);
+        lines.push(`Result: ${result.final_message.slice(0, 2000)}`);
+        lines.push('');
+      }
+      return {
+        success: true,
+        output: lines.join('\n'),
       };
     }
 

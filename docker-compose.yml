@@ -54,7 +54,7 @@ services:
       - "8001:8001"
     environment:
       - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
-      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:8b}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:4b}
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
@@ -177,11 +177,13 @@ services:
       - ./.oasis-context.md:/workspace/.oasis-context.md:ro
       - ${HOME:-/Users}:/host-home:ro
     environment:
+      - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-google/gemma-4-e2b}
       - OASIS_RESPONSE_LLM_PROVIDER=${OASIS_RESPONSE_LLM_PROVIDER:-ollama}
-      - OASIS_RESPONSE_LLM_MODEL=${OASIS_RESPONSE_LLM_MODEL:-qwen3:8b}
+      - OASIS_RESPONSE_LLM_MODEL=${OASIS_RESPONSE_LLM_MODEL:-qwen3:4b}
       - OASIS_TOOL_PLAN_LLM_PROVIDER=${OASIS_TOOL_PLAN_LLM_PROVIDER:-ollama}
-      # Default aligns with packages/shared_utils/config.py — pull: ollama pull qwen3:8b
-      - OASIS_TOOL_PLAN_LLM_MODEL=${OASIS_TOOL_PLAN_LLM_MODEL:-qwen3:8b}
+      # Default aligns with packages/shared_utils/config.py — pull: ollama pull qwen3:4b
+      - OASIS_TOOL_PLAN_LLM_MODEL=${OASIS_TOOL_PLAN_LLM_MODEL:-qwen3:4b}
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
@@ -192,6 +194,7 @@ services:
       - OASIS_LEYLINE_MODEL=${OASIS_LEYLINE_MODEL:-gpt-5.6-luna}
       - OASIS_LEYLINE_MAX_BUDGET_USD=${OASIS_LEYLINE_MAX_BUDGET_USD:-0}
       - OASIS_LEYLINE_DAILY_BUDGET_USD=${OASIS_LEYLINE_DAILY_BUDGET_USD:-0}
+      - OASIS_ROUTER_MODEL=${OASIS_ROUTER_MODEL:-}
       - OASIS_VISION_LLM_MODEL=${OASIS_VISION_LLM_MODEL:-}
       - OASIS_COMPUTER_USE_LLM_MODEL=${OASIS_COMPUTER_USE_LLM_MODEL:-}
       - OASIS_COMPUTER_USE_LLM_BASE_URL=${OASIS_COMPUTER_USE_LLM_BASE_URL:-}
@@ -216,7 +219,7 @@ services:
       - "8006:8006"
     environment:
       - OASIS_LLM_PROVIDER=${OASIS_LLM_PROVIDER:-ollama}
-      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:8b}
+      - OASIS_LLM_MODEL=${OASIS_LLM_MODEL:-qwen3:4b}
       - OASIS_LLM_MAX_TOKENS=${OASIS_LLM_MAX_TOKENS:-1024}
       - OASIS_OLLAMA_HOST=http://host.docker.internal:11434
       - OASIS_ANTHROPIC_API_KEY=${OASIS_ANTHROPIC_API_KEY:-}
@@ -303,6 +306,32 @@ services:
       retries: 5
       start_period: 30s
 
+  # Standalone coordinator, external agents, and Ratatoskr runner service
+  oasis-agent:
+    build:
+      context: .
+      dockerfile: apps/oasis-agent/Dockerfile
+    restart: unless-stopped
+    ports:
+      - "8022:8020"
+    environment:
+      - OASIS_AGENT_PORT=8020
+      - DEV_AGENT_URL=http://host.docker.internal:8008
+      - REDIS_URL=redis://redis:6379
+      - YGGDRASIL_URL=http://yggdrasil:3100
+      - YGGDRASIL_API_KEY=${YGGDRASIL_API_KEY:-}
+      - YGGDRASIL_MAX_CONCURRENCY=${YGGDRASIL_MAX_CONCURRENCY:-8}
+      - OASIS_MCP_SERVER_URL=http://mcp-server:8020
+    depends_on:
+      redis:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "node -e \"require('http').get('http://localhost:8020/health', r => process.exit(r.statusCode === 200 ? 0 : 1)).on('error', () => process.exit(1))\""]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 15s
+
   # NestJS API Gateway
   api-gateway:
     build:
@@ -331,6 +360,14 @@ services:
       - YGGDRASIL_URL=http://yggdrasil:3100
       - YGGDRASIL_API_KEY=${YGGDRASIL_API_KEY:-}
       - YGGDRASIL_MAX_CONCURRENCY=${YGGDRASIL_MAX_CONCURRENCY:-8}
+      - OASIS_AGENT_URL=http://oasis-agent:8020
+      # Model tier overrides for resolveTierModel
+      - OASIS_MODEL_2B=${OASIS_MODEL_2B:-google/gemma-4-e2b}
+      - OASIS_MODEL_4B=${OASIS_MODEL_4B:-google/gemma-4-e2b}
+      - OASIS_MODEL_12B=${OASIS_MODEL_12B:-google/gemma-4-12b}
+      - OASIS_ROUTER_MODEL=${OASIS_ROUTER_MODEL:-}
+      # LANGFUSE_* intentionally omitted pending a decision on whether to
+      # restore Langfuse observability (see langfuse.service.ts below).
       # Frequent NDJSON chunks during long tool_use so proxies don’t see an idle POST
       - OASIS_INTERACTION_KEEPALIVE_MS=${OASIS_INTERACTION_KEEPALIVE_MS:-12000}
       # Optional: set to 1 to also abort on res/socket stream "close" (can false-positive with NDJSON)
@@ -342,6 +379,16 @@ services:
       - OASIS_CONTEXT_WINDOW_TOOL_PLAN=${OASIS_CONTEXT_WINDOW_TOOL_PLAN:-131072}
       - OASIS_CODE_KNOWLEDGE_IN_TOOL_PLAN=${OASIS_CODE_KNOWLEDGE_IN_TOOL_PLAN:-true}
       - OASIS_CODE_KNOWLEDGE_TIMEOUT_MS=${OASIS_CODE_KNOWLEDGE_TIMEOUT_MS:-2500}
+      # Thought-layer timeout (ms) — bump for slow remote models or cold starts
+      - OASIS_THOUGHT_TIMEOUT_MS=${OASIS_THOUGHT_TIMEOUT_MS:-300000}
+      # Execution mode: reactive (act only), guided (think when stuck), deliberative (full reasoning)
+      - OASIS_EXECUTION_MODE=${OASIS_EXECUTION_MODE:-}
+      # Optional Janus health boundary; empty keeps the adapter disabled
+      - JANUS_BASE_URL=${JANUS_BASE_URL:-}
+      - JANUS_HEALTH_TIMEOUT_MS=${JANUS_HEALTH_TIMEOUT_MS:-2000}
+      # Optional Arcana Ash policy boundary; disabled unless explicitly enabled
+      - ARCANA_ENABLED=${ARCANA_ENABLED:-false}
+      - ARCANA_ASH_PATH=${ARCANA_ASH_PATH:-ash}
     depends_on:
       interpreter:
         condition: service_healthy
@@ -358,6 +405,8 @@ services:
       tool-executor:
         condition: service_healthy
       observer-service:
+        condition: service_healthy
+      oasis-agent:
         condition: service_healthy
       redis:
         condition: service_healthy

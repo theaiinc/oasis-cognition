@@ -27,6 +27,7 @@ export const COMPLEX_PIPELINE_STAGES: PipelineStage[] = [
   { key: 'GraphConstructed', label: 'Graph built', icon: GitBranch },
   { key: 'DecisionFinalized', label: 'Decision', icon: Sparkles },
   { key: 'ResponseGenerated', label: 'Generating', icon: MessageSquare },
+  { key: 'ThinkingChunkGenerated', label: 'Thinking', icon: Brain },
   { key: 'MemoryUpdated', label: 'Memory saved', icon: Database },
 ];
 

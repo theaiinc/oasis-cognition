@@ -2,8 +2,8 @@ import { useState, useEffect, useCallback } from 'react';
 import axios from 'axios';
 import { motion, AnimatePresence } from 'framer-motion';
 import {
-  X, FolderOpen, RefreshCw, Loader2, CheckCircle2,
-  HardDrive, Globe, RotateCcw,
+  X, FolderOpen, RefreshCw, Loader2,
+  RotateCcw,
   Trash2, FileText,
   ChevronDown, Plus, Edit2, Check, Mic,
   MessageSquare, Link2, Unlink,
@@ -709,114 +709,6 @@ export function SettingsPanel({
                   </div>
                 </div>
               )}
-
-              {/* ── Internal Agent LLM ─────────────────────────────── */}
-              {false && activeProjectId && (
-                <div className="pt-3 border-t border-slate-800">
-                  <h3 className="text-xs text-slate-400 font-medium mb-1">Internal Agent LLM</h3>
-                  <p className="text-[10px] text-slate-600 mb-3">Project-scoped settings. API keys are write-only.</p>
-                  <div className="flex flex-col gap-2.5">
-                    <select value={agentRoutingProvider} onChange={e => setAgentRoutingProvider(e.target.value as 'leyline' | 'direct')} className="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300" aria-label="Internal agent routing provider">
-                      <option value="leyline">Leyline (default routing)</option>
-                      <option value="direct">Direct provider</option>
-                    </select>
-                    {agentRoutingProvider === 'direct' ? (
-                      <select value={agentProvider} onChange={e => setAgentProvider(e.target.value)} className="w-full px-2.5 py-1.5 rounded bg-slate-900 border border-slate-700 text-xs text-slate-300" aria-label="Internal agent provider">
-                        <option value="">Default provider</option><option value="ollama">Ollama</option><option value="openai">OpenAI-compatible</option><option value="anthropic">Anthropic</option>
-                      </select>
-                    ) : null}
-                    {agentRoutingProvider === 'leyline' && (
-                      <>
-                        <Input className="text-xs h-8" placeholder="Leyline upstream provider (optional)" value={leylineProvider} onChange={e => setLeylineProvider(e.target.value)} aria-label="Leyline upstream provider" />
-                        <Input className="text-xs h-8" placeholder="Leyline upstream model (optional)" value={leylineModel} onChange={e => setLeylineModel(e.target.value)} aria-label="Leyline upstream model" />
-                      </>
-                    )}
-                    <Input className="text-xs h-8" placeholder="Model (e.g. qwen3:8b)" value={agentModel} onChange={e => setAgentModel(e.target.value)} aria-label="Internal agent model" />
-                    <Input className="text-xs h-8" placeholder="Router model (optional)" value={agentRouterModel} onChange={e => setAgentRouterModel(e.target.value)} aria-label="Internal agent router model" />
-                    {agentRoutingProvider === 'direct' && agentProvider === 'ollama' ? (
-                      <Input className="text-xs h-8" placeholder="Ollama host URL" value={agentOllamaHost} onChange={e => setAgentOllamaHost(e.target.value)} aria-label="Internal agent Ollama host" />
-                    ) : agentRoutingProvider === 'direct' ? (
-                      <Input className="text-xs h-8" placeholder="OpenAI-compatible base URL" value={agentBaseUrl} onChange={e => setAgentBaseUrl(e.target.value)} aria-label="Internal agent base URL" />
-                    ) : null}
-                    {agentRoutingProvider === 'direct' && agentProvider === 'anthropic' ? (
-                      <Input className="text-xs h-8" type="password" placeholder={agentAnthropicKeyConfigured ? 'Anthropic key configured (leave blank to keep)' : 'Anthropic API key'} value={agentAnthropicKey} onChange={e => setAgentAnthropicKey(e.target.value)} aria-label="Internal agent Anthropic API key" autoComplete="new-password" />
-                    ) : agentRoutingProvider === 'direct' && agentProvider !== 'ollama' && (
-                      <Input className="text-xs h-8" type="password" placeholder={agentApiKeyConfigured ? 'API key configured (leave blank to keep)' : 'API key (optional)'} value={agentApiKey} onChange={e => setAgentApiKey(e.target.value)} aria-label="Internal agent API key" autoComplete="new-password" />
-                    )}
-                    <div className="grid grid-cols-2 gap-2">
-                      <Input className="text-xs h-8" type="number" min="1" placeholder="Max output tokens" value={agentMaxTokens} onChange={e => setAgentMaxTokens(e.target.value)} aria-label="Internal agent max tokens" />
-                      <Input className="text-xs h-8" type="number" min="1" placeholder="Context window" value={agentContextWindow} onChange={e => setAgentContextWindow(e.target.value)} aria-label="Internal agent context window" />
-                    </div>
-                    <Input className="text-xs h-8" type="number" min="0" max="1" step="0.05" placeholder="Output reserve (0–1)" value={agentContextReserve} onChange={e => setAgentContextReserve(e.target.value)} aria-label="Internal agent context output reserve" />
-                    <div className="pt-2 border-t border-slate-800">
-                      <p className="text-[10px] text-slate-500 mb-2">Leyline routing (blank disables the gateway)</p>
-                      <Input className="text-xs h-8 mb-2" placeholder="Leyline base URL" value={leylineUrl} onChange={e => setLeylineUrl(e.target.value)} aria-label="Leyline base URL" />
-                      <div className="grid grid-cols-2 gap-2">
-                        <Input className="text-xs h-8" type="number" min="0" step="0.01" placeholder="Per-request USD" value={leylineMaxBudget} onChange={e => setLeylineMaxBudget(e.target.value)} aria-label="Leyline max budget" />
-                        <Input className="text-xs h-8" type="number" min="0" step="0.01" placeholder="Daily USD" value={leylineDailyBudget} onChange={e => setLeylineDailyBudget(e.target.value)} aria-label="Leyline daily budget" />
-                      </div>
-                    </div>
-                    <div className="flex items-center gap-2">
-                      <Button size="sm" onClick={handleSaveAgentSettings} disabled={agentSettingsSaving}>{agentSettingsSaving ? 'Saving…' : 'Save LLM settings'}</Button>
-                      {agentSettingsSaved && <span className="text-[10px] text-emerald-400">Saved</span>}
-                    </div>
-                  </div>
-                </div>
-              )}
-
-              {/* ── Code Index Config ───────────────────────────────── */}
-              <div className="pt-3 border-t border-slate-800">
-                <h3 className="text-xs text-slate-400 font-medium mb-3">Code Index</h3>
-                <div className="flex flex-col gap-3">
-                  <div>
-                    <label className="text-[10px] text-slate-500 font-medium mb-1 block">Source</label>
-                    <div className="flex gap-2">
-                      <button className={cn("flex-1 flex items-center justify-center gap-2 py-1.5 rounded-lg text-xs font-medium transition-all", projectType === 'local' ? "bg-blue-600/20 border border-blue-500/30 text-blue-400" : "bg-slate-800/50 border border-slate-700/50 text-slate-400 hover:text-slate-300")} onClick={() => setProjectType('local')}>
-                        <HardDrive className="w-3 h-3" /> Local
-                      </button>
-                      <button className={cn("flex-1 flex items-center justify-center gap-2 py-1.5 rounded-lg text-xs font-medium transition-all", projectType === 'git' ? "bg-blue-600/20 border border-blue-500/30 text-blue-400" : "bg-slate-800/50 border border-slate-700/50 text-slate-400 hover:text-slate-300")} onClick={() => setProjectType('git')}>
-                        <Globe className="w-3 h-3" /> Git
-                      </button>
-                    </div>
-                  </div>
-                  <div>
-                    <label className="text-[10px] text-slate-500 font-medium mb-1 block">{projectType === 'local' ? 'Project Path' : 'Local Clone Path'}</label>
-                    <input type="text" value={projectPath} onChange={e => setProjectPath(e.target.value)} placeholder="/Users/you/your-project" className="w-full px-3 py-1.5 rounded-lg bg-slate-900/80 border border-slate-700/50 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500/50" />
-                  </div>
-                  {projectType === 'git' && (
-                    <div>
-                      <label className="text-[10px] text-slate-500 font-medium mb-1 block">Git URL</label>
-                      <input type="text" value={gitUrl} onChange={e => setGitUrl(e.target.value)} placeholder="https://github.com/user/repo.git" className="w-full px-3 py-1.5 rounded-lg bg-slate-900/80 border border-slate-700/50 text-xs text-slate-200 placeholder:text-slate-600 focus:outline-none focus:ring-1 focus:ring-blue-500/50" />
-                    </div>
-                  )}
-                  <button onClick={projectConfig.configured ? handleReindex : handleConfigure} disabled={isIndexing || !projectPath.trim()} className={cn("w-full py-2 rounded-lg text-xs font-medium transition-all flex items-center justify-center gap-2", isIndexing ? "bg-slate-800 text-slate-400 cursor-wait" : "bg-blue-600 hover:bg-blue-500 text-white")}>
-                    {isIndexing ? (<><Loader2 className="w-3.5 h-3.5 animate-spin" />Indexing...</>) : projectConfig.configured ? (<><RefreshCw className="w-3.5 h-3.5" />Re-index</>) : (<><FolderOpen className="w-3.5 h-3.5" />Configure &amp; Index</>)}
-                  </button>
-                  {indexError && <p className="text-xs text-red-400">{indexError}</p>}
-                  {projectConfig.configured && (
-                    <div className="p-2.5 rounded-lg bg-slate-900/50 border border-slate-800">
-                      <div className="flex items-center gap-2 mb-1.5">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-green-400" />
-                        <span className="text-[11px] font-semibold text-slate-300">{projectConfig.project_name || 'Project'}</span>
-                      </div>
-                      <p className="text-[10px] text-slate-500 mb-1.5">{projectConfig.project_path}</p>
-                      {projectConfig.tech_stack && projectConfig.tech_stack.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mb-1.5">
-                          {projectConfig.tech_stack.map(t => (<span key={t} className="px-1.5 py-0.5 rounded bg-slate-800 text-[10px] text-slate-400">{t}</span>))}
-                        </div>
-                      )}
-                      {projectConfig.frameworks && projectConfig.frameworks.length > 0 && (
-                        <div className="flex flex-wrap gap-1 mb-1.5">
-                          {projectConfig.frameworks.map(f => (<span key={f} className="px-1.5 py-0.5 rounded bg-blue-900/30 text-[10px] text-blue-400">{f}</span>))}
-                        </div>
-                      )}
-                      {projectConfig.last_indexed && (
-                        <p className="text-[10px] text-slate-600">Last indexed: {new Date(projectConfig.last_indexed).toLocaleString()}</p>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
             </div>
           )}
 

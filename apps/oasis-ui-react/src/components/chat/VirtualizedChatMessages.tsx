@@ -1,4 +1,4 @@
-import { useRef, useEffect } from 'react';
+import { useRef, useEffect, useCallback } from 'react';
 import { useVirtualizer } from '@tanstack/react-virtual';
 import { ChatMessage } from './ChatMessage';
 import { timelineClientKeyForMessage } from '@/lib/utils';
@@ -13,6 +13,12 @@ interface VirtualizedChatMessagesProps {
   onEditResend: (text: string) => void;
   onResend: (text: string) => void;
   inputRef: React.RefObject<HTMLTextAreaElement | null>;
+  /** Called when the user scrolls near the top to load earlier history. */
+  loadMore?: () => void;
+  /** Whether more pages are available. */
+  hasMore?: boolean;
+  /** Whether a page load is in-flight. */
+  loadingMore?: boolean;
 }
 
 export function VirtualizedChatMessages({
@@ -24,14 +30,18 @@ export function VirtualizedChatMessages({
   onEditResend,
   onResend,
   inputRef,
+  loadMore,
+  hasMore = false,
+  loadingMore = false,
 }: VirtualizedChatMessagesProps) {
   const parentRef = useRef<HTMLDivElement>(null);
   const prevCountRef = useRef(messages.length);
+  const sentinelRef = useRef<HTMLDivElement>(null);
+  const loaderRef = useRef<HTMLDivElement>(null);
 
   const virtualizer = useVirtualizer({
     count: messages.length,
     getScrollElement: () => parentRef.current,
-    // Start with a generous estimate — dynamic measurement will correct it
     estimateSize: () => 120,
     overscan: 5,
   });
@@ -71,13 +81,49 @@ export function VirtualizedChatMessages({
     prevCountRef.current = messages.length;
   }, [messages.length, lastMsgContentLen, virtualizer]);
 
+  // IntersectionObserver for infinite scroll
+  // Watch both sentinel and loader elements — whichever hits the viewport first
+  useEffect(() => {
+    if (!loadMore || !hasMore || loadingMore) return;
+
+    const targets: Element[] = [];
+    if (sentinelRef.current) targets.push(sentinelRef.current);
+    if (loaderRef.current) targets.push(loaderRef.current);
+
+    if (targets.length === 0) return;
+
+    const observer = new IntersectionObserver(
+      (entries) => {
+        if (entries.some(e => e.isIntersecting) && hasMore && !loadingMore) {
+          loadMore();
+        }
+      },
+      { rootMargin: '300px 0px 0px 0px' },
+    );
+
+    targets.forEach(t => observer.observe(t));
+    return () => observer.disconnect();
+  }, [loadMore, hasMore, loadingMore]);
+
   const items = virtualizer.getVirtualItems();
 
   return (
-    <div
-      ref={parentRef}
-      style={{ height: '100%', overflow: 'auto' }}
-    >
+    <div ref={parentRef} style={{ height: '100%', overflow: 'auto' }}>
+      {/* Loading indicator (outside spacer so it's not absolutely-positioned) */}
+      {loadingMore && (
+        <div
+          ref={loaderRef}
+          className="flex items-center justify-center py-3 text-[11px] text-slate-500"
+        >
+          <span className="animate-pulse">Loading older messages...</span>
+        </div>
+      )}
+
+      {/* Sentinel element for IntersectionObserver (triggers load when visible) */}
+      {hasMore && !loadingMore && (
+        <div ref={sentinelRef} className="h-px" aria-hidden="true" />
+      )}
+
       <div
         style={{
           height: `${virtualizer.getTotalSize()}px`,

@@ -36,6 +36,27 @@ PROJECT_OVERRIDABLE_FIELDS: set[str] = {
     "context_summary",
     "tech_stack",
     "frameworks",
+    "llm_provider",
+    "llm_model",
+    "llm_max_tokens",
+    "openai_api_key",
+    "openai_base_url",
+    "anthropic_api_key",
+    "ollama_host",
+    "response_llm_provider",
+    "response_llm_model",
+    "tool_plan_llm_provider",
+    "tool_plan_llm_model",
+    "vision_llm_model",
+    "computer_use_llm_model",
+    "computer_use_llm_base_url",
+    "context_window",
+    "context_output_reserve",
+    "embedding_model",
+    "log_level",
+    "leyline_base_url",
+    "leyline_max_budget_usd",
+    "leyline_daily_budget_usd",
 }
 
 
@@ -61,16 +82,20 @@ class Settings(BaseSettings):
     openai_api_key: str = "lm-studio"
     openai_base_url: str = "http://localhost:1234/v1"
 
-    # Ollama (legacy, replaced by LM Studio)
+    # Ollama
     ollama_host: str = "http://localhost:11434"
+    # Alias for backward-compatibility (LLMClient reads ollama_host)
+    @property
+    def ollama_base_url(self) -> str:
+        return self.ollama_host
 
     # Response model (separate from interpreter model)
-    response_llm_provider: str = "openai"
-    response_llm_model: str = "google/gemma-4-26b-a4b-qat"
+    response_llm_provider: str = "ollama"
+    response_llm_model: str = "qwen3:4b"
 
     # Tool-plan model (separate for prompt-following / JSON reliability)
-    tool_plan_llm_provider: str = "openai"
-    tool_plan_llm_model: str = "google/gemma-4-26b-a4b-qat"
+    tool_plan_llm_provider: str = "ollama"
+    tool_plan_llm_model: str = "qwen3:4b"
 
     # Vision (screen-share / multimodal). OpenAI-compatible APIs: same base_url + key as text.
     # Empty: Ollama falls back to llava:13b in response-generator; OpenAI-compatible uses llm_model.
@@ -85,18 +110,36 @@ class Settings(BaseSettings):
     # Empty = uses the same base URL as the vision model.
     computer_use_llm_base_url: str = ""
 
-    # Leyline OpenAI-compatible gateway. Override for the deployed gateway;
-    # empty explicitly disables routing and preserves direct-provider behavior.
+    # Leyline proxy (https://github.com/theaiinc/leyline) — when routed, all LLM
+    # calls go through Leyline's OpenAI-compatible endpoint, which handles
+    # provider failover, model routing, load balancing, prompt compression, and
+    # cost-aware selection. Routing default is Leyline; "direct" (via
+    # llm_routing_provider above) explicitly pins llm_provider instead. An empty
+    # leyline_base_url also disables routing regardless of llm_routing_provider.
     leyline_base_url: str = DEFAULT_LEYLINE_BASE_URL
+    # Optional: pin Leyline to a specific downstream provider/model instead of
+    # letting it auto-select within budget.
     leyline_provider: str = ""
     leyline_model: str = ""
-    leyline_max_budget_usd: float = 0.0
-    leyline_daily_budget_usd: float = 0.0
+    # Budget constraints forwarded to Leyline for cost-aware model selection.
+    # 0 = no cap (Leyline uses its own default).
+    leyline_max_budget_usd: float = 0.0  # max cost per request
+    leyline_daily_budget_usd: float = 0.0  # max cost per rolling day
+
+    # Output token limits per model tier (0 = unlimited)
+    max_output_tokens_2b: int = 128
+    max_output_tokens_4b: int = 384
+    max_output_tokens_12b: int = 1024
 
     # Neo4j
     neo4j_uri: str = "bolt://localhost:7687"
     neo4j_user: str = "neo4j"
     neo4j_password: str = "oasis-cognition"
+    # Startup connection policy. Keep fallback detection bounded; container
+    # restart policy is responsible for retrying a permanently unavailable DB.
+    neo4j_connection_timeout_seconds: float = 2.0
+    neo4j_init_max_retries: int = 1
+    neo4j_retry_delay_seconds: float = 0.5
 
     # Redis
     redis_url: str = "redis://localhost:6379"

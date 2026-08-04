@@ -51,9 +51,8 @@ const sessions = new Map<string, ComputerUseSession & { visionGranted: boolean }
 let HOST_PLATFORM: 'darwin' | 'linux' | 'windows' = 'darwin'; // default to macOS
 (async () => {
   try {
-    const res = await axios.get(`${DEV_AGENT_URL}/health`, { timeout: 5000 });
-    const p = res.data?.platform || '';
-    if (p === 'darwin' || p === 'linux' || p === 'windows') HOST_PLATFORM = p;
+    const { platform } = await new (await import('./local-macos-runtime')).LocalMacOSRuntime(DEV_AGENT_URL).health();
+    if (platform === 'darwin' || platform === 'linux' || platform === 'windows') HOST_PLATFORM = platform;
   } catch { /* keep default */ }
 })();
 
@@ -76,9 +75,17 @@ function getAppNameFromLabel(label: string): string {
   return label;
 }
 
+import { Inject } from '@nestjs/common';
+import type { ComputerUseRuntime } from './computer-use-runtime.interface';
+import { ComputerUseRuntimeToken } from './computer-use-runtime.interface';
+
 @Controller('computer-use')
 export class ComputerUseController implements OnModuleInit {
   private readonly logger = new Logger(ComputerUseController.name);
+
+  constructor(
+    @Inject(ComputerUseRuntimeToken) private readonly runtime: ComputerUseRuntime,
+  ) {}
 
   /* ──────────────────────────── Durable memory ────────────────────────── */
 
@@ -334,15 +341,13 @@ export class ComputerUseController implements OnModuleInit {
     // path intact.
     if (!dto.share_info && !dto.capture_target && !(session as any)._native_app_mode) {
       try {
-        const healthRes = await axios.get(`${DEV_AGENT_URL}/health`, { timeout: 2000 });
-        if (healthRes.data?.chrome_bridge === true) {
+        const health = await this.runtime.health();
+        if (health && health.platform !== 'unknown') {
           (session as any)._browser_app = 'Google Chrome';
-          this.logger.log(`Session ${sessionId}: no share/capture target provided; Chrome Bridge is active → defaulting _browser_app to "Google Chrome" for native keyboard routing`);
+          this.logger.log(`Session ${sessionId}: no share/capture target provided; runtime healthy → defaulting _browser_app to "Google Chrome" for native keyboard routing`);
         }
       } catch {
-        // dev-agent unreachable — skip default silently; the session will still
-        // work for Chrome-Bridge-only actions and will surface a clearer error
-        // if native keyboard actions fail.
+        // dev-agent unreachable — skip default silently
       }
     }
 
@@ -3902,12 +3907,7 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
     if (!session) return;
 
     try {
-      const res = await axios.post(
-        `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-        { tool: 'computer_action', action: 'list_screens' },
-        { timeout: 10000 },
-      );
-      const screens = res.data?.screens || [];
+      const screens = await this.runtime.listScreens();
       const target = screens[screenIndex];
       if (target) {
         (session as any)._screen_region = {
@@ -4153,18 +4153,17 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
     if (sync) return sync;
     const session = sessions.get(sessionId);
     if (!session) return null;
-    // Last-resort: check if Chrome Bridge is connected right now. Session-create
-    // may have missed it (dev-agent unreachable for ~1s, or a race with the
-    // bridge reconnecting). We don't want a single flaky health probe to
-    // strand the session's keyboard routing for its entire lifetime.
     try {
-      const healthRes = await axios.get(`${DEV_AGENT_URL}/health`, { timeout: 1500 });
-      if (healthRes.data?.chrome_bridge === true) {
+      const health = await this.runtime.health();
+      if (health.platform === 'unknown') return null;
+      // Check if Chrome Bridge is connected
+      const screens = await this.runtime.listScreens();
+      if (screens.length > 0) {
         (session as any)._browser_app = 'Google Chrome';
-        this.logger.log(`resolveTargetAppAsync(${sessionId}): Chrome Bridge now active → caching _browser_app="Google Chrome"`);
+        this.logger.log(`resolveTargetAppAsync(${sessionId}): runtime healthy → caching _browser_app="Google Chrome"`);
         return 'Google Chrome';
       }
-    } catch { /* dev-agent unreachable — nothing we can do */ }
+    } catch { /* runtime unreachable */ }
     return null;
   }
 
@@ -4221,7 +4220,6 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
     const shareInfo = (session as any)?._share_info as { displaySurface: string; label: string; sourceWidth: number; sourceHeight: number } | undefined;
     const captureTarget = (session as any)?._capture_target as { mode: string; target?: string } | undefined;
 
-    // Determine the app to focus from share_info or capture_target
     let appName: string | null = null;
     let isFullScreen = false;
 
@@ -4238,14 +4236,10 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
         appName = captureTarget.target || null;
       }
     } else {
-      // No explicit share/capture — fall back to the session's browser_app
-      // (set at creation when Chrome Bridge is active).
       appName = (session as any)?._browser_app || null;
     }
 
     if (isFullScreen) {
-      // For multi-screen: return the screen region as bounds so coordinates
-      // are offset correctly (LLM sees only the target screen's image)
       const screenRegion = this.getScreenRegion(sessionId);
       if (screenRegion && (screenRegion.x !== 0 || screenRegion.y !== 0)) {
         this.logger.log(`Full screen mode — screen offset: (${screenRegion.x},${screenRegion.y}) ${screenRegion.width}x${screenRegion.height}`);
@@ -4262,27 +4256,17 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
 
     this.logger.log(`Focusing target app: "${appName}"`);
 
-    // Focus the window/app and get bounds in one flow
     try {
-      await axios.post(
-        `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-        { tool: 'computer_action', action: 'focus_window', text: appName },
-        { timeout: 5000 },
-      );
+      await this.runtime.focusWindow(appName);
     } catch (err: any) {
       this.logger.warn(`Failed to focus "${appName}": ${err.message}`);
     }
 
-    // Get bounds for coordinate offset
     try {
-      const boundsRes = await axios.post(
-        `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-        { tool: 'computer_action', action: 'get_window_bounds', text: appName },
-        { timeout: 5000 },
-      );
-      if (boundsRes.data?.bounds) {
-        this.logger.log(`Window bounds: ${JSON.stringify(boundsRes.data.bounds)}`);
-        return boundsRes.data.bounds;
+      const bounds = await this.runtime.getWindowBounds(appName);
+      if (bounds) {
+        this.logger.log(`Window bounds: ${JSON.stringify(bounds)}`);
+        return bounds;
       }
     } catch { /* use null — no offset */ }
 
@@ -4301,55 +4285,39 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
    */
   private async getScreenImage(sessionId: string): Promise<string | undefined> {
     const session = sessions.get(sessionId);
-    const captureTarget = (session as any)?._capture_target as { mode: string; target?: string } | undefined;
 
-    // 1. Primary: native screenshot via dev-agent (OasisScreenCapture.app)
+    // 1. Primary: native screenshot via runtime
     try {
-      // If targeting a specific window/app, focus it first then capture its region.
-      // Also focus _native_app_mode when set (from open_app) — otherwise any
-      // other app that pops to front between ticks hijacks the screenshot.
+      // If targeting a specific window/app, focus it first.
+      const captureTarget = (session as any)?._capture_target as { mode: string; target?: string } | undefined;
       const focusTarget =
         (captureTarget?.target && (captureTarget.mode === 'window' || captureTarget.mode === 'app'))
           ? captureTarget.target
           : ((session as any)?._native_app_mode || null);
       if (focusTarget) {
-        await axios.post(
-          `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-          { tool: 'computer_action', action: 'focus_window', text: focusTarget },
-          { timeout: 5000 },
-        ).catch(() => { /* best effort focus */ });
+        await this.runtime.focusWindow(focusTarget);
         await new Promise(r => setTimeout(r, 300));
       }
 
-      // For native app actions (open_app, click_screen), always capture ALL screens
-      // so the agent can see apps on any display. For browser actions, use the targeted screen.
       const screenRegion = this.getScreenRegion(sessionId);
-      const payload: Record<string, any> = { tool: 'computer_action', action: 'screenshot' };
       const lastAction = session?.plan?.[session.current_step]?.action?.toLowerCase() || '';
       const isNativeAction = ['open_app', 'click_screen', 'key_press'].includes(lastAction);
-      if (screenRegion && !isNativeAction) {
-        payload.screen_region = screenRegion;
-      }
-      // For native actions, capture full screen (all displays) to find the app
 
-      const res = await axios.post(
-        `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-        payload,
-        { timeout: ACTION_TIMEOUT_MS },
-      );
-      if (res.data?.screenshot) {
-        // Validate screenshot isn't blank/black (Screen Recording permission missing).
-        // A real 1024px screenshot is typically >20KB base64. A blank JPEG is <15KB.
-        const b64Len = res.data.screenshot.length;
-        if (b64Len > 20_000) {
-          this.logger.log(`Native screenshot captured (${b64Len} chars, target: ${captureTarget?.mode || 'full_screen'}${screenRegion ? ` screen@${screenRegion.x},${screenRegion.y}` : ''})`);
-          return res.data.screenshot;
-        }
-        this.logger.warn(`Native screenshot appears blank (${b64Len} chars) — Screen Recording permission may not be granted to OasisScreenCapture.app`);
+      const screenshot = await this.runtime.getScreenImage({
+        region: screenRegion && !isNativeAction ? screenRegion : undefined,
+        scale: 2,
+      });
+
+      if (screenshot) {
+        this.logger.log(
+          `Native screenshot captured (${screenshot.length} chars, target: ${captureTarget?.mode || 'full_screen'}${screenRegion ? ` screen@${screenRegion.x},${screenRegion.y}` : ''})`,
+        );
+        return screenshot;
       }
+      this.logger.warn(`Native screenshot appears blank — Screen Recording permission may not be granted to OasisScreenCapture.app`);
     } catch { /* native capture not available — fall through */ }
 
-    // 2. Fallback: browser screen-share frame (if the user opted into browser sharing)
+    // 2. Fallback: browser screen-share frame
     const frameAge = Date.now() - ((session as any)?._screen_frame_at || 0);
     if (session?.live_screenshot) {
       if (frameAge < 10000) {
@@ -4379,14 +4347,12 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
     if (sessionId) {
       const session = sessions.get(sessionId);
 
-      // Priority 1: target screen region (native capture of a specific screen)
       const screenRegion = (session as any)?._screen_region as { width: number; height: number } | undefined;
       if (screenRegion?.width && screenRegion.width > 0) {
         nativeWidth = screenRegion.width;
         this.logger.log(`Using screen_region.width=${nativeWidth} for coordinate scaling`);
       }
 
-      // Priority 2: browser share info
       if (nativeWidth === 1024) {
         const shareInfo = (session as any)?._share_info as { sourceWidth: number; sourceHeight: number } | undefined;
         if (shareInfo?.sourceWidth && shareInfo.sourceWidth > 0) {
@@ -4397,13 +4363,8 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
     }
     if (nativeWidth === 1024) {
       try {
-        const sizeRes = await axios.post(
-          `${DEV_AGENT_URL}/internal/dev-agent/execute`,
-          { tool: 'computer_action', action: 'get_screen_size' },
-          { timeout: 5000 },
-        );
-        const sizeMatch = sizeRes.data?.output?.match(/(\d+)x(\d+)/);
-        if (sizeMatch) nativeWidth = parseInt(sizeMatch[1], 10);
+        const size = await this.runtime.getScreenSize();
+        nativeWidth = size.width;
       } catch { /* use defaults */ }
     }
     const imageWidth = Math.min(nativeWidth, 1024);
@@ -4770,18 +4731,10 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
 
       const fetchPageText = async (): Promise<{ raw: string; pageContent: string; url: string } | null> => {
         try {
-          const pageRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`, {
-            tool: 'computer_action',
-            action: 'get_page_text',
-            text: workUrlHint,
-          }, { timeout: 15000 });
-          if (pageRes.data?.success && pageRes.data.output) {
-            const raw = pageRes.data.output as string;
-            const urlMatch = raw.match(/^URL:\s*(.+)$/m);
-            const url = urlMatch ? urlMatch[1].trim() : '';
-            const contentIdx = raw.indexOf('Page content:\n');
-            const pageContent = contentIdx >= 0 ? raw.slice(contentIdx + 'Page content:\n'.length).trim() : '';
-            return { raw, pageContent, url };
+          const pageResult = await this.runtime.getPageText({ tabHint: workUrlHint });
+          if (pageResult.text) {
+            const raw = `URL: ${pageResult.url || ''}\nTitle: ${pageResult.title || ''}\n\nPage content:\n${pageResult.text}`;
+            return { raw, pageContent: pageResult.text, url: pageResult.url || '' };
           }
         } catch (err: any) {
           this.logger.warn(`get_page_text failed: ${err.message}`);
@@ -4811,23 +4764,16 @@ READ THE SCREEN FIRST — always analyze what the UI is showing you:
         this.logger.log(`read_screen: got Chrome URL/title (${chromeContext.length} chars) but no JS content`);
       }
 
-      // Step 2: Native macOS Vision OCR via dev-agent (fast, accurate, no API calls)
-      // This runs locally using macOS Vision framework — no vendor lock-in.
+      // Step 2: Native macOS Vision OCR via runtime
       try {
         const screenRegion = this.getScreenRegion(sid);
-        const ocrPayload: Record<string, any> = { tool: 'computer_action', action: 'ocr_screenshot' };
-        if (screenRegion) ocrPayload.screen_region = screenRegion;
-        const ocrRes = await axios.post(`${DEV_AGENT_URL}/internal/dev-agent/execute`,
-          ocrPayload, { timeout: 30000 });
-        if (ocrRes.data?.success && ocrRes.data.output) {
-          const ocrText = ocrRes.data.output as string;
-          if (ocrText.length > 50) {
-            const fullOutput = chromeContext ? `${chromeContext}\n\nVisible text (OCR):\n${ocrText}` : ocrText;
-            this.logger.log(`read_screen via native OCR: ${ocrText.length} chars`);
-            // Update screenshot from OCR result if available
-            if (ocrRes.data.screenshot && session3) session3.live_screenshot = ocrRes.data.screenshot;
-            return { output: fullOutput, screenshot: ocrRes.data.screenshot || img };
-          }
+        const ocrResult = await this.runtime.ocrScreenshot({
+          region: screenRegion || undefined,
+        });
+        if (ocrResult.text && ocrResult.text.length > 50) {
+          const fullOutput = chromeContext ? `${chromeContext}\n\nVisible text (OCR):\n${ocrResult.text}` : ocrResult.text;
+          this.logger.log(`read_screen via native OCR: ${ocrResult.text.length} chars`);
+          return { output: fullOutput, screenshot: img };
         }
       } catch (err: any) {
         this.logger.warn(`Native OCR failed: ${err.message} — falling through`);

@@ -3,456 +3,14 @@
 This file is a running devlog/compass for Oasis Cognition agent work. Keep it updated with "aha" moments, interface contracts, and any conventions that are easy to forget.
 
 ### 2026-06-10 — Yggdrasil Agent Pool (combined controller + built-in runner)
-
-- **Core insight**: Yggdrasil IS the agent pool. The orchestration controller starts a built-in Ratatoskr runner in the same process. One container, one port, zero external dependencies.
-- **New file**: `apps/agent-runner/src/yggdrasil-pool.ts` — combined Express app that:
-  - Implements the full orchestration API (`/runners/register`, `/heartbeat`, `/runners/:id/tasks`, etc.)
-  - Self-registers a built-in runner with capabilities `['agent', 'llm', 'shell']`
-  - Polls its own runners Map for tasks assigned to the built-in runner
-  - Executes tasks in-process via a sub-agent think-act-execute loop with shell/file/web tools
-- **Architecture**:
-  ```
-  ┌─────────────┐   HTTP (dispatchTask, admission state)
-  │ api-gateway │◄──────────────────────────────────┐
-  │ (bridge)    │  GET /api/runners, POST /runners/ │
-  └─────────────┘  :id/tasks, PATCH /:id/tasks/:tid │
-       │                                              │
-       └──────────────────────────────────────────────┘
-                             │
-                    ┌────────▼────────────────┐
-                    │     yggdrasil-pool      │
-                    │  ┌──────────────────┐   │
-                    │  │ Orchestration    │   │
-                    │  │ controller       │   │
-                    │  └────────┬─────────┘   │
-                    │           │ self-register│
-                    │  ┌────────▼─────────┐   │
-                    │  │ Built-in         │   │
-                    │  │ Ratatoskr runner │   │
-                    │  │ (LLM sub-agent)  │   │
-                    │  └──────────────────┘   │
-                    └─────────────────────────┘
-  ```
-- **Flow**:
-  1. Gateway calls `YggdrasilBridgeService.dispatchTask()` → `POST /runners/:runnerId/tasks` on Yggdrasil
-  2. Yggdrasil stores the task in its runners Map with status `running`
-  3. The built-in runner's poll loop picks up the new task (if within `MAX_CONCURRENT_TASKS`)
-  4. Executes it in-process via sub-agent loop (LLM + tools)
-  5. Updates task status to `completed`/`failed` directly in the Map
-  6. Gateway's `waitForTask()` polls `GET /runners/:runnerId/tasks` until terminal
-- **Capability Presets** (`apps/agent-runner/src/presets/`): Each capability has a JSON preset describing OS deps, npm deps, env vars, task handler modules, and Dockerfile preparation steps. Built-in presets: `llm`, `web_search`, `shell`, `agent`, `code`. Capabilities ARE presets — `CAPABILITIES=agent` resolves to `agent` + `llm` + `shell` + `web_search` (transitive `dependsOn`). Unknown capability names pass through as raw strings. Presets also generate Dockerfiles via `generateDockerfile(combinePresets(...))`.
-  - `apps/agent-runner/src/presets/schema.ts` — types, combinePresets(), generateDockerfile()
-  - `apps/agent-runner/src/presets/builtins.ts` — 5 built-in presets
-  - When RATATOSKR_PRESETS is set, the runner registers with the union of all resolved preset names as its capabilities.
-- **Additional external runners**: `registry.ts` still works as a standalone Ratatoskr runner for external hosts. They register via `POST /runners/register` to the Yggdrasil controller, and the built-in poll loop in yggdrasil-pool.ts only picks up tasks for `BUILTIN_RUNNER_ID`.
-- **Key files**:
-  - `apps/agent-runner/src/yggdrasil-pool.ts` — combined controller + built-in runner (NEW)
-  - `apps/agent-runner/src/registry.ts` — external Ratatoskr runner (unchanged)
-  - `apps/api-gateway/src/coordinator/yggdrasil-bridge.service.ts` — HTTP client only, no built-in runner
-  - `apps/agent-runner/yggdrasil.Dockerfile` — updated for yggdrasil-pool.ts
-
-### 2026-06-04 — Parallel subagent coordinator (design + first phases)
-
-- **New feature**: Parallel subagent coordinator using `@theaiinc/yggdrasil` embedded in api-gateway for capacity/admission.
-- **Design doc**: `docs/design/parallel-subagent-coordinator.md` — covers admission formula, billing classes, approval policy, Yggdrasil env, and phased rollout.
-- **Phase 0**: Design doc published.
-- **Phase 1a**: Dev-agent `GET /internal/dev-agent/host-capacity` endpoint returns RAM, disk, CPU, GPU (nvidia-smi), NPU (Apple Silicon) snapshot. Added `psutil>=6.0.0` to dev-agent requirements.
-- **Phase 1b**: New `apps/api-gateway/src/coordinator/` module with `CoordinatorTypes` (CoordinatorJob, JobBudget, BillingClass, WorkerBackend), `HostCapacityService`, `JobUsageService`, `JobBudgetService`.
-- **Key contracts**:
-  - Admission formula (design doc): `parallel_allowed = min(plan.parallel_count, ygg.available_slots, floor(ram_free / ram_per_child), floor(disk_free / disk_per_child), gpu_slots, floor(budget_remaining / est_per_child))`
-  - Billing classes: `free_local`, `paid_api`, `subscription_external`, `uncertain`
-  - Approval policy: auto-approve only when `billing_class === free_local AND auto_approve_free_jobs === true`
-  - Yggdrasil embedded library (not separate compose service) in v1
-- **Phase 1b-c**: Extended `AgentProfileConfig` with `billing_class`/`resource_class`. Created `JobUsageService`, `JobBudgetService`, `HostCliBackend`. Extended `ExternalAgentSession` with `parent_job_id`/`task_id`.
-- **Phase 1d**: Added job auto-approve toggles (`auto_approve_free_jobs`, `auto_approve_paid_jobs`) and default USD cap to SettingsPanel (Budget tab).
-- **Phase 2**: Added `@theaiinc/yggdrasil@0.0.1` dependency. Created `YggdrasilBridgeService` wrapping AgentManager + LoadBalancer + OrchestrationConfig. `HostCliBackend` implements `WorkerBackend` interface (HostCliBackend first).
-- **Phase 3a-b**: `CoordinatorPreflightService` — admission formula, cost estimation via `pricing.ts`, approval decision. Planner contract extended via native coordinator tools (`delegate_tasks` accepts `parallel_groups` + `tasks`).
-- **Phase 3c**: `JobApprovalCard` (UI) — editable budget, approve/reject actions. REST endpoints: `POST /api/v1/coordinator/jobs`, `GET /:id`, `POST /:id/approve`, `POST /:id/cancel`, `GET /host-capacity`. `JobBudgetPill` component for header display.
-- **Phase 4**: `CoordinatorService` — `createJob` → preflight → persisting to Redis; `approveJob` → dispatch; `cancelJob` → kill children. Publish events: `CoordinatorPreflightReady`, `SubagentStarted`, `SubagentReport`, `JobCompleted`. `NATIVE_COORDINATOR_TOOLS` wired into interaction service tool loop (`delegate_tasks`, `delegate_job_status`, `delegate_job_cancel`).
-- **Key files**:
-  - `apps/api-gateway/src/coordinator/coordinator.module.ts` (registered in AppModule)
-  - `apps/api-gateway/src/interaction/native-coordinator-tools.ts`
-  - `apps/oasis-ui-react/src/components/chat/JobApprovalCard.tsx`
-  - `apps/oasis-ui-react/src/components/chat/JobBudgetPill.tsx`
-  - `apps/oasis-ui-react/src/components/panels/SettingsPanel.tsx` (auto-approve toggles)
-  - `apps/oasis-ui-react/src/App.tsx` (coordinator event handlers)
-  - `services/dev_agent/main.py` (host-capacity endpoint)
-
-### 2026-06-04 — Phase 5: Docker agent pool + workflow parallelism
-
-- **ContainerBackend**: New `WorkerBackend` implementation (`container-backend.ts`) that spawns each subagent in an ephemeral Docker container via dockerode. Uses dynamic import with stub fallback when Docker is unavailable. Supports `spawn`, `checkStatus`, `kill`, `estimateCost`. Configurable via env vars: `AGENT_POOL_IMAGE`, `AGENT_RAM_MB`, `AGENT_CPU_SHARES`, `DOCKER_SOCKET`, `COMPOSE_NETWORK`, `AGENT_CONTAINER_STARTUP_TIMEOUT_MS`.
-- **Compose profile**: `docker-compose.agent-pool.yml` — activates with `docker compose -f docker-compose.yml -f docker-compose.agent-pool.yml up -d`. Adds `agent-registry` (lightweight HTTP service that registers N Yggdrasil worker slots and spawns containers on demand) and `agent-runner` (build-only image anchor).
-- **Agent runner app**: `apps/agent-runner/` — Node/TS project with:
-  - `src/registry.ts` — Express server (port 8025) exposing `/health`, `/slots/register`, `/worker/:id/spawn`, `/worker/:id/kill`, `/containers`. Self-registers with gateway on startup.
-  - `src/runner.ts` — Container entrypoint that reads `OASIS_AGENT_GOAL`, executes the task, reports back via `POST /coordinator/jobs/:id/child-started` and `POST /coordinator/jobs/:id/child-report`.
-  - `Dockerfile` — Node 20 Alpine + Docker CLI.
-- **Dynamic backend switching**: `CoordinatorModule` exposes `WORKER_BACKEND` injection token. When `AGENT_POOL_ENABLED=true`, `ContainerBackend` is used; otherwise falls back to `HostCliBackend`. `CoordinatorService` injects `@Inject(WORKER_BACKEND)` for polymorphic dispatch.
-- **Gateway internal endpoints**: `POST /coordinator/jobs/:id/child-started` (called by container runner on launch), `POST /coordinator/jobs/:id/child-report` (called on completion), `POST /coordinator/internal/worker` (register one slot), `POST /coordinator/internal/worker/slots` (register N slots).
-- **Workflow engine parallel execution**: Rewrote `engine.ts` from sequential topo sort to round-based parallel execution. Each round discovers all ready nodes (dependencies satisfied), dispatches them via `Promise.allSettled`, re-evaluates the DAG after each round, and propagates `skipped` status downstream. Supports `maxConcurrency` option to cap parallelism. Compatible with existing callers (`workflows.service.ts` uses same `executeRun` signature).
-- **Key files**:
-  - `apps/api-gateway/src/coordinator/container-backend.ts`
-  - `apps/api-gateway/src/coordinator/coordinator.module.ts` (WORKER_BACKEND token)
-  - `docker-compose.agent-pool.yml`
-  - `apps/agent-runner/` (package.json, tsconfig.json, Dockerfile, src/registry.ts, src/runner.ts, .dockerignore)
-  - `apps/api-gateway/src/coordinator/coordinator.controller.ts` (internal endpoints)
-  - `apps/api-gateway/src/workflows/engine.ts` (parallel round-based execution)
-
-### 2026-06-04 — DeepSeek model support / provider-aware pricing
-
-- **Refactored pricing** (`pricing.ts`) to use composite `<provider>:<model>` keys. `pricingFor(model, provider)` and `estimateUsd(..., provider)` now accept an optional `provider` parameter. Resolution order: composite exact → composite prefix → bare exact → bare prefix → null.
-- **Added provider-aware pricing rows**: `deepseek:deepseek-v4-flash`, `llmapi:deepseek-v4-flash`, `anthropic:claude-sonnet-4-7`, `openai:gpt-4o`, `ollama:qwen3`, etc. Bare model names kept as fallbacks for backward compat.
-- **Added `last_provider`** to `SessionUsage` and `JobUsage` types, tracked alongside `last_model` and threaded through `recomputeUsd` so session costing uses the correct (provider, model) pricing.
-- **Threaded provider** from `interaction.service.ts` (reads `req.context.provider_override`, set by role resolution from `AgentProfileConfig.provider`) → `sessionUsage.addTurn(sessionId, model, provider, ...)`.
-- **Usage**: set `OASIS_OPENAI_BASE_URL=https://api.deepseek.com/v1` (or `https://api.llmapi.ai/v1`), `OASIS_OPENAI_API_KEY=sk-...`, and the model name `deepseek-v4-flash`. Pricing resolves to `deepseek:deepseek-v4-flash`. For LLM API markups, the key `llmapi:deepseek-v4-flash` is available via OASIS_MODEL_PRICING_JSON override.
-- **PricingService** (`pricing.service.ts`) replaces direct `pricing.ts` calls. It merges built-in defaults → `OASIS_MODEL_PRICING_JSON` env override → optional remote pricing API (`OASIS_PRICING_API_URL`) with periodic refresh (default 1h). `SessionUsageService` and `JobUsageService` inject it via DI. REST endpoint at `GET /api/v1/pricing` for inspection and `POST /api/v1/pricing/refresh` for manual re-fetch. `pricing.ts` retains only the type interfaces (`ModelPricing`, `UsdEstimate`).
-
-### 2026-04-08 — Chrome Bridge extension for computer-use
-
-- **Problem**: CU page text extraction relied on AppleScript JS injection into Chrome, which requires the hidden "Allow JavaScript from Apple Events" setting. Without it, `get_page_text` returned empty and CU fell back to macOS OCR (garbled, unreliable).
-- **Solution**: Manifest V3 Chrome extension (`extensions/oasis-chrome-bridge/`) connects to dev-agent via WebSocket (`ws://localhost:8008/ws/chrome-bridge`). Content script extracts DOM text, meta tags (e.g. GitHub `user-login`), element bounds. Background service worker routes commands. Falls back to AppleScript when extension isn't connected.
-- **Key files**: `services/dev_agent/chrome_bridge.py` (WS bridge singleton), `services/dev_agent/main.py` (`/ws/chrome-bridge` endpoint), `services/dev_agent/computer_use.py` (extension-first routing for `get_page_text`, `chrome_navigate`, `chrome_set_url`).
-- **Install**: Chrome → `chrome://extensions` → Developer mode → Load unpacked → `extensions/oasis-chrome-bridge`. Green "ON" badge = connected.
-- **UI**: Computer Use panel shows "Chrome Bridge connected" (green) or install instructions (amber warning).
-
-### 2026-04-08 — CU discovery token resolution
-
-- **Problem**: `__DISCOVERED_USERNAME__` tokens in plan step URLs were used literally when regex extraction failed on garbled OCR, causing 404 navigations and cascading failures.
-- **Fix (3 layers)**: (1) Guard in `executeSteps` detects unresolved tokens before executing, runs a discovery `read_screen`, and triggers plan revision if still unresolved. (2) LLM fallback in `replaceDiscoveryTokens` asks the model to extract usernames when regex fails. (3) Revision prompt includes discovered values and instructs LLM to use click-based navigation instead of `__DISCOVERED_*__` tokens when discovery fails.
-
-### 2026-04-08 — CU 2FA / verification detection
-
-- **Problem**: When sites redirect through 2FA (e.g. Facebook `two_step_verification`), the agent captured the transient auth URL and panicked into a revision loop.
-- **Fix**: (1) `read_screen` retries up to 3 times with 3s waits when it detects transient auth/redirect URLs (2FA, checkpoint, OAuth, SSO). (2) After any step completes, if the output matches verification patterns, the session **pauses** with a user-facing message ("Please complete verification in the browser, then resume"). User handles 2FA, clicks Resume, agent continues.
-
-### 2026-04-08 — Global emergency stop hotkey
-
-- **Problem**: The emergency pause hotkey (Cmd+Escape) only worked when the Oasis UI tab was focused (JS `keydown` listener). Useless when the CU agent is controlling another app.
-- **Fix**: `services/dev_agent/global_hotkey.py` uses `pynput.keyboard.GlobalHotKeys` to listen at the OS level in a daemon thread. Works regardless of which app is focused.
-- **Hotkey sync**: UI panel pushes hotkey changes to `POST /internal/dev-agent/cu-panic-key`. Dev-agent restarts the listener with the new combo. Supports all UI options: `meta+Escape`, `ctrl+Escape`, `meta+shift+Escape`, `meta+.`.
-- **Env override**: `OASIS_CU_PANIC_HOTKEY=meta+Escape` (UI format) sets the default.
-
-### 2026-04-08 — CU pre-plan web research
-
-- **Problem**: The CU planner generated plans from pure LLM general knowledge without consulting any documentation. For tasks like "close my Facebook page", it guessed UI steps that didn't match the actual Facebook interface, then falsely reported success.
-- **Fix**: Added a `researchGoal()` phase before plan generation. The CU controller asks the LLM to generate a search query, then calls the tool-executor's `web_search` tool (DuckDuckGo) to find step-by-step guides. Results are injected into the plan prompt as `WEB RESEARCH` context.
-- **Architecture**: Web search goes through `tool-executor` (port 8007) via `POST /internal/tool/execute` with `tool: "web_search"`. This keeps tool execution centralized — no search code in dev-agent or teaching-service.
-- **Flow**: Goal → LLM generates search query → tool-executor DuckDuckGo search → results injected into plan prompt + stored on session for revisions/goal-satisfaction checks.
-- **Stored on session**: `(session as any)._research` — reused in revision prompts so the LLM stays grounded in the same documentation across retries.
-
-### 2026-04-08 — Symlink consolidation
-
-- Removed Python package symlinks (`packages/event_types` → `event-types`, etc.). Renamed hyphenated directories to underscored names directly (`packages/shared_utils/`, `packages/event_types/`, `packages/reasoning_schema/`). Updated all 10 Dockerfiles.
-- Removed unused `apps/api_gateway` symlink and tracked `packages/ui-kit/node_modules` symlink.
-
-### 2026-04-08 — Dedicated CU LLM routing
-
-- `services/response_generator/service.py` creates a separate `LLMClient` for CU calls when `OASIS_COMPUTER_USE_LLM_MODEL` and `OASIS_COMPUTER_USE_LLM_BASE_URL` are set. Allows using a fast remote vision model (e.g. `qwen3-vl-flash` via llmapi.ai) for CU while keeping other LLM calls on the default provider.
-- `.env` vars: `OASIS_COMPUTER_USE_LLM_MODEL`, `OASIS_COMPUTER_USE_LLM_BASE_URL`. Docker-compose passes them to response-generator.
-
-### 2026-03-29 — Teaching-service Docker image goes stale (fixes "don't apply")
-
-- **Symptom**: Repo `services/teaching-service/service.py` is updated but behavior in Compose is unchanged; `docker logs` still show old validation patterns.
-- **Cause**: `docker-compose.yml` **does not mount** the service source into `teaching-service` — code is **baked at build time**. `docker compose ps` can show the container "Up 3 days" while `api-gateway` was recreated recently; only rebuilt images pick up Python changes.
-- **Fix**: After editing teaching-service: `docker compose build teaching-service && docker compose up -d teaching-service` (or `docker compose up -d --build teaching-service`).
-
-### 2026-03-29 — Teaching follow-ups ignored by validator (repeat clarifying questions)
-
-- **Symptom**: After the user answered "I meant X not Y," the teaching flow kept asking the same clarification (e.g. "never use mocks" read as universal testing advice vs scoped to product implementation).
-- **Cause (1)**: `continue_from_clarification()` merged the reply into `TeachingAssertion.supporting_context`, but `validate()` originally omitted it from the LLM prompt.
-- **Cause (2)**: Follow-up still re-ran **the same extracted assertion and search query**, so web hits stayed on "mocks in unit tests." `/internal/teaching/continue` also returned the **stale** assertion object, not a refined one.
-- **Cause (3)**: API gateway only wrote `teaching/pending` when `clarifying_questions.length > 0`. If the model cleared questions but left `contradictions` / low confidence, **pending was deleted** while the assistant still refused to store — the user's next message no longer hit `handleTeachingFollowup`.
-- **Fix**: `continue_from_clarification` re-**extracts** assertion + `search_query` from original + clarification; optional `_accept_after_scope_clarification` when the user clearly separates tests vs implementation; validator prompt heuristics for scoped claims and `preference`; gateway persists pending whenever **not** `readyToStore` (`validated`, `confidence ≥ 0.6`, **zero contradictions**).
-
-### 2026-03-29 — Interpreter history + second-person replies
-
-- **Problem**: Vague follow-ups ("pls fix") were easy to mis-route or answer without thread context; `chat_history.slice(-6)` could drop the gateway's `Conversation summary:` system row when the condensed window had more than six messages. Models also mirrored "User asked …" / "the user" in user-visible text.
-- **Fix**: `buildInterpreterChatHistory()` in `interaction.service.ts` keeps the latest summary system message plus up to six other turns. Interpreter uses `_merge_interpreter_chat_history()` with the same rule and an explicit prompt line about summaries. Response-generator `SYSTEM_PROMPT`, `CASUAL_SYSTEM_PROMPT`, and complex `format_response` / stream labels use **Message:** + instructions to reply in **second person** ("you") and to use the thread for vague messages.
-
-### 2026-03-22 — README + docs hub (architecture / guides)
-
-- **Root README** now summarizes architecture (Mermaid), ports, quick start (`make up`, Ollama, dev-agent, optional code-indexer), API entry `POST /api/v1/interaction`, and "what stands out."
-- **`docs/README.md`** indexes curated docs; **`docs/architecture/overview.md`** = operational architecture + port table; **`docs/guides/getting-started.md`** = setup; **`docs/guides/what-makes-oasis-different.md`** = product/technical differentiators. Cross-links to **SAD.md** and **code-indexing-service-design.md**. **Makefile** primary targets are `make up` / `make down` (not `dev-up`).
-
-### 2026-03-22 — Code knowledge graph (Tree-sitter + Neo4j)
-
-- **`services/code_indexer`**: Indexes TS/TSX/JS/JSX under `OASIS_WORKSPACE_PATH` (default `/workspace`) into Neo4j labels **`CodeFile`**, **`CodeSymbol`**, **`CodeModule`**. Uses **`tree-sitter` + `tree-sitter-typescript`** (TS vs TSX grammars). Port **`8010`** (not 8009 — that is observer-service).
-- **Compose**: `code-indexer` service; enable background indexing with `OASIS_CODE_INDEXER_INDEX_ON_START=true`; optional **`OASIS_CODE_INDEXER_WATCH=true`** for debounced re-index on file changes.
-- **Memory API** (same Neo4j): `GET /internal/memory/code/symbols?q=…`, `/code/references?symbol_id=…`, `/code/hierarchy?root=…`, `/code/imports?path=…` — for agents/UI to resolve symbols without grep-first spirals.
-- **API Gateway → tool plan**: Before the tool loop, the gateway calls **`/internal/memory/code/symbols`** (up to 3 queries derived from the user message + `semantic_structure`) and appends a **`[CODE INDEX (Neo4j)]`** block to **`knowledge_summary`** for every tool-plan hop. Opt out with **`OASIS_CODE_KNOWLEDGE_IN_TOOL_PLAN=false`**. Timeout: **`OASIS_CODE_KNOWLEDGE_TIMEOUT_MS`** (default 2500).
-- **Package imports**: run as `uvicorn services.code_indexer.main:app` with **`PYTHONPATH=/app`**; use **`services.code_indexer.*`** imports inside the package.
-
-### 2026-03-22 — Heuristic tool-plan repair (LLM) before failed tool use
-
-- **`parse_tool_plan_raw`**: If the streamed plan is **unparseable** (`ValueError`), one **`_tool_plan_llm`** pass (`TOOL_PLAN_HEURISTIC_REPAIR_PROMPT`) rewrites output into flat `REASONING:` / `DECISION:` / `ACTION:` / `PARAM_*:` lines, then parse runs again.
-- If parse succeeds but **`_retry_hint`** + **`final_answer`** with **`[INTERNAL:`** (invalid tool, missing params, invalid DECISION, etc.), the same repair runs once using the internal error text as context.
-- **Gateway** unchanged: still calls `tool-plan/parse-raw`; fewer 422s and fewer `validation_error` tool rows from bad primary output.
-
-### 2026-03-22 — apply_patch (unified diff) + forgiving paths
-
-- **apply_patch** dev-agent tool: applies a **unified diff** in the worktree via `git apply`, trying `--whitespace=nowarn` → `--ignore-space-change` → `--ignore-whitespace` for lenient matching. Strips optional \`\`\`diff fences; rejects `..` and absolute paths in `---`/`+++` lines. Gateway / response-generator / logic-engine treat it like other code mutations.
-- **Forgiving paths**: dev-agent **write_file**, **edit_file**, **read_worktree_file** normalize repo-relative paths (strip `/workspace/`, `./`, leading `/`, trailing lone `.`).
-- **Aliases**: `patch`, `unified_diff` → **apply_patch** (no longer folded into **edit_file**). Planner prompt prefers **apply_patch** over **edit_file** for non-trivial edits.
-
-### 2026-03-21 — edit_file / write_file "fails on last iteration" (empty string dropped)
-
-- **Symptom**: Final cleanup edits (e.g. removing a line) failed with missing params or dev-agent "Missing … new_string".
-- **Cause**: Gateway used `plan.new_string || undefined` (same for `content` / `old_string`). Falsy **`""`** was omitted from the JSON body → FastAPI saw `new_string=None`. Response-generator used `not plan.get("new_string")`, so **`""`** was treated as missing.
-- **Fix**: Gateway `??` for `content` / `old_string` / `new_string`. Response-generator: require `new_string` with **`is None`** only; `write_file` content same. Dev-agent `edit_file`: normalize CRLF/LF on `old_string` / `new_string` before matching.
-
-### 2026-03-21 — Plan + free-thought churn during exploration
-
-- **Symptom**: Upfront plan and free-thought layer revised almost every tool hop even when exploration was healthy.
-- **Causes**: (1) Logic engine set `revise_plan` after **2** read-only actions on implementation-shaped goals (`only_read_tools && total_actions >= 2`), and again at **6** without code changes — observer replan fired often. (2) Gateway treated **any** non-empty `observer_feedback` as a reason to rerun **thought/generate**, **generateStreamingThoughts**, and **decision**; routine feedback always includes long "goal not met" + step-progress text.
-- **Fix**: Logic engine — single threshold **`total_actions >= 12`** with **`not has_code_changes`** (plus `advisory_blocked`). Gateway — `feedbackWarrantsReasoningRefresh()` gates mid-loop refresh; thought graph nodes only when `iteration === 0` or that gate is true.
-
-### 2026-03-21 — "edit_file failed" from duplicate detection (path-only signature)
-
-- **Symptom**: Logs showed `Duplicate tool call detected: edit_file …path… — injecting redirect` on the **second and later** edits to the **same file** in one session.
-- **Cause**: Duplicate-call detection compared `tool + path + command + …` but **not** `old_string` / `new_string`, so every new patch to `CodeBlock.tsx` matched the first `edit_file` and was blocked with `success: false` before dev-agent ran.
-- **Fix** (`interaction.service.ts`): **Skip** duplicate interception for `edit_file` and `write_file` (multiple distinct patches per file are normal).
-
-### 2026-03-21 — edit_file / read_file ergonomics
-
-- **edit_file validation**: Response-generator no longer requires `worktree_id` in the parsed plan for `edit_file` / `write_file` / `read_worktree_file` — gateway already coalesces from `create_worktree`. Paths sent to dev-agent strip a trailing lone `.`; dev-agent resolves missing extensions (e.g. `CodeBlock` → `CodeBlock.tsx`) for **read_worktree_file** and **edit_file**.
-- **Duplicate read_file / read_worktree_file**: Gateway returns **success** with **full cached output** from the earlier identical call (plus a short `[Cached: …]` tag) instead of a failed duplicate block.
-- **ActivityStream timeline**: Thought layer chunks render **in order** with other events (no deferred sticky block at the bottom).
-
-### 2026-03-21 — Thought layer: height + scroll noise
-
-- **Symptom**: Thought layer pinned at the bottom of the activity stream; duplicate `ThoughtLayerGenerated` events rescrolled even when text unchanged; tall prose hid tool cards above.
-- **Fix** (`apps/oasis-ui-react`): `computeThoughtStreamRevision()` (`lib/thoughtStreamRevision.ts`) bumps only on chunk growth or **last** layer body length/hash — not raw layer event count. `ToolCallsScrollContainer` thought `useLayoutEffect` respects **`userScrolledUp`**. `ActivityStream` thought-layer + long validated quotes use **~3-line** `max-h-[3.4rem]` with **Show full / Show less** (`LayerExpandToggle`).
-
-### 2026-03-21 — Plan checkboxes vs "Install library" steps
-
-- **Symptom**: Step "Install the chosen syntax highlighting library" showed checked even though no `npm`/`pip`/`edit_file` on `package.json` ran.
-- **UI cause**: `PlanCard` treated step *i* as done when `successfulCount > i` (any N successful tools), so three `grep`/`read_file` calls checked off the first three plan lines regardless of meaning.
-- **Fix (UI)**: Prefer `step_statuses` from the latest `TaskGraphUpdated` → `task_graph` → last `CompletionNode.attributes.step_statuses`. Else match `ToolCallCompleted` rows by **`step_index === i`**. Legacy `successfulCount` fallback only if completions lack `step_index`.
-- **Fix (logic engine)**: `_INSTALL_STEP_RE` + require **`bash` / `edit_file` / `write_file`** for install/dependency/package.json wording; if the plan wrongly assigns `read_file` to such a step, **do not** treat read-only tools as satisfying it.
-
-### 2026-03-21 — Autonomous tool_use: read loops vs edit_file
-
-- **Symptom**: In autonomous mode with fix/implement intent, the agent kept calling `read_file` / `grep` every iteration and rarely reached `create_worktree` / `edit_file` / `write_file`.
-- **Cause**: `updateExplorationStateFromToolResult` treated every **expanding** `read_file` as success that **reset** `explorationState.stagnation` to 0, so `buildExplorationEscalationGuidance` almost never hit `[IMPLEMENTATION: STOP EXPLORING]`.
-- **Fix** (`apps/api-gateway/src/interaction/interaction.service.ts`): For `toolUseNeedsImplementationEscalation` (intent `fix` / `implement`), expanding results from `read_file`, `grep`, `list_dir`, `find_files`, `browse_url` **increment** stagnation instead of resetting. **Autonomous** extras: observer line after **5+** successful explore-only tools; **override plan** to `create_worktree` after **12+** if the model still chose an exploration tool.
-
-- **Follow-up ("same" behavior)**: (1) Interpreter often labels autonomous goals **`explore`**, not `fix`/`implement`, so escalation never ran. **Autonomous** now escalates unless intent is `greet` or `teach`. (2) `hasSuccessfulImplementationProgress` became true after **`create_worktree`**, so autonomous nudges and `buildExplorationEscalationGuidance` stopped — the model could read forever **after** a worktree. Escalation and stagnation now treat **success** as **`edit_file` / `write_file`**; separate nudge **`[AUTONOMOUS — EDIT NOW]`** after **2+** read-only tools following the last successful worktree. Thresholds: nudge from **3** explores, force worktree from **7**.
-
-### 2026-03-21 — Thought layer UI: pin streaming card + collapsed validated thought
-
-- **Symptom**: `ThoughtChunkGenerated` events interleaved with tool cards left the Thought Layer block in the middle of `ActivityStream`; inner scroll pinned to bottom but the growing card was off-screen. Collapsed **Agent Thoughts** (`ThoughtsValidated`) showed the **first** thought instead of the latest.
-- **Fix** (`apps/oasis-ui-react`): **`ActivityStream`** aggregates chunk/layer text but **renders deferred `interaction_id` groups after** all inline tool / validated rows so the streaming card stays at the bottom of the scroll container. **`ThoughtsDisplay`** + **`ActivityStream`** use **`thoughts.slice(-1)`** when collapsed. **`App.tsx`** adds **`activeThoughtStreamRevision`** to the main viewport auto-scroll deps so chunk **character** growth still scrolls when near bottom.
-
-### 2026-03-16 — Aha: screen context was dropped at interpreter boundary
-
-- **Symptom**: LiveKit screen share frames were flowing, and the voice agent was already attaching `context.screen_content`, but routing/extraction did not change.
-- **Root cause**: `apps/api-gateway/src/interaction/interaction.service.ts` called the interpreter with only `{ text }` and **did not forward** `req.context`.
-- **Fix**: Interpreter requests now accept `context` and the interpreter prompt prepends `EXTERNAL_CONTEXT` so the LLM can use screen OCR / UI state during route classification + entity extraction.
-
-### Screen context contract
-
-- **Where it originates**: `services/voice-agent/main.py` OCRs screen-share frames and sends them as `context.screen_content` in the `/api/v1/interaction` request payload.
-- **Where it must be forwarded**:
-  - API Gateway → Interpreter: `POST /internal/interpret` must include `context`.
-  - Interpreter → LLM: prompt must include external context to influence `route`, `entities`, and `context` output.
-
-### 2026-03-16 — Teaching completion: multi-turn pending state
-
-- **Problem**: Teaching often returns clarifying questions; without session state, the next user message starts a new teaching extraction instead of continuing the same validation.
-- **Fix**: Store a **pending teaching** state keyed by `session_id` in `memory-service` and have the API gateway **auto-resume** teaching when a pending state exists.
-- **New endpoints**:
-  - `GET /internal/memory/teaching/pending?session_id=...`
-  - `POST /internal/memory/teaching/pending`
-  - `DELETE /internal/memory/teaching/pending?session_id=...`
-  - `POST /internal/teaching/continue` (re-validates after user clarification)
-
-### 2026-03-16 — UX: queue messages while reasoning
-
-- **Problem**: UI blocked sending while `isThinking`, causing users to wait and disrupting flow; also a new `session_id` per text message breaks multi-turn flows.
-- **Fix**: `apps/oasis-ui-react/src/App.tsx` now keeps a **stable** `textSessionId` and queues typed messages while reasoning; queued messages auto-send after the current response finishes.
-
-### 2026-03-16 — Casual route 500 and voice timeline
-
-- **Casual 500**: Response-generator `/internal/response/chat` was surfacing Ollama errors (e.g. "model runner has unexpectedly stopped") as 500. **Fix**: `services/response-generator/main.py` catches exceptions in `casual_chat` and returns 200 with a friendly fallback message so the gateway no longer returns 500.
-- **Voice timeline stuck at VoiceRequestSent**: Timeline SSE is filtered by `session_id`; the voice agent used its own `session_id`, so backend events (Interpreter, Graph, etc.) never reached the UI. **Fix**: UI sends `{ type: 'set_session', session_id: textSessionId }` over LiveKit data on `RoomEvent.Connected`; voice agent listens for `data_received`, updates effective session id, and uses it in `call_oasis()` so all voice pipeline events are published under the same session the UI subscribes to.
-
-### 2026-03-17 — Aha: hallucinated vision without screen_image
-
-- **Symptom**: In some chats, the model confidently described "the image you provided" (e.g., a Discord screen) even though the user had not shared any image or enabled screen sharing.
-- **Likely cause**: The casual system prompt advertised "you can see the user's screen when they enable screen sharing (Vision button)" but did not explicitly forbid visual descriptions when no `screen_image` was attached, so the model generalized and hallucinated screenshots based on text alone.
-- **Fix**: Tightened `CASUAL_SYSTEM_PROMPT` in `services/response-generator/service.py` to:
-  - Make visual access conditional on an explicit `screen_image` attachment.
-  - Instruct the model to say clearly that it **cannot** see the screen when no image is present and only then suggest using the Vision button.
-  - Explicitly forbid inventing or describing images / UIs unless an actual image is attached.
-- **Contract**: Any future prompts that mention vision/screen-reading must:
-  - Tie visual abilities to concrete context fields (e.g. `screen_image`, `screen_content`) rather than generic "you can see the screen" statements.
-  - Include a negative rule: when no such field is present, the model must treat the situation as **no vision available** and avoid "the image you provided…" style hallucinations.
-
-### 2026-03-18 — Aha: teaching validation clarifying_questions schema
-
-- **Symptom**: Teaching validation crashed with `ValidationError` on `ValidationResult.clarifying_questions.0` because the LLM sometimes returned a list of **dicts** (e.g. `{ "why": "..." }`) instead of plain strings.
-- **Root cause**: `TeachingService.validate` forwarded `parsed["clarifying_questions"]` directly into the Pydantic model, which expects `list[str]`, so nested dicts failed validation.
-- **Fix**: Normalize both `clarifying_questions` and `contradictions` before constructing `ValidationResult` by:
-  - Ensuring they are lists.
-  - Converting each element to `str`, and when an element is a `dict`, flattening by joining all values into a single human-readable string.
-- **Contract**: Any future LLM-parsed list fields that are typed as `list[str]` in Pydantic must defensively coerce **both the container and the elements** (including dicts) to strings before model construction.
-
-### 2026-03-18 — Voice agent connection: proxy + transcription stability
-
-- **Symptom**: "Couldn't connect to the voice agent" — UI at localhost:3000 calls voice-agent at localhost:8090; CORS/port/network issues could block direct access.
-- **Fix**: Added API gateway proxy at `/api/v1/voice-proxy` (join, token, voice-id/*, health). UI now uses `OASIS_BASE_URL + '/api/v1/voice-proxy'` instead of direct port 8090. Same-origin requests avoid CORS; gateway reaches voice-agent via Docker service name.
-- **Transcription**: `make restart-voice` no longer kills transcription (port 8099). Killing it was unnecessary and caused a window where voice-agent couldn't transcribe. Voice-agent has `extra_hosts: host.docker.internal:host-gateway` for Linux compatibility reaching host transcription.
-- **Contract**: Voice agent HTTP endpoints are proxied through the API gateway. UI should use the proxy URL, not direct port 8090.
-
-### 2026-03-18 — Log fixes: JSON parsing, LiveKit, ddgs, transcription, tool iterations
-
-- **LLM JSON parsing**: Interpreter, teaching, and response-generator often received malformed/truncated JSON from Ollama. **Fix**: Enhanced `packages/shared_utils/json_utils.py` `extract_json()` to repair truncated JSON (close unclosed brackets, strip trailing commas). All `chat_json` callers benefit.
-- **LiveKit secret**: LiveKit requires secret ≥32 chars. **Fix**: Updated `config/livekit/livekit.yaml` and docker-compose to use `oasis-livekit-dev-secret-min-32-chars`.
-- **LiveKit "invalid token" / "cryptographic primitive"**: Token validation fails when (a) API key/secret mismatch between voice-agent and LiveKit server, or (b) clock skew between token-generating server and LiveKit. **Fix**: Added `LIVEKIT_KEYS` env to LiveKit container so both use identical credentials. If still failing, ensure host clock is synced (`ntpdate` or `timedatectl`).
-- **duckduckgo_search deprecation**: Package renamed to `ddgs`. **Fix**: Switched `services/teaching-service/web_search.py` and `services/teaching_service/web_search.py` to `from ddgs import DDGS`; updated requirements to `ddgs>=9.0.0`.
-- **Voice transcription**: MLX transcription failures ("Network unreachable", "Remote end closed"). **Fix**: Voice-agent now uses httpx for transcription calls, 3 retries with 2s/4s backoff, clearer error message suggesting `make transcription-ensure`.
-- **Tool iterations**: Default 6 was too low for complex tool-use flows. **Fix**: `MAX_TOOL_ITERATIONS` now configurable via env (default 10).
-
-### 2026-03-18 — Multi-agent tool_use architecture
-
-- **Change**: Converted single-agent tool_use flow into a multi-agent system with Planning Agent, Execution Agent, and Observer Agent.
-- **Agent roles**:
-  - **Planning Agent** (Brain): Creates upfront plan via `POST /internal/plan/tool-use` (response-generator). Uses Oasis Cognition persona. Returns `{ steps, success_criteria }`.
-  - **Execution Agent**: Runs tools via `tool-plan` LLM. Receives plan + observer feedback. Does NOT decide final_answer alone.
-  - **Observer Agent** (Brain): Holds task graph, validates goal completion via `POST /internal/observer/validate` (observer-service). Uses logic-engine `validate_goal`. Returns `{ goal_met, feedback, updated_graph }`.
-- **Flow**: Plan → Execute → Observer validate → if not goal_met, inject feedback and continue (Observer decides, not LLM).
-- **New services**: `observer-service` (port 8009), calls graph-builder + logic-engine.
-- **New schema**: `GoalNode`, `PlanNode`, `ActionNode`, `CompletionNode`; `ToolUsePlan`, `GoalValidationResult`; edge types `IMPLEMENTS`, `EXECUTES`, `COMPLETES`.
-- **Contract**: Tool-plan prompt now accepts `upfront_plan` and `observer_feedback`. Observer is the arbiter of goal completion.
-
-### 2026-03-18 — Plan card & Reply-to-message UI
-
-- **Plan card**: Gateway publishes `ToolPlanReady` event with `steps` and `success_criteria` after Planning Agent creates upfront plan. UI shows `PlanCard` during processing (next to tool cards) and in ThinkingCard/timeline overlay so user can preview why tools are being executed.
-- **Reply to specific response**: User can click "Reply" on any assistant message to give feedback. When replying, the next message is sent as `[Feedback on your previous response] "..." User feedback: {text}` so the agent receives guidance on how to correct its approach.
-
-### 2026-03-18 — Tool-plan: explore first, never ask for clarification without searching
-
-- **Symptom**: Agent asked "Can you please provide more details or clarify what you're looking for?" for "syntax highlighting in the code view" instead of proactively searching.
-- **Fix**: Strengthened tool-plan prompt: (1) "Explore first, ask later" — when vague, grep/list_dir/read_file first; (2) If must ask, ask SPECIFIC question based on what was found, not generic "provide more details"; (3) First action for implementation requests must be a tool call, never final_answer asking for clarification.
-
-### 2026-03-18 — Interpreter: code-editing requests must route to tool_use
-
-- **Symptom**: User asks "enable syntax highlighting in the code view" → shows "Deep Reasoning", agent says "I'll work on it" but no tools run, then silence.
-- **Root cause**: Interpreter routed to "complex" instead of "tool_use". Complex route does symbolic reasoning only — no bash, read_file, edit_file. Tool use never happens.
-- **Fix**: Strengthened Interpreter prompt: added "enable", "implement", "add X to the UI" as tool_use signals; added rule "NEVER use complex for adding features, enabling something, fixing code"; added "If the user wants to add/enable/implement/change something in the codebase → ALWAYS use tool_use".
-
-### 2026-03-18 — Tool failure: retry with different approach
-
-- **Problem**: When a tool failed, the Execution Agent would accept the failure and sometimes give up or give final_answer.
-- **Fix**: Tool-plan prompt now instructs: when a tool FAILED, retry with a different approach (different command, path, read file again for edit_file, list_dir to find path, etc.). When the last result was a failure, an explicit hint is injected: "You MUST retry with a different approach. Do NOT give final_answer yet."
-
-### 2026-03-18 — Voice auto-connect on chat page load
-
-- **Change**: Voice connection now auto-connects when the chat page opens. If the browser blocks (e.g. Chrome autoplay policy), the user can click Connect to retry.
-- **Implementation**: `useEffect` calls `handleConnect()` once on mount via `hasAutoConnectedRef` guard.
-
-### 2026-03-18 — App.tsx split into individual components
-
-- **Change**: Refactored monolithic ~3000-line `App.tsx` into modular components for maintainability.
-- **Structure**:
-  - `lib/types.ts` — Message, TimelineEvent, ProjectConfig, GraphData, GraphPanelProps
-  - `lib/constants.ts` — OASIS_BASE_URL, VOICE_AGENT_URL, pipeline stages
-  - `components/voice/` — WaveformVisualizer, ListeningOrb, VoiceIdModal
-  - `components/chat/` — CodeBlock, MarkdownMessage, DiffViewer, InlineToolCards, ChatHeader, TimelineOverlay
-  - `components/timeline/` — PipelineProgress, ToolCallsDisplay, PlanCard, ThinkingCard
-  - `components/graph/` — GraphPanel, KnowledgeGraphViz, LogicEngineViz
-  - `components/panels/` — SettingsPanel, HistoryPanel
-- **App.tsx** now ~1000 lines: state, effects, handlers, and composition of extracted components.
-
-### 2026-03-18 — Reasoning panel: Knowledge graph & Logic engine separated
-
-- **Change**: Split the combined "Knowledge graph & logic engine" panel into two distinct tabs, each with its own best-of-kind visualization.
-- **Knowledge graph tab**: Hierarchical node-link graph (top-down layers: Problem/Goal → Evidence/Trigger/Constraint → Hypotheses/Plan → Action → Conclusion/Completion). Nodes colored by type; curved edges with edge-type labels (TRIGGERS, SUPPORTS, LEADS_TO, etc.).
-- **Logic engine tab**: Decision (conclusion + confidence bar), reasoning trace (step-by-step inference flow), and learned rules (IF/THEN cards).
-- **Data**: API now returns `conclusion` in complex-route response; UI stores `reasoning_trace`, `confidence`, `conclusion` per message for Logic Engine viz.
-
-### 2026-03-18 — Architecture: LLM = mouth, Logic engine = brain, Knowledge graph = memory
-
-- **Contract**: All routes must use the triad: **Logic Engine** (brain), **Knowledge Graph / Memory** (memory), **LLM** (mouth).
-- **Complex route**: Already correct — graph-builder → memory query + rules → logic-engine reason → response-generator formats. LLM only formats the decision.
-- **Tool use route**: Now wired:
-  - Fetches memory + rules at start; passes to Planning Agent, tool-plan LLM, and Observer.
-  - Observer passes memory + rules to logic-engine `validate_goal`; logic engine uses them for grounded validation (confidence boost when memory/rules match tool outputs).
-  - Task graph stored in memory when goal met.
-- **Casual route**: Now wired — fetches memory + rules; injects into casual prompt so responses are grounded in past context.
-- **Logic engine**: `reason` (complex) and `validate_goal` (tool_use Observer) both accept `memory_context` and `rules`; they are connected to the same memory layer.
-
-### 2026-03-18 — Knowledge graph expiration: verify ground truth when stale
-
-- **Problem**: Memory entries can expire (code changes, files move, tool outputs become outdated). Relying on old knowledge without verification causes hallucinations.
-- **Fix**: Memory query returns `stale_count` and `stale_hint` when entries exceed `OASIS_MEMORY_MAX_AGE_HOURS` (default 24).
-- **Flow**: When stale, `memory_stale_hint` is passed to: (1) Logic engine — reduces memory weight in scoring, skips confidence boost in validate_goal; (2) Response generator — injects "verify against ground truth (re-read files, re-run commands) before relying; renew knowledge by re-executing tools"; (3) Tool-plan — instructs to verify first, then proceed.
-- **Config**: `OASIS_MEMORY_MAX_AGE_HOURS` (default 24). Set lower for fast-moving codebases.
-
-### 2026-03-18 — Knowledge graph: wall-hitting and aha moments
-
-- **Problem**: Agent repeats the same failed attempts (e.g. read_file on path that doesn't exist, grep that found nothing) instead of trying different approaches.
-- **Fix**: Extract "walls" from failed tool results (path doesn't exist, grep found nothing, edit_file old_string not found) and:
-  - Accumulate in session; pass `walls_hit` to tool-plan each iteration.
-  - Inject prominently: "FAILED ATTEMPTS / WALLS HIT (do NOT retry these; try different paths, patterns, or approaches)".
-  - Store walls in memory when storing task graph (tags + content.walls) so future sessions avoid same mistakes.
-- **Memory**: Walls from past sessions (memory_context entries with content.walls) are merged with current session walls and injected into tool-plan.
-
-### 2026-03-18 — Plan step highlighting & tool calls scroll container
-
-- **Problem**: AI response bubbles pushed out of viewport due to many tool calls and long plan cards.
-- **PlanCard**: Steps now have checkboxes (✓ when done, □ when pending). Current step is highlighted (blue bg) when activity relates to it. Step is "done" when we have more successful tool completions than step index (heuristic: tools progress through plan steps in order).
-- **ToolCallsScrollContainer**: Tool calls wrapped in scrollable container (max-height 280px). Auto-scrolls to bottom when streaming; pauses if user scrolls up; resumes when user scrolls back to bottom; stops when response complete (`isStreaming=false`).
-
-### 2026-03-18 — App.tsx refactor: under 700 lines
-
-- **Extracted**: `useVoiceConnection` hook (LiveKit room, mic, screen share, data handlers), `ChatMessage` (single message with tools/diff/markdown), `ChatInputArea` (textarea + reply bar), `ThinkingOverlay` (plan + tools during thinking), `VoiceBubbles` (transcription + live transcript). `getErrorMessage` moved to `lib/utils.ts`.
-- **Result**: App.tsx reduced from ~1009 to ~389 lines.
-
-### 2026-03-18 — Plan step highlighting + knowledge graph live update
-
-- **Plan step highlighting**: API gateway now publishes `step_index` in ToolCallStarted, ToolCallCompleted, ToolCallBlocked. PlanCard uses it: when a tool is running, highlights the step from the last ToolCallStarted; when between tools, highlights the next step (last completion step_index + 1). Falls back to heuristic (successfulCount) when step_index is absent.
-- **Knowledge graph on the fly**: After each observer validation (post-tool), when we have walls, call memory/store with task_graph + walls. This persists walls to the knowledge graph during execution so future steps/sessions can avoid them. The tool-plan already receives walls_hit each iteration; the interim store ensures the graph is updated live.
-
-### 2026-03-18 — Knowledge graph, observer, reply UX, context summary (plan implementation)
-
-- **Storage & linking**: (1) Always store task graph after every observer validation (removed wallsHit-only condition). (2) Memory store accepts `session_id`; stored in content and tags. (3) Memory query accepts `session_id` for thread-based retrieval. (4) Gateway passes `session_id` to all store calls and initial memory query.
-- **Live updates**: (1) After each store, re-fetch memory with `session_id` so next tool-plan sees latest graph. (2) Tool-plan receives `task_graph`; prompt injects "Current task graph: N nodes. Last actions: ...". (3) Publish `TaskGraphUpdated` event after each store; UI subscribes and updates `graphBySessionId`.
-- **Observer**: (1) On observer validate failure, inject fallback feedback instead of null: "Observer unavailable. If you have exhausted options, explain to the user and give final_answer." (2) Logic-engine: when 5+ consecutive read_file/list_dir failures for same path (path does not exist), return goal_met with feedback "User should be informed the path does not exist: {path}".
-- **Reply UI**: (1) Message type has `replyToMessageId`, `replyToPreview`. (2) ChatMessage shows compact "Replying to" card above bubble (icon, truncated preview ~60 chars, "Reply" badge); user feedback in bubble. (3) API: `context.reply_to` = { message_id, preview }; gateway builds formatted prompt when present.
-- **Graph by thread**: UI switched from `graphsByMessageId` to `graphsBySessionId`; GraphPanel shows graph for current session; TaskGraphUpdated updates live.
-- **Context summarization**: (1) `estimateTokens(text)` ~4 chars/token. (2) `OASIS_CONTEXT_WINDOW` (default 8192). (3) Before building chat_history, if tokens > 50% of window: call `POST /internal/response/summarize-history` with older messages; replace with "Conversation summary: ..." + keep last 5 messages.
-
-### 2026-03-18 — Tool-plan robustness, walls prominence, path-failure heuristic
-
-- **Tool-plan JSON robustness**: (1) `extract_json` now handles nested braces, ast.literal_eval for Python dicts. (2) `_normalize_tool_plan_output` maps common LLM mistakes: `tool_id`→`tool`, `output`→`answer`, builds valid call_tool from malformed structure. (3) Few-shot example and stricter "ONLY JSON" instruction in prompt. (4) Retry hint is more explicit.
-- **Walls prominence**: Walls moved to TOP of tool-plan prompt with ⚠️. Explicit rule: "Before any read_file/list_dir/grep, check the path is NOT in the list." Note that /workspace/X and /X are equivalent.
-- **Path-failure heuristic**: Logic-engine normalizes paths (strip /workspace), extracts path from output when attr empty, logs when heuristic triggers. Handles both path formats for counting failures.
-
-### 2026-03-18 — Grep semantic search (pattern expansion + ripgrep)
-
-- **Problem**: LLM searches like `grep pattern=CodeView path=...` often miss matches when code uses `code-view`, `code_view`, or `CodeView` in different files.
-- **Fix**: (1) **Pattern expansion**: `_expand_pattern_semantic()` turns identifiers into regex alternation: `CodeView` → `(CodeView|codeview|code_view|code-view)`. Multi-word: `syntax highlighting` → `(SyntaxHighlighting|syntax_highlighting|syntax-highlighting|...)`. Skips expansion when pattern looks like regex (`\s`, `\d`, `+`, `*`, etc.). (2) **Ripgrep**: Prefer `rg` over `grep` (faster, better Unicode); fall back to `grep` if `rg` unavailable. (3) **Exclude dirs**: Skip `node_modules`, `.git`, `__pycache__`, `.next`, `dist`, `build`, `.venv`, `venv` to reduce noise. (4) **Case-insensitive fallback**: If expanded pattern finds nothing, retry with `-i`.
-- **Contract**: Tool-executor Dockerfile installs `ripgrep`. Grep tool is now more robust for codebase search without embedding/semantic infra.
-
-### 2026-03-18 — Autonomous mode, Logic Engine fixes, Knowledge Graph UX
-
-- **Logic Engine decisions empty**: TaskGraphUpdated was overwriting conclusion/reasoning_trace/confidence with undefined. **Fix**: Merge with existing session data; preserve payload fields when provided. API Gateway now includes observer conclusion/confidence/reasoning_trace in TaskGraphUpdated and tool_use response. LogicEngineViz derives conclusion from CompletionNode when absent.
-- **Knowledge Graph bigger view**: Added expand button (Maximize2) on Knowledge Graph tab; modal renders at 800x550. KnowledgeGraphViz accepts containerWidth/containerHeight for responsive layout.
-- **Logic Engine feasibility**: New `POST /internal/assess-feasibility` checks memory (not_achievable entries) and walls (5+ path failures). Memory `store-not-achievable` endpoint stores goal, reason, suggestion. Feasibility pre-check runs before tool loop (skipped in autonomous mode).
-- **Autonomous mode**: Session config (autonomous_mode, autonomous_max_duration_hours) via `POST /api/v1/session/config`. When enabled: unlimited tool iterations (10k cap), 6hr default time limit, snapshot every 5 iterations, knowledge graph summary injected into tool-plan, feasibility pre-check skipped.
-- **Snapshots**: Dev-agent `create_snapshot`/`restore_snapshot`/`list_snapshots` capture worktree diffs to `~/.oasis/snapshots/{session_id}/`. API gateway proxies to dev-agent. SnapshotCreated event published for timeline.
-- **UI**: Settings panel "Autonomous" tab: toggle, max hours input, snapshot list with Restore. SnapshotCreated in TOOL_PIPELINE_STAGES.
-
-### 2026-03-19 — Self-teaching pipeline: rules creation, teaching triggers, failure learning
-
-- **Problem**: Agent in autonomous mode never created rules despite having teach_rule capability. It would grep for non-existent files endlessly, give up, or tell the user to do it.
-- **Root causes identified**:
-  1. TOOL_PLAN_PROMPT had no teach_rule/update_rule/delete_rule tools defined — agent couldn't create rules.
-  2. A bad example in the prompt referenced `CodeView.tsx` (non-existent) — agent followed it literally.
-  3. Tool-executor blocked `npm install` and `pip install` — agent couldn't install packages and gave up.
-  4. PLAN_TOOL_USE_PROMPT generated vague plans with no per-step verification criteria.
-  5. No mechanism to force teaching when the agent hit repeated failures.
-
+- **Yggdrasil** is a 2-in-1 service: an HTTP controller (runner registration, job dispatch) + a built-in local runner. External runners register via `POST /runners/register`; the built-in runner registers itself on startup.
+- **Types** shared between `agent-runner` and `oasis-agent` via `packages/oasis-agent-sdk/`.
+- **Contracts**:
+  - `POST /runners/register` accepts `RunnerInfo` (name, endpoint, capabilities, realmTemplates). Returns `{ ok: true, runner_id }`.
+  - `POST /runners/:runnerId/reject` accepts `{ job_id, reason }`.
+
+### 2026-06-15 — Project-scoped memory + rules (fix stale data across project switches)
+- **Problem**: Switching projects in the UI didn't clear `graphsBySessionId`, so the old project's reasoning graph stayed visible. Memory queries, rules, and foundational nodes were NOT scoped by `project_id`, so stale data from previous projects leaked into the new project's context.
 - **Fixes**:
   - **Self-teaching tools**: Added teach_rule, update_rule, delete_rule to TOOL_PLAN_PROMPT with full JSON format.
   - **Action handlers**: Added teach_rule/update_rule/delete_rule handlers in `interaction.service.ts` tool loop (before call_tool). Each creates/updates/deletes rules via memory-service, refreshes rules for next iteration.
@@ -1054,3 +612,153 @@ A proper model registry now lives at `apps/api-gateway/src/models/model-variants
   simultaneous project contexts; full browser/integration harness execution
   remains environment-dependent because this checkout has no runnable
   `tests/e2e` source/configuration.
+  - **Frontend (App.tsx)**: `_setActiveProjectId` now clears `setGraphsBySessionId({})` and `setTimelineByClientMessageId({})` when the project changes, so no stale graphs or timelines visible.
+  - **Memory service endpoints**:
+    - `/internal/memory/query` now accepts `project_id` parameter — filters to memories tagged with `project:{project_id}` via tags CONTAINS.
+    - `/internal/memory/store` and `/internal/memory/store-not-achievable` now accept `project_id` — stored memories are tagged with `project:{project_id}` for future scoped retrieval.
+  - **Gateway (interaction.service.ts)**:
+    - All three routes (casual, complex, tool_use) now pass `project_id` to `/internal/memory/query`.
+    - Rules loading uses `/internal/memory/projects/{project_id}/rules` when a project is active, falling back to global `/internal/memory/rules`.
+    - Store calls pass `project_id` so future graphs are tagged.
+  - **Thing NOT changed**: `retrieve_nodes_by_tier` (ReasoningNode has no tags property, and foundational nodes are always built fresh per session — low risk).
+
+### 2026-06-16 — session_id persistence + cross-project data leak fix
+- **Critical Bug**: `_get_sessions_for_project()` queried `m.session_id` on `Memory` nodes, but session_id was NEVER stored as a top-level Neo4j property — only embedded inside the `content` JSON blob and the `tags` array. This meant project-scoped `retrieve_nodes_by_tier()` queries returned **zero results** for existing memories, breaking cross-project foundational node isolation.
+- **Fix (MemoryService)**:
+  - `store()` now persists `m.session_id` as a top-level Neo4j property (extracted from `content.session_id` or `tags` prefix).
+  - Added `CREATE INDEX IF NOT EXISTS FOR (m:Memory) ON (m.session_id)` for fast lookups.
+  - `_get_sessions_for_project()` now queries `m.session_id` first, and falls back to parsing `m.content` JSON for pre-migration entries.
+
+### 2026-06-16 — Router model timeout fix + dev-agent launchd persistence
+- **Problem 1: Router model timeout**. The `response-generator`'s `/internal/route` endpoint was called by the gateway with a 15-second timeout, but the e2b router model could take longer due to processing in the single-request queue behind larger models. When the gateway received a timeout, it fell back to keyword matching (which worked, but the router model's classification was never used).
+- **Fix**: Increased both router timeout calls in `interaction.service.ts` from 15s to **30s** (lines ~1757 and ~1816). The `/internal/route` endpoint bypasses the LLM request queue (it creates its own `LLMClient` directly), so the only bottleneck was the gateway's HTTP timeout.
+- **Problem 2: Dev-agent service not persistent**. The dev-agent (port 8008) was started via `nohup` in a shell script that died when the shell session ended. The Docker gateway connected to `host.docker.internal:8008` and got `ECONNREFUSED`.
+- **Fix**: Created a macOS LaunchAgent at `~/Library/LaunchAgents/com.oasis.dev-agent.plist` that keeps the dev-agent alive via `KeepAlive=true` and auto-starts on login. Updated `Makefile` dev-agent-start/dev-agent-stop to use `launchctl load`/`launchctl bootout` instead of fragile PID-file-based nohup management.
+  - `retrieve()` session filter changed from `m.content CONTAINS $session_id` to `m.session_id = $session_id OR m.tags CONTAINS $session_tag`.
+- **Fix (Gateway - interaction.service.ts)**:
+  - `handleComplex()` memory store call **missing `session_id`** — was only passing `project_id`. Added `session_id: sessionId` so reasoning graphs get tagged with the session for later project-scoped queries.
+  - All other store calls (tool_use loop, store-not-achievable) already passed both session_id and project_id correctly.
+- **Data flow contract**: Every `POST /internal/memory/store` call MUST include BOTH `session_id` and `project_id`. The session_id is what links ReasoningNodes back to Memories for project-scoped `retrieve_nodes_by_tier` queries.
+
+### 2026-06-17 — Asgard implemented + LLM pipeline unblocked
+- **Asgard** (`apps/asgard/asgard`) is the unified launcher for theaiinc daily apps (Cognition, Echo, Missive).
+  - `asgard up|down|status|logs|app <name>` — CLI commands
+  - `make asgard|asgard-status|asgard-stop|asgard-logs` — Makefile integration
+  - Health checks via port probes; no external dependencies
+- **Root cause of pipeline stall**: `.env` file set `OASIS_RESPONSE_LLM_PROVIDER=openai` and `OASIS_RESPONSE_LLM_MODEL=gemma-4-12b-coder-fable5-composer2.5-v1`, but that model was loaded on a **remote PC (Uyen-PC)** that was unreachable. Every LM Studio request hung for 2+ minutes.
+- **Fix**: Changed `.env` and `docker-compose.yml` defaults to use **Ollama + qwen3:4b** (pulled locally, ~11s response time). Also pulled `qwen3:4b` via `ollama pull`.
+- **Bug fix**: `LLMClient` referenced `self._settings.ollama_base_url` but `Settings` only had `ollama_host`. Added ollama_base_url as a `@property` alias on Settings.
+- **Changed docker-compose defaults**: `qwen3:4b` everywhere (was `qwen3:8b`/`google/gemma-4-12b-qat`); router model disabled (was `arch-router-1.5b.gguf` which required remote LM Studio); `OASIS_LLM_PROVIDER` default changed from `openai` to `ollama`.
+- **Flat-text tool-plan non-streaming issue**: The Ollama backend's streaming path may still have issues with the gateway's flat-text parser. The pipeline now processes requests correctly (interpreter → router → response-generator) at ~40s per LLM call.
+- **Teaching mechanism**: Rules are stored via `POST /internal/memory/teach` with fields `assertion`, `category`, `domain`. The `underlying_concept` field becomes the **IF condition** — it must describe *when* the rule applies. The `assertion` becomes the **conclusion** — what the model should do. Both condition and conclusion are stored separately and shown as `IF <condition> → <conclusion>` to the model.
+- **Rule classification**: The `_summarize_knowledge()` function auto-classifies rules by keywords in their conclusion text: `"approach"/"pattern for"` → `workflow/approach`, `"must"/"required"/"prefer"` → `requirement`, etc. Rules without these keywords fall to `general`. Classification is visible to the model as a theme summary.
+- **Bug fixed**: `_summarize_knowledge()` was reading `r.get("assertion")` but the rules endpoint returns `conclusion` as the key — keyword classification never activated. Fixed to read `r.get("conclusion")` with fallback.
+- **Feature added**: Rules are now displayed as `IF <condition> → <conclusion>` in both the knowledge TOC (tool-plan) and casual prompt so the model knows the trigger condition. Added shared `_format_rule()` / `_format_rules_list()` helpers.
+- **Generalized rules with triggers (stored)**:
+  1. IF asked to create a unified launcher or dashboard for a multi-service project → explore project structure first (workflow/approach)
+  2. IF required to build a launcher script for multiple services → implement status/up/down/table commands (requirement)
+  3. IF you need to check if a service is running → health probe via HTTP GET with short timeouts, green/red color-code (workflow/approach)
+  4. IF you need to integrate with existing project infrastructure → build on top of existing Makefile targets and docker compose commands (workflow/approach)
+- **Key wall — FC mode with 12B coder**: The `gemma-4-12b-coder-fable5-composer2.5-v1` on remote LM Studio works for simple prompts (~7s) but **hangs indefinitely** on structured streaming with tool definitions (FC mode). The `stream_chat_structured_async` call sends `tools` in the body and the model stalls. The same model works for flat-text streaming. **Workaround**: Force `use_fc=False` in tool-plan path, or use a model that supports native function calling (Ollama qwen3, OpenAI models).
+- **Key wall — No model can complete tool-plan pipeline (2026-06-17)**:
+  - **LM Studio 12B coder (remote)**: Hangs on FC mode. Flat-text route model call takes 90s+ but the tool-plan stage hangs indefinitely — the system prompt is too large (~3-4K tokens) for this model on remote.
+  - **LM Studio e2b (remote)**: Returns empty content for any prompt.
+  - **Ollama qwen3:4b (local)**: Initially seemed fast but returns **empty content** from Docker containers and hangs locally for streaming calls. The 4B model doesn't reliably respond.
+  - **LM Studio arch-router-1.5b.gguf (local)**: Works reliably in 0.4-2s but is a 1.5B router — too small to produce tool plans or code.
+  - **Conclusion**: No available model can run the full interpreter → routing → tool-plan → tool-execution pipeline end-to-end. The teacher loop is blocked until a working model is available.
+- **Teaching a naive model**: Rules must be extremely detailed — step-by-step recipes with exact commands, functions to implement, and field names. The local model cannot infer intent or fill in gaps. Every rule should include concrete bash/python snippets, function signatures, and ordering constraints (step 1 do X, step 2 do Y). Rules still reference only patterns (not project-specific names). Example structure: "IF trigger → step 1: command. step 2: function. step 3: output format."
+- **Rule detail level for naive models (7 rules stored)**:
+  1. IF you need to discover what apps exist → exact `ls apps/`, `docker compose config --services`, grep commands
+  2. IF you need to create a bash launcher → exact 4 functions (cmd_status, cmd_up, cmd_down, cmd_help) with tput colors and curl probes
+  3. IF the user asks for a unified launcher → 7-step implementation order (read compose → read Makefile → create script → status → up/down → Makefile heading → Makefile target)
+  4. IF you need to check service health → exact curl command with status code check and tput setaf color
+  5. IF you need to add a Makefile target → exact pattern (variable, .PHONY, heading, target)
+  6. IF you need to edit files → exact create_worktree → PARAM_WORKTREE_ID → edit_file → get_diff → final_answer flow
+  7. IF you need to print a status table → exact printf column format with service name, status, port and summary counts
+
+### 2026-06-17 — @theaiinc/headroom-ai fork created for Leyline compression
+- **headroom-ai fork**: Forked `chopratejas/headroom` (Apache-2.0, credit retained) to `github.com/theaiinc/headroom-ai` as a library-only Python package.
+- **What was stripped**: Proxy server, CLI, integrations (LangChain, Agno, MCP), evals, image compression, learning system, telemetry, install utilities, pricing, providers, storage, subscription, capture, audit, dashboard, RTK. Rust crates and TS SDK also removed.
+- **What was kept**: transforms, tokenizers, proxy/interceptors, memory, ccr, cache, relevance, shared_context — these are needed for compression + retrieval of masked data.
+- **JSON bridge**: `headroom.json_cli` reads JSON from stdin (`{"messages": [...], "model": "..."}`), writes compressed result as JSON to stdout. Registered as `headroom-compress` CLI entry point in pyproject.toml. Bumped version to 0.26.0.
+- **Build system**: Changed from maturin (Rust extension) to pure setuptools — the Rust crate (`crates/headroom-py`) and maturin config were stripped.
+- **Leyline integration**: `src/core/compress.ts` spawns `headroom-compress` (falls back to `python3 -m headroom.json_cli`). `isCompressionAvailable()` is now async (Promise-based). Removed `HEADROOM_BASE_URL` env var (no HTTP proxy needed). Removed headroom-ai optional peerDependency from package.json.
+- **Upstream merge process**: `git fetch upstream && git merge upstream/main && bash scripts/strip-to-library.sh && git add -A && git commit -m "chore: strip to library-only after upstream merge" && git push origin main`
+- **Credit**: README and LICENSE retain Apache-2.0 from upstream. All references credit `chopratejas/headroom`.
+
+### 2026-06-18 — Leyline integration with Cognition (LLM proxy layer)
+- **Leyline** (`@theaiinc/leyline`) is now Cognition's LLM proxy — when `OASIS_LEYLINE_BASE_URL` is set, ALL `LLMClient` calls route through Leyline's OpenAI-compatible endpoint (`POST /v1/chat/completions`).
+- **How it works**: `LLMClient.provider` overrides to `"openai"` when `leyline_base_url` is set. All OpenAI/Anthropic/Ollama call methods redirect to `{leyline_base_url}/v1/chat/completions`. Cognition sends the model name; Leyline picks the provider, handles failover, load balancing, and compression.
+- **Key changes**:
+  - `config.py`: Added `leyline_base_url: str = ""` field, `PROJECT_OVERRIDABLE_FIELDS`, `extra="ignore"` in model_config for TS-only env vars
+  - `llm_client.py`: `_effective_openai_base_url()`, `_is_routed_via_leyline()`, updated `provider` property, updated `_get_openai()` and all async HTTP URL constructions
+  - `response_generator/main.py`: Passes `leyline_base_url` to sub-Settings constructor
+  - `docker-compose.yml`: `OASIS_LEYLINE_BASE_URL` added to interpreter, response-generator, and teaching-service
+  - `tests/test_llm_client.py`: 7 new tests for Leyline routing (provider override, URL resolution, sync/async/streaming)
+- **Zero-downtime upgrade**: `OASIS_LEYLINE_BASE_URL` defaults to empty — existing direct-to-provider behavior unchanged. Set to `http://leyline:3000` to enable proxy.
+- **`.env`**: Added commented-out `OASIS_LEYLINE_BASE_URL` entry with docs.
+
+### 2026-06-18 — Cognition evaluation session: Asgard launcher prompt
+- **Scenario**: Tasked Cognition (via POST /api/v1/interaction) to create a unified launcher for daily apps (Cognition, Echo, Missive) with status/up/down/dashboard commands. Clean worktree state, no prior Asgard artifacts on disk.
+- **Pipeline path**: Cold boot (fresh container, remote LM Studio model loading weights). Total time from prompt to first tool call: ~17 minutes (2min thought → 10min tool-plan generation → 4min tool reasoning → 1 tool call → timeout on response thought layer at 60s).
+- **Final artifact**: Pipeline timed out before writing any files. One exploratory tool call (read-only probe) was made, but no worktree created, no files written.
+- **Evaluation rubric**: 2b — do nothing, but due to latency/timeout, not architecture failure.
+- **Architecture choice**: Cognition planned a Python script at `scripts/launcher.py` with a wrapper script. **Correct pattern** is a bash script at `apps/asgard/asgard` (standalone, no runtime deps, follows Makefile's existing native-service patterns). The project convention for CLI tools is `apps/<name>/<name>` as a bash script, not `scripts/*.py`.
+- **Launcher conventions (from prior session, committed in HEAD)**:
+  - Lives at `apps/asgard/asgard` as a bash script with `set -euo pipefail`
+  - Health probes: `curl -sf --max-time 3 http://localhost:$PORT/health`
+  - Colors: `tput` or ANSI escape codes, green/red/yellow
+  - Table: `printf` with columns for App, Port, Status, Description
+  - Makefile integration: `.PHONY` target calls the script, e.g. `asgard: @$(ASGARD) up`
+  - README at `apps/asgard/README.md` with quick-start table
+
+### 2026-06-18 — Cognition evaluation methodology
+- **How to evaluate a Cognition output**: Use a two-axis rubric.
+  - **Axis 1 — Architecture fit**:
+    - Does it follow project conventions? (app placement, service patterns, health probes)
+    - Does it reuse existing primitives? (docker compose, Makefile targets, curl probes)
+    - Does it live in the right directory? (apps/ for end-user tools, services/ for microservices)
+  - **Axis 2 — Execution result**:
+    - 2a: Full running app, few bugs → awesome, just fix bugs
+    - 2b: Do nothing → diagnose why
+      - 2ba: Wrong architecture → suggest better approach
+      - 2bb: Good architecture but bugs in flow → fix systematically
+    - 2c: Hallucinated / broken output → flag and retry with constraints
+- **Pipeline timings matter**: A cold boot (first prompt after docker-compose restart) can take 15-25min due to model weight caching. Warm runs are significantly faster but the thought-layer timeout (default 60s in InteractionService) can still cut off slow models. Factor this into evaluation — don't call "stall" until at least 20min of inactivity.
+- **Common bugs found in prior Asgard run**:
+  1. `cmd_up` uses `2>/dev/null || true` silencing all errors — removes error visibility
+  2. Missing `docker-ensure` (Makefile's docker-ensure handles Docker Desktop startup + stale postmaster.pid cleanup)
+  3. `cmd_up` starts a subset of services (4 of ~20) but `cmd_down` calls `docker compose down` which stops everything — scope mismatch
+  4. No tracking of which services were started vs already running
+  5. Broken worktree file (`launcher.py` was a string literal triple-quoted comment, not executable code)
+
+### 2026-06-18 — Thought-layer timeout bumped + env var override
+- **Problem**: Cold boot (remote LM Studio model loading weights) took ~10min for tool-plan generation but the thought-layer timeout was only 60s for 12B models (`size ≤ 12 → 60_000`). Pipeline produced a tool plan but the follow-up thought layer hit `timeout of 60000ms exceeded` before completing.
+- **Fix**: Changed `resolveThoughtTimeout()` in `interaction.service.ts`:
+  - ≤4B models: 120s → **300s** (5min)
+  - 8-12B models: 60s → **300s** (5min)
+  - >12B models: 30s → **120s** (2min)
+  - Added `OASIS_THOUGHT_TIMEOUT_MS` env var override — bypasses heuristics entirely when set
+- **Infrastructure**: Added `OASIS_THOUGHT_TIMEOUT_MS` to `docker-compose.yml` api-gateway env and `.env` (commented out, default 300000ms).
+- **Lesson**: Don't call "stall" until at least 20min of inactivity. Also add env var overrides for any timeout that hits slow remote models — avoids requiring code changes to tune.
+
+### 2026-06-18 — API-started sessions show no progress in UI (fix clientMessageId gap)
+
+- **Problem**: When a chat starts via `POST /api/v1/interaction` (e.g. curl/CLI), the HTTP caller has no `client_message_id`. The backend set `const clientMessageId = req.context?.client_message_id` which was `undefined`. All pipeline events (ThinkingChunkGenerated, ToolCallStarted, etc.) were published **without** `client_message_id`.
+  - The UI's SSE handler in App.tsx drops every event that lacks `client_message_id` (line 1041: `if (typeof clientId !== 'string' || !clientId) return`).
+  - No timeline, no thinking overlay, no progress = the session looks empty/silent when opened in the UI.
+- **Fix (3 layers)**:
+  1. **Backend — interaction.service.ts**: Changed `const clientMessageId = req.context?.client_message_id` to `const clientMessageId = req.context?.client_message_id || uuidv4()` so API callers always get a valid ID.
+  2. **Backend — redis-event.service.ts**: `pushMessage()` now accepts an optional `options.clientMessageId` parameter, which is stored as `client_message_id` in the message JSON. Both user and assistant `pushMessage` calls pass the generated `clientMessageId`.
+  3. **Frontend — App.tsx**: `loadHistoryPage()` and `loadSession()` detect the stored `client_message_id` from history and use it as the message ID for SSE event correlation. Both functions now also set `activeClientMessageId` + `isThinking` when loading an in-flight API-started session (last message is 'user' with `client_message_id`), so the thinking overlay activates and backlog SSE events match correctly.
+- **Contract**: Every pipeline event published via `this.events.publish()` now carries a defined `client_message_id`. The frontend SSE handler's drop guard no longer silently discards pipeline progress for API-originated sessions.
+
+### 2026-07-29 — Integration boundary audit
+- **Interaction lifecycle**: `POST /api/v1/interaction` is an acceptance endpoint (`202 { session_id }`), not an NDJSON final-response endpoint. Completed responses arrive through `/api/v1/events/timeline`; clients must correlate events/history with `client_message_id`.
+- **Contract drift found**: memory graph storage returns `{ status: "ok", graph_id }`; tool planning returns its action object directly; tool-plan requests include `context_window_override` and `context_output_reserve`. Shared Zod schemas must mirror these live shapes.
+- **Workflow invariants**: `maxConcurrency` must mark only the current batch dispatched, disabled workflows must reject all enqueue paths, and workflow deletion must remove run records, indexes, and per-run streams.
+- **Browser filesystem limitation**: `showDirectoryPicker()` exposes a directory handle/name but not an absolute host path. Never send `handle.name` to the dev-agent as `project_path`; desktop preload or manual entry is required.
+- **Optional platforms**: Leyline is already optional and has focused routing/budget tests. Janus is a Cloudflared tunnel guardian and should remain an operational health boundary. Arcana is a policy/approved-command boundary; never expose secret values, and treat daemon-unavailable as a tested disabled path.
+- **Janus boundary**: Janus v0.1.4 exposes `/api/status`; the gateway's optional `GET /api/v1/health/janus` adapter must return only sanitized disabled/healthy/unavailable state and never make chat execution depend on tunnel supervision.
+- **Arcana boundary**: Arcana uses local Ash/project policy resolution, not HTTP. The optional `GET /api/v1/health/arcana` adapter must use fixed argv, require absolute paths, reject NUL bytes, never accept secret values, and treat missing mapping/daemon as unavailable.
+- **Verification status**: Gateway Jest passes 133 tests and both gateway/UI production builds pass. Python collection passes 56 tests, and the full suite now passes after bounding Neo4j fallback initialization. Playwright Chromium infrastructure now runs the asynchronous interaction smoke test (1/1).

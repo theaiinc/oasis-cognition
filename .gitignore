@@ -37,3 +37,4 @@ services/ui_parser/weights/
 apps/api-gateway/theaiinc-yggdrasil*.tgz
 apps/agent-runner/theaiinc-yggdrasil*.tgz
 apps/agent-runner/theaiinc-yggdrasil-ratatoskr*.tgz
+apps/agent-runner/theaiinc-yggdrasil-runtime*.tgz

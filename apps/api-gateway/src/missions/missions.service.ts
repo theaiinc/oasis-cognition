@@ -152,7 +152,16 @@ export class MissionsService implements OnModuleInit, OnModuleDestroy {
   async update(id: string, patch: UpdateMissionDto): Promise<Mission> {
     const prev = await this.get(id);
     if (!prev) throw new HttpException('mission not found', HttpStatus.NOT_FOUND);
-    if (patch.schedule) this.validateSchedule(patch.schedule);
+    if ('goal' in patch && !patch.goal?.trim()) {
+      throw new HttpException('goal cannot be empty', HttpStatus.BAD_REQUEST);
+    }
+    if ('prompt' in patch && !patch.prompt?.trim()) {
+      throw new HttpException('prompt cannot be empty', HttpStatus.BAD_REQUEST);
+    }
+    if ('schedule' in patch) {
+      if (!patch.schedule?.trim()) throw new HttpException('schedule (cron) cannot be empty', HttpStatus.BAD_REQUEST);
+      this.validateSchedule(patch.schedule);
+    }
     const next: Mission = {
       ...prev,
       ...patch,

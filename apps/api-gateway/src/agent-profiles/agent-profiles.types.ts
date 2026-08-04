@@ -5,7 +5,7 @@
  * and project roles both reference profiles by id.
  */
 
-export type ProfileAgentType = 'internal' | 'claude-code' | 'cursor-cli';
+export type ProfileAgentType = 'internal' | 'claude-code' | 'cursor-cli' | 'opencode';
 export type PermissionMode = 'plan' | 'acceptEdits' | 'bypassPermissions' | 'default';
 
 export interface AgentProfileConfig {
@@ -22,8 +22,6 @@ export interface AgentProfileConfig {
   openai_api_key?: string;
   anthropic_api_key?: string;
   max_tokens?: number;
-  context_window?: number;
-  context_output_reserve?: number;
   leyline_base_url?: string;
   leyline_provider?: string;
   leyline_model?: string;
@@ -32,7 +30,7 @@ export interface AgentProfileConfig {
   /** External-only. Default `acceptEdits`. */
   permission_mode?: PermissionMode;
   /** External-only. Whether the Oasis MCP server should be auto-wired.
-   *  Defaults: true for claude-code, false for cursor-cli (no per-session
+   *  Defaults: true for claude-code, false for cursor-cli and opencode (no per-session
    *  MCP config flag). */
   mcp_enabled?: boolean;
   /** Prepended to every spawn's goal/prompt. Applied after the role
@@ -45,6 +43,12 @@ export interface AgentProfileConfig {
   billing_class?: 'free_local' | 'paid_api' | 'subscription_external' | 'uncertain';
   /** Rough resource footprint for capacity planning. */
   resource_class?: 'light' | 'standard' | 'gpu';
+  /** Override the model's context window (tokens). Defaults to the model variant's context_length.
+   *  Research agents typically need huge windows; coding agents can use moderate; chat agents can use small. */
+  context_window?: number;
+  /** Fraction of context_window reserved for output (0.0–1.0). Default 0.4.
+   *  Higher → more room for thinking/completion tokens, less for input context. */
+  context_output_reserve?: number;
 }
 
 export interface AgentProfile {

@@ -1,10 +1,10 @@
 import { Controller, Post, Get, Delete, Param, Body, Query, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import axios from 'axios';
 import { RedisEventService } from '../events/redis-event.service';
-import { CoordinatorService } from '../coordinator/coordinator.service';
 
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://localhost:8008';
 const MEMORY_URL = process.env.MEMORY_SERVICE_URL || 'http://memory-service:8004';
+const OASIS_AGENT_URL = process.env.OASIS_AGENT_URL || 'http://oasis-agent:8020';
 
 @Controller('project')
 export class ProjectController {
@@ -12,7 +12,6 @@ export class ProjectController {
 
   constructor(
     private readonly events: RedisEventService,
-    private readonly coordinator: CoordinatorService,
   ) {}
 
   @Get('config')
@@ -40,8 +39,21 @@ export class ProjectController {
       project_id: project,
       active_sessions: await this.events.getActiveSessions(project),
       events: await this.events.getProjectEvents(project, boundedLimit),
-      jobs: await this.coordinator.listJobs(undefined, project),
+      jobs: await this.listJobsForProject(project),
     };
+  }
+
+  private async listJobsForProject(projectId: string): Promise<unknown[]> {
+    try {
+      const res = await axios.get(`${OASIS_AGENT_URL}/api/v1/coordinator/jobs`, {
+        params: { project_id: projectId },
+        timeout: 10000,
+      });
+      return res.data;
+    } catch (err: any) {
+      this.logger.warn(`oasis-agent unavailable, omitting jobs from operations: ${err.message}`);
+      return [];
+    }
   }
 
   @Post('configure')

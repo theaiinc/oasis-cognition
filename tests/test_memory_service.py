@@ -15,6 +15,13 @@ def memory_svc():
     return MemoryService(settings)
 
 
+def test_unavailable_neo4j_uses_bounded_fallback_policy(memory_svc):
+    """Unavailable Neo4j must select fallback without the old 10x3s retry loop."""
+    assert memory_svc.storage_backend == "fallback"
+    assert memory_svc._settings.neo4j_init_max_retries == 1
+    assert memory_svc._settings.neo4j_retry_delay_seconds == 0.5
+
+
 @pytest.mark.asyncio
 async def test_store_and_retrieve(memory_svc):
     entry = MemoryEntry(

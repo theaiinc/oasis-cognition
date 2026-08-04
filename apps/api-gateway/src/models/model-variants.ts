@@ -19,9 +19,17 @@
  *   4. Bare model prefix
  */
 
-import type { BillingClass, ResourceClass } from '../coordinator/coordinator.types';
+// ── Types (moved from coordinator types to avoid circular dep) ──────────
 
-// ── Types ──────────────────────────────────────────────────────────────
+export type BillingClass =
+  | 'free_local'
+  | 'paid_api'
+  | 'subscription_external'
+  | 'uncertain';
+
+export type ResourceClass = 'light' | 'standard' | 'gpu';
+
+// ── Model variant definitions ─────────────────────────────────────────────
 
 export interface ModelVariant {
   /** The exact model string the LLM API expects. */
@@ -135,6 +143,54 @@ const registry: ModelVariant[] = [
     resource_class: 'standard',
   },
 
+  // gemma-4-12b-coder-fable5-composer2.5-v1 — fine-tuned 12B coder
+  {
+    id: 'gemma-4-12b-coder-fable5-composer2.5-v1',
+    name: 'Gemma 4 12B Coder Fable5 Composer2.5 v1',
+    family: 'gemma-4',
+    provider: 'openai',
+    source: 'lmstudio',
+
+    parameter_size_b: 12,
+    quantization: 'unknown',
+    context_length: 262_144,
+
+    capabilities: {
+      tools: true,
+      thinking: true,
+      vision: false,
+      code: true,
+      embedding: false,
+    },
+
+    billing_class: 'free_local',
+    resource_class: 'standard',
+  },
+
+  // google/gemma-4-e2b — 2B, fast for testing
+  {
+    id: 'google/gemma-4-e2b',
+    name: 'Gemma 4 e2B',
+    family: 'gemma-4',
+    provider: 'openai',
+    source: 'lmstudio',
+
+    parameter_size_b: 2,
+    quantization: 'fp16',
+    context_length: 262_144,
+
+    capabilities: {
+      tools: true,
+      thinking: true,
+      vision: false,
+      code: false,
+      embedding: false,
+    },
+
+    billing_class: 'free_local',
+    resource_class: 'standard',
+  },
+
   // ── Ollama / local (legacy) ──────────────────────────────────────────
   {
     id: 'qwen3:8b',
@@ -225,6 +281,30 @@ const registry: ModelVariant[] = [
       vision: false,
       code: false,
       embedding: true,
+    },
+
+    billing_class: 'free_local',
+    resource_class: 'light',
+  },
+
+  // arch-router-1.5b.gguf — purpose-built routing model, tiny & fast
+  {
+    id: 'arch-router-1.5b.gguf',
+    name: 'Arch Router 1.5B',
+    family: 'qwen2',
+    provider: 'openai',
+    source: 'lmstudio',
+
+    parameter_size_b: 1.5,
+    quantization: 'Q4_K_M',
+    context_length: 32_768,
+
+    capabilities: {
+      tools: false,
+      thinking: false,
+      vision: false,
+      code: false,
+      embedding: false,
     },
 
     billing_class: 'free_local',

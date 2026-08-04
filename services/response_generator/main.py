@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import sys
 import os
@@ -179,6 +180,24 @@ async def generate_response_stream(req: GenerateRequest):
     return StreamingResponse(generate(), media_type="text/plain")
 
 
+@app.post("/internal/response/generate-stream-structured")
+async def generate_response_stream_structured(req: GenerateRequest):
+    """Like ``/generate-stream`` but yields NDJSON lines with ``type``
+    discrimination so the gateway can forward reasoning (thinking) tokens
+    to the frontend separately from visible content.
+
+    Each line is JSON: ``{"type": "reasoning", "text": "..."}`` or
+    ``{"type": "content", "text": "..."}``.
+    """
+    decision = DecisionTree(**req.decision_tree)
+    async def generate():
+        async for line in generator.stream_format_response_structured(
+            decision, context=req.context, user_message=req.user_message, chat_history=req.chat_history,
+        ):
+            yield line
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
+
+
 @app.post("/internal/response/chat")
 async def casual_chat(req: ChatRequest):
     try:
@@ -221,6 +240,11 @@ class ToolPlanRequest(BaseModel):
     tool_history_digest: list[str] | None = None  # compact one-liner per successful call from ALL toolResults
     artifact_search_results: list[dict[str, Any]] | None = None
     artifact_context: str | None = None
+    model_override: str | None = None  # model name for prompt-tier selection (e.g. "google/gemma-4-e2b")
+    rule_packs_to_inject: list[str] | None = None  # JIT-inject these rule packs (e.g. ["tool_rules", "coding_rules"])
+    max_tokens: int | None = None  # model-tier-specific output token cap
+    context_window_override: int | None = None  # override default context_window (profile > model variant > env)
+    context_output_reserve: float | None = None  # fraction reserved for output (0.0-1.0), e.g. 0.4
 
 class ThoughtGenerateRequest(BaseModel):
     user_message: str
@@ -292,6 +316,9 @@ async def tool_plan(req: ToolPlanRequest):
             free_thoughts=req.free_thoughts,
             active_worktree_id=req.active_worktree_id,
             tool_history_digest=req.tool_history_digest,
+            rule_packs_to_inject=req.rule_packs_to_inject,
+            model_override=req.model_override,
+            max_tokens=req.max_tokens,
         )
         # Attach context budget info so the gateway can relay to the UI
         if generator._last_context_budget:
@@ -335,8 +362,8 @@ async def tool_plan_parse_raw(req: ToolPlanParseRawRequest):
 @app.post("/internal/response/tool-plan-stream")
 async def tool_plan_stream(req: ToolPlanRequest):
     """Stream the planning of the next tool call."""
-    def generate():
-        for chunk in generator.stream_tool_plan(
+    async def generate():
+        async for chunk in generator.stream_tool_plan(
             req.user_message,
             tool_results=req.tool_results,
             chat_history=req.chat_history,
@@ -356,9 +383,31 @@ async def tool_plan_stream(req: ToolPlanRequest):
             tool_history_digest=req.tool_history_digest,
             artifact_search_results=req.artifact_search_results,
             artifact_context=req.artifact_context,
+            model_override=req.model_override,
+            rule_packs_to_inject=req.rule_packs_to_inject,
+            max_tokens=req.max_tokens,
+            context_window_override=req.context_window_override,
+            context_output_reserve=req.context_output_reserve,
         ):
             yield chunk
     return StreamingResponse(generate(), media_type="text/plain")
+
+
+class RouteRequest(BaseModel):
+    user_message: str
+    chat_history: list[dict[str, str]] | None = None
+
+
+@app.post("/internal/route")
+async def route_request(req: RouteRequest):
+    """Classify a user request and return a model tier recommendation."""
+    from services.response_generator.service import route_request as _route
+
+    result = await _route(
+        user_message=req.user_message,
+        chat_history=req.chat_history,
+    )
+    return result
 
 
 class DecisionRequest(BaseModel):
@@ -366,6 +415,7 @@ class DecisionRequest(BaseModel):
     user_message: str
     context: dict[str, Any] | None = None
     memory_context: list[dict[str, Any]] | None = None
+    chat_history: list[dict[str, str]] | None = None
 
 
 @app.post("/internal/decision")
@@ -376,6 +426,7 @@ async def make_decision(req: DecisionRequest):
         user_message=req.user_message,
         context=req.context,
         memory_context=req.memory_context,
+        chat_history=req.chat_history,
     )
 
 
@@ -444,8 +495,8 @@ from fastapi.responses import StreamingResponse
 @app.post("/internal/thought/reason-stream")
 async def reasoning_layer_stream(req: ThoughtReasonRequest):
     """Stream a free-form reasoning thought trace (Free Thoughts)."""
-    def generate():
-        for chunk in generator.stream_free_thoughts(
+    async def generate():
+        async for chunk in generator._stream_free_thoughts_async(
             req.user_message,
             context=req.context,
             chat_history=req.chat_history,
@@ -455,6 +506,28 @@ async def reasoning_layer_stream(req: ThoughtReasonRequest):
             yield chunk
 
     return StreamingResponse(generate(), media_type="text/plain")
+
+
+@app.post("/internal/thought/reason-stream-structured")
+async def reasoning_layer_stream_structured(req: ThoughtReasonRequest):
+    """Stream a structured reasoning thought trace with tool call support (NDJSON).
+
+    Each line is JSON with a ``type`` field: ``"reasoning"``, ``"tool_call"``,
+    ``"content"``, or ``"done"``. When ``type`` is ``"tool_call"``, the gateway
+    should execute the requested tool and re-invoke this endpoint with the
+    results appended to ``tool_results``.
+    """
+    async def generate():
+        async for item in generator._stream_free_thoughts_structured_async(
+            req.user_message,
+            context=req.context,
+            chat_history=req.chat_history,
+            tool_results=req.tool_results,
+            observer_feedback=req.observer_feedback,
+        ):
+            yield json.dumps(item) + "\n"
+
+    return StreamingResponse(generate(), media_type="application/x-ndjson")
 
 
 @app.post("/internal/thought/reason")

@@ -6,6 +6,7 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { useToast } from '@/hooks/use-toast';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 interface VoiceIdModalProps {
   onClose: () => void;
@@ -122,7 +123,7 @@ export function VoiceIdModal({ onClose, voiceAgentUrl, micEnabled, setMicSilent 
               <div className="text-center">
                 <p className="text-sm text-slate-200 font-medium mb-2">No voice profile set up yet</p>
                 <p className="text-xs text-slate-400 leading-relaxed">
-                  Enroll your voice so Oasis only listens to you and ignores other people, TV, and background conversations.
+                  Enroll your voice so {BRAND_SHORT_NAME} only listens to you and ignores other people, TV, and background conversations.
                 </p>
               </div>
               <div className="bg-slate-800/60 rounded-xl p-4 w-full">
@@ -158,7 +159,7 @@ export function VoiceIdModal({ onClose, voiceAgentUrl, micEnabled, setMicSilent 
               </div>
               <p className="text-sm text-slate-300 text-center">
                 Speak now! Say anything naturally.<br />
-                <span className="text-slate-500 text-xs">e.g. "Hello, I'm setting up my voice profile for Oasis"</span>
+                <span className="text-slate-500 text-xs">e.g. "Hello, I'm setting up my voice profile for {BRAND_SHORT_NAME}"</span>
               </p>
               <div className="w-full bg-slate-800 rounded-full h-2 mt-2">
                 <motion.div
@@ -184,7 +185,7 @@ export function VoiceIdModal({ onClose, voiceAgentUrl, micEnabled, setMicSilent 
               <div className="text-center">
                 <p className="text-sm font-bold text-emerald-400">Voice Profile Enrolled!</p>
                 <p className="text-xs text-slate-400 mt-2 leading-relaxed">
-                  Oasis will now only respond to your voice.<br />
+                  {BRAND_SHORT_NAME} will now only respond to your voice.<br />
                   Other voices in the room will be ignored.
                 </p>
               </div>

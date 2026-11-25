@@ -24,6 +24,7 @@ import {
   activateProject, getProjectSettings, saveProjectSettings, getAgentProfile, updateAgentProfile,
   type Artifact, type Project, type SpeakerProfile,
 } from '@/lib/artifact-api';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -853,7 +854,7 @@ export function SettingsPanel({
                 <p className="text-sm font-semibold text-slate-200">Per-session budget cap</p>
                 <p className="text-[11px] text-slate-500 mt-1 leading-relaxed">
                   Cap how many tokens or how many dollars this session can consume across all
-                  agent calls. When the cap is reached, Oasis refuses further LLM work and asks
+                  agent calls. When the cap is reached, {BRAND_SHORT_NAME} refuses further LLM work and asks
                   you to raise the cap or start a new chat. The cap applies to the current
                   session only — every new chat starts fresh.
                 </p>

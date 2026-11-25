@@ -450,6 +450,10 @@ services:
     build:
       context: .
       dockerfile: apps/oasis-ui-react/Dockerfile
+      args:
+        - VITE_BRAND_NAME=${VITE_BRAND_NAME:-}
+        - VITE_BRAND_SHORT_NAME=${VITE_BRAND_SHORT_NAME:-}
+        - VITE_BRAND_LOGO=${VITE_BRAND_LOGO:-}
     restart: unless-stopped
     ports:
       - "3000:80"

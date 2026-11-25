@@ -13,6 +13,14 @@ COPY packages/ui-kit/ /repo/packages/ui-kit/
 
 # Copy app source
 COPY apps/oasis-ui-react/ .
+
+# Branding (src/lib/brand.ts): empty means the Oasis Cognition defaults.
+ARG VITE_BRAND_NAME=
+ARG VITE_BRAND_SHORT_NAME=
+ARG VITE_BRAND_LOGO=
+ENV VITE_BRAND_NAME=${VITE_BRAND_NAME}
+ENV VITE_BRAND_SHORT_NAME=${VITE_BRAND_SHORT_NAME}
+ENV VITE_BRAND_LOGO=${VITE_BRAND_LOGO}
 RUN npm run build
 
 FROM nginx:alpine

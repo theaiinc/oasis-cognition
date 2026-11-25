@@ -1,5 +1,6 @@
 import { DollarSign, Coins, Infinity as InfinityIcon, AlertCircle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 export type BudgetMode = 'unlimited' | 'tokens' | 'usd';
 
@@ -83,7 +84,7 @@ export function SessionBudgetPill({ usage, budget, pct, onClick }: Props) {
     ? `\nPricing as of ${usage.pricing_updated_at}.`
     : '';
   const tooltipBase = over
-    ? `Budget cap reached — Oasis is refusing further LLM calls in this session. Raise the cap in Settings, or start a new chat.`
+    ? `Budget cap reached — ${BRAND_SHORT_NAME} is refusing further LLM calls in this session. Raise the cap in Settings, or start a new chat.`
     : warn
       ? `Approaching cap (${Math.round(pct * 100)}%). Click to raise.`
       : `${Math.round(pct * 100)}% of cap used. Click to adjust.`;

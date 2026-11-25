@@ -5,6 +5,7 @@ import { useToast } from '@/hooks/use-toast';
 import { getErrorMessage } from '@/lib/utils';
 import { VOICE_AGENT_URL } from '@/lib/constants';
 import type { Message, TimelineEvent } from '@/lib/types';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 function getMediaStreamTrack(track: unknown): MediaStreamTrack | undefined {
   if (!track || typeof track !== 'object') return undefined;
@@ -106,7 +107,7 @@ export function useVoiceConnection({
         setIsConnected(true);
         setIsConnecting(false);
         setStatusText('Connected');
-        addMessage('Connected to Oasis reasoning session.', 'system');
+        addMessage(`Connected to ${BRAND_SHORT_NAME} reasoning session.`, 'system');
         const sendSetSession = () => {
           try {
             room.localParticipant.publishData(new TextEncoder().encode(JSON.stringify({ type: 'set_session', session_id: sessionIdRef.current })), { reliable: true });

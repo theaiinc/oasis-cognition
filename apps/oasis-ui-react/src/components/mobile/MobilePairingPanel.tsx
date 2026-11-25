@@ -7,6 +7,7 @@ import { ScrollArea } from '../ui/scroll-area';
 import { useToast } from '../../hooks/use-toast';
 import { MOBILE_PAIRING_URL } from '../../lib/constants';
 import axios from 'axios';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 interface PairingStatus {
   state: 'idle' | 'awaiting_mobile' | 'paired' | 'expired';
@@ -176,7 +177,7 @@ export function MobilePairingPanel({ onClose }: MobilePairingPanelProps) {
           {status.state === 'idle' && (
             <>
               <p className="text-xs text-slate-400">
-                Pair a mobile device to use Oasis as a companion app. A secure, encrypted session
+                Pair a mobile device to use {BRAND_SHORT_NAME} as a companion app. A secure, encrypted session
                 will be established via QR code.
               </p>
 

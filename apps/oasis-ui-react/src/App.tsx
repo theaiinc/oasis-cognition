@@ -41,6 +41,7 @@ import type { CaptureTarget } from '@/components/computer-use/CaptureTargetPicke
 import { MobilePairingPanel } from '@/components/mobile/MobilePairingPanel';
 import { useVoiceConnection } from '@/hooks/useVoiceConnection';
 import { TokenUsageDonut } from '@/components/chat/TokenUsageDonut';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 function isUserAbort(e: unknown): boolean {
   if (axios.isAxiosError(e) && e.code === 'ERR_CANCELED') return true;
@@ -252,12 +253,12 @@ export default function App() {
       // Electron desktop shell
       const w = window as unknown as { oasis?: { isDesktop?: boolean; notify?: (o: { title: string; body: string; silent?: boolean }) => void } };
       if (w.oasis?.isDesktop && w.oasis.notify) {
-        w.oasis.notify({ title: 'Oasis', body: msg });
+        w.oasis.notify({ title: BRAND_SHORT_NAME, body: msg });
         return;
       }
       // Browser: use the Web Notification API
       if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
-        new Notification('Oasis', { body: msg });
+        new Notification(BRAND_SHORT_NAME, { body: msg });
       }
     } catch { /* notifications not supported */ }
   }, []);
@@ -1263,7 +1264,7 @@ export default function App() {
       {showSidebar && <div className="md:hidden fixed inset-0 bg-black/60 z-20" onClick={() => setShowSidebar(false)} aria-hidden="true" />}
       <div className={cn("w-16 min-w-[64px] flex-shrink-0 flex flex-col items-center py-6 border-r border-slate-800 bg-[#0a0f1a] gap-8 z-30", !showSidebar && "max-md:hidden", showSidebar && "max-md:fixed max-md:left-0 max-md:top-0 max-md:h-screen max-md:shadow-xl")}>
         <div className="w-10 h-10 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center shadow-lg shadow-blue-900/10">
-          <img src="/favicon.svg" alt="Oasis" className="w-7 h-7 select-none" draggable={false} />
+          <img src="/favicon.svg" alt={BRAND_SHORT_NAME} className="w-7 h-7 select-none" draggable={false} />
         </div>
         <div className="flex-1 flex flex-col gap-6">
           <Button

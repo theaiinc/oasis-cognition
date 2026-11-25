@@ -1,6 +1,7 @@
 import { Body, Controller, Delete, Get, Param, Patch, Post, Query, HttpException, HttpStatus, Logger } from '@nestjs/common';
 import { MissionsService } from './missions.service';
-import type { CreateMissionDto, UpdateMissionDto } from './missions.types';
+import { bulkFilter, bulkTargets } from './missions-bulk';
+import type { BulkMissionsDto, BulkMissionsResult, CreateMissionDto, Mission, UpdateMissionDto } from './missions.types';
 
 @Controller('missions')
 export class MissionsController {
@@ -10,6 +11,18 @@ export class MissionsController {
   @Get()
   async list(@Query('project_id') projectId?: string) {
     return { missions: await this.missions.list(projectId?.trim() || undefined) };
+  }
+
+  /** Pause every mission (optionally only one project's or one role's). */
+  @Post('pause-all')
+  async pauseAll(@Body() body: BulkMissionsDto) {
+    return this.bulk(body, 'pause');
+  }
+
+  /** Resume every paused mission (same filters as pause-all). */
+  @Post('resume-all')
+  async resumeAll(@Body() body: BulkMissionsDto) {
+    return this.bulk(body, 'resume');
   }
 
   @Get(':id')
@@ -48,5 +61,15 @@ export class MissionsController {
   @Post(':id/run')
   async runOnce(@Param('id') id: string) {
     return this.missions.runOnce(id);
+  }
+
+  private async bulk(body: BulkMissionsDto | undefined, op: 'pause' | 'resume'): Promise<BulkMissionsResult> {
+    const { inScope, targets } = bulkTargets(await this.missions.list(), bulkFilter(body), op);
+    const changed: Mission[] = [];
+    for (const m of targets) {
+      changed.push(op === 'pause' ? await this.missions.pause(m.mission_id) : await this.missions.resume(m.mission_id));
+    }
+    this.logger.log(`${op}-all: ${changed.length} changed, ${inScope.length - targets.length} unchanged`);
+    return { changed, unchanged: inScope.length - targets.length };
   }
 }

@@ -15,6 +15,7 @@ import { ComputerUseModule } from './computer-use/computer-use.module';
 import { ArtifactModule } from './artifact/artifact.module';
 import { WorkflowsModule } from './workflows/workflows.module';
 import { WebSearchModule } from './web-search/web-search.module';
+import { KnowledgePacksModule } from './knowledge-packs/knowledge-packs.module';
 import { AgentProfilesModule } from './agent-profiles/agent-profiles.module';
 import { ProjectRolesModule } from './project-roles/project-roles.module';
 import { FilesModule } from './files/files.module';
@@ -42,6 +43,7 @@ import { ArcanaModule } from './arcana/arcana.module';
     ArtifactModule,
     WorkflowsModule,
     WebSearchModule,
+    KnowledgePacksModule,
     AgentProfilesModule,
     ProjectRolesModule,
     FilesModule,

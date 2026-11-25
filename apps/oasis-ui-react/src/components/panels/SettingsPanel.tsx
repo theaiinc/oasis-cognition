@@ -25,6 +25,7 @@ import {
   type Artifact, type Project, type SpeakerProfile,
 } from '@/lib/artifact-api';
 import { BRAND_SHORT_NAME } from '@/lib/brand';
+import { KnowledgePackSettings } from './KnowledgePackSettings';
 
 interface SettingsPanelProps {
   open: boolean;
@@ -52,7 +53,7 @@ function inferMediaType(mime: string, name: string): 'audio' | 'video' | 'image'
   return null;
 }
 
-type TabKey = 'project' | 'voices' | 'autonomous' | 'budget' | 'general';
+type TabKey = 'project' | 'voices' | 'knowledge' | 'autonomous' | 'budget' | 'general';
 
 type BudgetMode = 'unlimited' | 'tokens' | 'usd';
 interface BudgetSnapshot {
@@ -524,6 +525,7 @@ export function SettingsPanel({
         {([
           ['project', 'Project'],
           ['voices', 'Voices'],
+          ['knowledge', 'Knowledge'],
           ['autonomous', 'Autonomous'],
           ['budget', 'Budget'],
           ['general', 'General'],
@@ -1008,6 +1010,8 @@ export function SettingsPanel({
               </div>
             </div>
           )}
+
+          {tab === 'knowledge' && <KnowledgePackSettings activeProjectId={activeProjectId} activeProjectName={activeProjectName} />}
 
           {tab === 'general' && (
             <div className="flex flex-col gap-4">

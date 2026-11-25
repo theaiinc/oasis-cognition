@@ -13,7 +13,7 @@ from typing import Any
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "../.."))
 
-from fastapi import FastAPI, Query
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel
 
 from packages.reasoning_schema.models import MemoryEntry, ReasoningGraph
@@ -546,6 +546,32 @@ async def get_project_rules(
 async def scope_rule_to_project(req: ScopeRuleRequest):
     await memory.scope_rule_to_project(req.rule_id, req.project_id)
     return {"status": "ok"}
+
+
+# ── Knowledge packs (export / import a project's rules) ────────────────
+# The api-gateway names the project; nothing in the pack decides where it is written.
+
+class ImportKnowledgePackRequest(BaseModel):
+    pack: Any
+    project_id: str | None = None
+
+
+@app.get("/internal/memory/knowledge-packs/export")
+async def export_knowledge_pack(project_id: str | None = Query(None), name: str = Query("", max_length=120)):
+    from services.memory_service.knowledge_pack import PackError, export_pack
+    try:
+        return await export_pack(memory, project_id=project_id or None, name=name)
+    except PackError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+
+@app.post("/internal/memory/knowledge-packs/import")
+async def import_knowledge_pack(req: ImportKnowledgePackRequest):
+    from services.memory_service.knowledge_pack import PackError, import_pack
+    try:
+        return await import_pack(memory, req.pack, project_id=req.project_id or None)
+    except PackError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
 
 @app.get("/internal/memory/projects/{project_id}/chats")

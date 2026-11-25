@@ -1607,6 +1607,9 @@ export default function App() {
               {messages.filter((m) => m.sender === 'user' || m.sender === 'assistant').length === 0 && !voice.micEnabled && (
                 <EmptyChatHints
                   hasMissions={Object.keys(missionsById).length > 0}
+                  projectId={activeProjectId}
+                  sessionId={textSessionId}
+                  onMissionCreated={() => { void reloadMissions(); }}
                   onPick={(prompt) => { setInputText(prompt); inputRef.current?.focus(); }}
                 />
               )}

@@ -16,6 +16,8 @@ interface MobileChatViewProps {
   onCancel: () => void;
   onOpenSidebar: () => void;
   voice?: VoiceChatState;
+  online?: boolean;
+  onCancelQueued?: (queueId: string) => void;
 }
 
 export function MobileChatView({
@@ -28,6 +30,8 @@ export function MobileChatView({
   onCancel,
   onOpenSidebar,
   voice,
+  online = true,
+  onCancelQueued,
 }: MobileChatViewProps) {
   const scrollRef = useRef<HTMLDivElement>(null);
 
@@ -74,6 +78,11 @@ export function MobileChatView({
 
       {/* Connection status */}
       <PairingStatus connected={pairing.paired} expiresAt={pairing.expiresAt} />
+      {!online && (
+        <div className="px-4 py-1.5 bg-amber-900/30 border-b border-amber-800/60 text-[11px] text-amber-200">
+          You're offline. Messages you send now will go out when you're back online.
+        </div>
+      )}
 
       {/* Messages */}
       <div ref={scrollRef} className="flex-1 overflow-y-auto px-4 py-4">
@@ -100,7 +109,7 @@ export function MobileChatView({
         ) : (
           <div className="flex flex-col gap-3">
             {messages.map((msg) => (
-              <MobileChatMessage key={msg.id} message={msg} />
+              <MobileChatMessage key={msg.id} message={msg} onCancelQueued={onCancelQueued} />
             ))}
             {/* Streaming status indicator */}
             {isThinking && streamingStatus && !messages.some(m => m.isStreaming && (m.text || m.thinking)) && (

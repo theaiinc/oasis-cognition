@@ -10,6 +10,7 @@ export class SessionService {
   private session: MobilePairingSession | null = null;
   private cleanupTimer: ReturnType<typeof setInterval> | null = null;
   private onSessionExpired: (() => void) | null = null;
+  private readonly endListeners = new Set<(ended: { pairingId: string; pushDeviceId: string | null }) => void>();
 
   constructor() {
     this.cleanupTimer = setInterval(() => this.checkExpiration(), CLEANUP_INTERVAL_MS);
@@ -17,6 +18,16 @@ export class SessionService {
 
   setOnSessionExpired(cb: () => void): void {
     this.onSessionExpired = cb;
+  }
+
+  /** Called once per pairing when it ends (revoked, expired or replaced), before its keys are wiped. */
+  onSessionEnded(cb: (ended: { pairingId: string; pushDeviceId: string | null }) => void): () => void {
+    this.endListeners.add(cb);
+    return () => this.endListeners.delete(cb);
+  }
+
+  setPushDeviceId(deviceId: string | null): void {
+    if (this.session && this.session.mobilePaired) this.session.pushDeviceId = deviceId;
   }
 
   getState(): PairingState {
@@ -128,6 +139,10 @@ export class SessionService {
 
   private cleanup(): void {
     if (this.session) {
+      const ended = { pairingId: this.session.pairingId, pushDeviceId: this.session.pushDeviceId ?? null };
+      for (const cb of this.endListeners) {
+        try { cb(ended); } catch { /* a listener never blocks cleanup */ }
+      }
       // Wipe key material
       if (this.session.sessionKey) {
         this.session.sessionKey.fill(0);

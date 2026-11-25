@@ -1,22 +1,15 @@
 import axios from 'axios';
-import http from 'http';
+import { v4 as uuidv4 } from 'uuid';
+import { GATEWAY_URL } from '../gateway';
+import { followTurn, FollowOptions, FollowResult } from './timeline-follower';
 import { SessionService } from '../session/session.service';
 import { encrypt, decrypt } from '../crypto/crypto.service';
 import { EncryptedPayload } from '../crypto/crypto.types';
 
-const GATEWAY_URL = process.env.GATEWAY_URL || 'http://localhost:8000';
 const DEV_AGENT_URL = process.env.DEV_AGENT_URL || 'http://127.0.0.1:8008';
+/** A Redis stream id, the gateway's event cursor. */
+const CURSOR = /^\d+-\d+$/;
 
-// Timeline event types worth forwarding to mobile
-const FORWARD_EVENT_TYPES = new Set([
-  'ResponseChunkGenerated',
-  'ToolCallStarted',
-  'ToolCallCompleted',
-  'ToolReasoningChunkGenerated',
-  'ThoughtChunkGenerated',
-  'ThoughtLayerGenerated',
-  'ThoughtsValidated',
-]);
 
 export class RelayService {
   constructor(private readonly sessionService: SessionService) {}
@@ -46,14 +39,18 @@ export class RelayService {
   }
 
   /**
-   * Forward an interaction to the gateway with real-time streaming.
+   * Send the phone's message to the gateway and stream the turn back.
    *
-   * Opens TWO channels simultaneously:
-   * 1. POST /interaction (NDJSON) — the main request/response
-   * 2. GET /events/timeline (SSE) — real-time streaming events (response chunks, tool calls, thinking)
+   * The gateway accepts a message with 202 and a replay cursor, then runs the
+   * turn in the background and publishes its progress on the timeline. We follow
+   * the timeline from that cursor (see followTurn) and write each event to the
+   * phone as one encrypted NDJSON line, each carrying `_cursor`, then a final line
+   * with the response (or `_oasis_error`).
    *
-   * Both channels' data is encrypted and forwarded to mobile as NDJSON lines,
-   * tagged with `_stream_type` so mobile can distinguish them.
+   * A phone that lost the stream sends the same message again, with the same
+   * client_message_id and `resume_after` set to the last `_cursor` it got: the
+   * gateway recognises the id and starts no second turn, and we replay from
+   * that cursor, so the phone sees every event once.
    */
   async streamInteraction(
     decryptedBody: any,
@@ -61,135 +58,101 @@ export class RelayService {
     mobileSessionId: string,
     writeEncryptedLine: (payload: EncryptedPayload) => void,
     onDone: () => void,
+    signal: AbortSignal = new AbortController().signal,
+    follow: (opts: FollowOptions) => Promise<FollowResult> = followTurn,
   ): Promise<void> {
+    const { resume_after: resumeAfterRaw, ...body } = decryptedBody || {};
+    const resumeAfter = typeof resumeAfterRaw === 'string' && CURSOR.test(resumeAfterRaw) ? resumeAfterRaw : null;
+    const clientMessageId = typeof body.context?.client_message_id === 'string' && body.context.client_message_id
+      ? body.context.client_message_id
+      : uuidv4();
     const gatewayBody = {
-      ...decryptedBody,
+      ...body,
       session_id: mobileSessionId,
-      context: {
-        ...decryptedBody.context,
-        source: 'mobile-companion',
-      },
+      context: { ...body.context, source: 'mobile-companion', client_message_id: clientMessageId },
+    };
+    const send = (obj: Record<string, unknown>) => {
+      try {
+        writeEncryptedLine(this.encryptResponse(JSON.stringify(obj), pairingId));
+      } catch (err) {
+        console.warn('[Relay] Failed to encrypt line:', (err as Error).message);
+      }
     };
 
-    // Start SSE timeline listener BEFORE sending the interaction
-    // so we don't miss early events
-    const sseCleanup = this.subscribeToTimeline(mobileSessionId, pairingId, writeEncryptedLine);
-
     try {
-      const response = await axios.post(`${GATEWAY_URL}/api/v1/interaction`, gatewayBody, {
-        responseType: 'stream',
-        headers: {
-          'Content-Type': 'application/json',
-          Accept: 'application/x-ndjson',
-        },
-        timeout: 300_000,
+      let accepted: { event_cursor?: string; duplicate?: boolean };
+      try {
+        const response = await axios.post(`${GATEWAY_URL}/api/v1/interaction`, gatewayBody, {
+          headers: { 'Content-Type': 'application/json' },
+          timeout: 30_000,
+          signal,
+        });
+        accepted = response.data || {};
+      } catch (err: any) {
+        if (signal.aborted) return;
+        const status: number | undefined = err?.response?.status;
+        const detail = err?.response?.data?.message || err?.response?.data?.error;
+        send({
+          _oasis_error: true,
+          // Network trouble or a 5xx: the same message can be sent again safely.
+          retryable: !status || status >= 500,
+          body: { error: typeof detail === 'string' ? detail : (status ? `Gateway refused the message (${status})` : 'Desktop is unreachable') },
+        });
+        return;
+      }
+
+      const startCursor = typeof accepted.event_cursor === 'string' && CURSOR.test(accepted.event_cursor) ? accepted.event_cursor : null;
+      const after = resumeAfter || startCursor;
+      send({ _oasis_accepted: true, client_message_id: clientMessageId, duplicate: Boolean(accepted.duplicate), _cursor: after });
+
+      const result = await follow({
+        sessionId: mobileSessionId,
+        clientMessageId,
+        after,
+        signal,
+        onEvent: (event, cursor) => send({ _mobile_event: true, event_type: event.event_type, payload: event.payload, _cursor: cursor }),
       });
 
-      await new Promise<void>((resolve, reject) => {
-        let buffer = '';
-
-        response.data.on('data', (chunk: Buffer) => {
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-            try {
-              const encrypted = this.encryptResponse(trimmed, pairingId);
-              writeEncryptedLine(encrypted);
-            } catch (err) {
-              console.warn('[Relay] Failed to encrypt line:', (err as Error).message);
-            }
-          }
-        });
-
-        response.data.on('end', () => {
-          if (buffer.trim()) {
-            try {
-              const encrypted = this.encryptResponse(buffer.trim(), pairingId);
-              writeEncryptedLine(encrypted);
-            } catch { /* ignore */ }
-          }
-          resolve();
-        });
-
-        response.data.on('error', (err: Error) => reject(err));
-      });
+      switch (result.outcome) {
+        case 'completed':
+          send({ session_id: mobileSessionId, client_message_id: clientMessageId, response: result.response, _cursor: result.cursor });
+          break;
+        case 'failed':
+        case 'cancelled':
+          send({ _oasis_error: true, retryable: false, body: { error: result.error }, _cursor: result.cursor });
+          break;
+        case 'unreachable':
+        case 'timeout':
+          send({ _oasis_error: true, retryable: true, body: { error: result.error }, _cursor: result.cursor });
+          break;
+        case 'aborted':
+          break;
+      }
     } finally {
-      // Close the SSE connection
-      sseCleanup();
       onDone();
     }
   }
 
-  /**
-   * Subscribe to the gateway's SSE timeline for a session.
-   * Forwards relevant events (response chunks, tool calls, thinking) as encrypted NDJSON lines
-   * tagged with `_mobile_event: true` so the mobile client can distinguish them from the
-   * final interaction response.
-   *
-   * Returns a cleanup function to close the SSE connection.
-   */
-  private subscribeToTimeline(
-    sessionId: string,
-    pairingId: string,
-    writeEncryptedLine: (payload: EncryptedPayload) => void,
-  ): () => void {
-    let req: http.ClientRequest | null = null;
-    let closed = false;
+  // ── Push notifications (registrations live on the gateway) ───────────────
 
-    const url = new URL(`${GATEWAY_URL}/api/v1/events/timeline`);
-    url.searchParams.set('session_id', sessionId);
-    url.searchParams.set('backlog', '0');
+  async getPushConfig(): Promise<{ enabled: boolean; public_key: string | null }> {
+    const response = await axios.get(`${GATEWAY_URL}/api/v1/mobile-push/config`, { timeout: 10_000 });
+    return { enabled: Boolean(response.data?.enabled), public_key: response.data?.public_key ?? null };
+  }
 
-    // Use raw http to handle SSE stream
-    req = http.get(url.toString(), (res) => {
-      let sseBuffer = '';
+  async registerPush(deviceId: string, subscription: unknown): Promise<void> {
+    await axios.post(`${GATEWAY_URL}/api/v1/mobile-push/subscriptions`, { device_id: deviceId, subscription }, { timeout: 10_000 });
+    this.sessionService.setPushDeviceId(deviceId);
+  }
 
-      res.on('data', (chunk: Buffer) => {
-        if (closed) return;
-        sseBuffer += chunk.toString();
-        const lines = sseBuffer.split('\n');
-        sseBuffer = lines.pop() || '';
+  async unregisterPush(deviceId: string): Promise<void> {
+    await axios.delete(`${GATEWAY_URL}/api/v1/mobile-push/subscriptions/${encodeURIComponent(deviceId)}`, { timeout: 10_000 });
+    const s = this.sessionService.getActiveSession();
+    if (s?.pushDeviceId === deviceId) this.sessionService.setPushDeviceId(null);
+  }
 
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (!data) continue;
-
-          try {
-            const event = JSON.parse(data);
-            if (!FORWARD_EVENT_TYPES.has(event.event_type)) continue;
-
-            // Tag it as a streaming event for mobile to distinguish
-            const mobileEvent = {
-              _mobile_event: true,
-              event_type: event.event_type,
-              payload: event.payload || {},
-            };
-
-            const encrypted = this.encryptResponse(JSON.stringify(mobileEvent), pairingId);
-            writeEncryptedLine(encrypted);
-          } catch {
-            // Skip unparseable events
-          }
-        }
-      });
-
-      res.on('error', () => { /* ignore SSE errors */ });
-    });
-
-    req.on('error', () => { /* ignore connection errors */ });
-
-    return () => {
-      closed = true;
-      if (req) {
-        req.destroy();
-        req = null;
-      }
-    };
+  async testPush(deviceId: string): Promise<void> {
+    await axios.post(`${GATEWAY_URL}/api/v1/mobile-push/subscriptions/${encodeURIComponent(deviceId)}/test`, {}, { timeout: 15_000 });
   }
 
   async proxyHistory(path: string, query: Record<string, string>, pairingId: string): Promise<EncryptedPayload> {

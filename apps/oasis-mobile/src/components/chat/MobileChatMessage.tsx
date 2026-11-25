@@ -7,9 +7,11 @@ import type { Message } from '../../lib/types';
 
 interface MobileChatMessageProps {
   message: Message;
+  /** Withdraw a message still waiting to be sent. */
+  onCancelQueued?: (queueId: string) => void;
 }
 
-export function MobileChatMessage({ message }: MobileChatMessageProps) {
+export function MobileChatMessage({ message, onCancelQueued }: MobileChatMessageProps) {
   const isUser = message.sender === 'user';
   const isError = !isUser && message.text.startsWith('Error:');
 
@@ -18,7 +20,7 @@ export function MobileChatMessage({ message }: MobileChatMessageProps) {
       <div
         className={`max-w-[85%] rounded-2xl px-4 py-2.5 text-sm leading-relaxed ${
           isUser
-            ? 'bg-cyan-600 text-white rounded-br-md'
+            ? `bg-cyan-600 text-white rounded-br-md ${message.pending ? 'opacity-60' : ''}`
             : isError
               ? 'bg-red-900/30 border border-red-800 text-red-300 rounded-bl-md'
               : 'bg-slate-800 text-slate-200 rounded-bl-md'
@@ -56,6 +58,24 @@ export function MobileChatMessage({ message }: MobileChatMessageProps) {
         ) : message.text ? (
           <MarkdownMessage text={message.text} />
         ) : null}
+
+        {!isUser && message.error && (
+          <p className="text-xs mt-1 text-red-300">Error: {message.error}</p>
+        )}
+
+        {isUser && message.pending && (
+          <div className="flex items-center justify-end gap-2 mt-1 text-[10px] text-cyan-100/80">
+            <span>Waiting to send</span>
+            {message.queueId && onCancelQueued && (
+              <button
+                onClick={() => onCancelQueued(message.queueId!)}
+                className="underline underline-offset-2 hover:text-white"
+              >
+                Cancel
+              </button>
+            )}
+          </div>
+        )}
 
         {message.confidence != null && message.confidence > 0 && (
           <p className="text-[10px] mt-1 text-slate-500">

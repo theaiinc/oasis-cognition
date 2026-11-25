@@ -2,6 +2,7 @@ import { useState, useCallback, useEffect } from 'react';
 import { usePairing } from './hooks/usePairing';
 import { useEncryptedChat } from './hooks/useEncryptedChat';
 import { useVoiceChat } from './hooks/useVoiceChat';
+import { usePushNotifications } from './hooks/usePushNotifications';
 import { QRScannerView } from './components/pairing/QRScannerView';
 import { MobileChatView } from './components/chat/MobileChatView';
 import { MobileSidebar } from './components/sidebar/MobileSidebar';
@@ -79,8 +80,8 @@ export default function App() {
 
   const activeProjectId = projectConfig?.project_id;
   const {
-    messages, isThinking, streamingStatus,
-    sendMessage, cancelRequest, clearMessages, loadHistoryMessages,
+    messages, isThinking, streamingStatus, online,
+    sendMessage, cancelQueued, cancelRequest, clearMessages, loadHistoryMessages,
     activeSessionId, addMessage, updateMessage,
     setIsThinking, setStreamingStatus,
   } = useEncryptedChat(pairing, activeProjectId);
@@ -165,6 +166,8 @@ export default function App() {
       console.warn('[Voice]', message);
     }, []),
   });
+
+  const push = usePushNotifications(pairing);
 
   const [showScanner, setShowScanner] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(false);
@@ -325,6 +328,8 @@ export default function App() {
           onSend={sendMessage}
           onCancel={cancelRequest}
           onOpenSidebar={() => setSidebarOpen(true)}
+          online={online}
+          onCancelQueued={cancelQueued}
         />
       )}
 
@@ -342,6 +347,7 @@ export default function App() {
         onSessionSelect={handleSessionSelect}
         onNewChat={handleNewChat}
         onOpenComputerUse={() => setShowComputerUse(true)}
+        push={push}
       />
     </div>
   );

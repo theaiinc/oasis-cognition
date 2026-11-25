@@ -17,6 +17,8 @@ export default defineConfig({
         globPatterns: ['**/*.{js,css,html,ico,png,svg,woff2}'],
         skipWaiting: true,
         clientsClaim: true,
+        // Push notification handlers (public/push-sw.js) run inside the generated worker.
+        importScripts: ['push-sw.js'],
         // API calls pass through to network — never cache them
         navigateFallback: 'index.html',
         navigateFallbackDenylist: [/^\/pair/, /^\/relay/, /^\/health/],

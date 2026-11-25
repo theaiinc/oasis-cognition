@@ -358,6 +358,10 @@ services:
       - OASIS_WORKFLOW_RUN_TTL_DAYS=${OASIS_WORKFLOW_RUN_TTL_DAYS:-}
       - OASIS_WORKFLOW_MAX_RUNS=${OASIS_WORKFLOW_MAX_RUNS:-}
       - OASIS_WORKFLOW_RUN_SWEEP_HOURS=${OASIS_WORKFLOW_RUN_SWEEP_HOURS:-}
+      # Push to paired phones; off unless all three are set (see .env.example).
+      - MOBILE_PUSH_VAPID_PUBLIC_KEY=${MOBILE_PUSH_VAPID_PUBLIC_KEY:-}
+      - MOBILE_PUSH_VAPID_PRIVATE_KEY=${MOBILE_PUSH_VAPID_PRIVATE_KEY:-}
+      - MOBILE_PUSH_VAPID_SUBJECT=${MOBILE_PUSH_VAPID_SUBJECT:-}
       - MOBILE_RELAY_URL=http://host.docker.internal:8015
       - OBSERVER_URL=http://observer-service:8009
       - CODE_INDEXER_URL=http://code-indexer:8010

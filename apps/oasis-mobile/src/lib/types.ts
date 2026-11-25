@@ -14,6 +14,12 @@ export interface Message {
   thinkingDone?: boolean;
   toolCalls?: ToolCallInfo[];
   isStreaming?: boolean;
+  /** Waiting in the outbox: not on the desktop yet. */
+  pending?: boolean;
+  /** Outbox id (also the client_message_id) of a message sent from this phone. */
+  queueId?: string;
+  /** What went wrong, shown under any text that already arrived. */
+  error?: string;
 }
 
 export interface PairingParams {

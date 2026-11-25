@@ -20,6 +20,7 @@ import { AgentProfilesModule } from './agent-profiles/agent-profiles.module';
 import { ProjectRolesModule } from './project-roles/project-roles.module';
 import { FilesModule } from './files/files.module';
 import { MissionsModule } from './missions/missions.module';
+import { MobilePushModule } from './mobile-push/mobile-push.module';
 import { ModelsModule } from './models/models.module';
 import { CoordinatorModule } from './coordinator/coordinator.module';
 import { JanusModule } from './janus/janus.module';
@@ -48,6 +49,7 @@ import { ArcanaModule } from './arcana/arcana.module';
     ProjectRolesModule,
     FilesModule,
     MissionsModule,
+    MobilePushModule,
     ModelsModule,
     CoordinatorModule,
     JanusModule,

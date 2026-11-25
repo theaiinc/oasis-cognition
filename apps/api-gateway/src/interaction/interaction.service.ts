@@ -12,6 +12,7 @@ import { AgentProfilesService } from '../agent-profiles/agent-profiles.service';
 import { ProjectRolesService } from '../project-roles/project-roles.service';
 import { lookupVariant } from '../models/model-variants';
 import { ProjectContextService } from '../context/project-context.service';
+import { DEFAULT_APPROVAL_TIMEOUT_MS, GATED_TOOLS, editApprovalGate, editPreview, verdictOutput, type GateVerdict } from './edit-approval';
 import { discoverChecks, MAX_SELF_VALIDATION_NUDGES, selfValidationGate, selfValidationNote, selfValidationState } from './self-validation';
 
 export interface InteractionRequest {
@@ -4949,6 +4950,40 @@ export class InteractionService {
             }
           }
 
+          // ── Per-edit approval (opt-in per chat, edit-approval.ts) ──
+          // With "Review edits" on, the change waits here for the user's approve/reject; off, nothing changes.
+          let approvedNote = '';
+          if (GATED_TOOLS.has(execPayload.tool) && isDevAgentTool && (await editApprovalGate().enabledFor(sessionId))) {
+            const gateTool = execPayload.tool as 'edit_file' | 'write_file';
+            const gatePath = String(execPayload.path || path || '');
+            const preview = editPreview(gateTool, execPayload);
+            const timeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS;
+            const verdict: GateVerdict = await editApprovalGate().request({
+              sessionId, tool: gateTool, path: gatePath, diff: preview.diff, truncated: preview.truncated,
+              reasoning: plan.reasoning || undefined, interactionId, clientMessageId,
+            }, {
+              timeoutMs, signal, isAborted,
+              publish: (type, payload) => this.events.publish(type, sessionId, payload),
+            });
+            this.logger.log(`Edit approval for ${gateTool} ${gatePath}: ${verdict.outcome}`);
+            if (verdict.outcome !== 'approved') {
+              const output = verdictOutput(gateTool, gatePath, verdict, timeoutMs);
+              toolResults.push({
+                tool: toolName, path: gatePath || undefined, success: false, blocked: true,
+                output, reasoning: plan.reasoning || '',
+              } as any);
+              await this.events.publish('ToolCallCompleted', sessionId, {
+                tool: toolName, success: false, output, output_length: output.length, path: gatePath || undefined,
+                approval: verdict.outcome,
+                iteration: iteration + 1, step_index: activeStepIndex, plan_revision: planRevision,
+                interaction_id: interactionId, client_message_id: clientMessageId,
+              });
+              updateThoughtsOnlyStreak();
+              continue;
+            }
+            approvedNote = `${verdictOutput(gateTool, gatePath, verdict, timeoutMs)} `;
+          }
+
           const execTimeoutMs =
             toolName === 'bash' ? 600_000 : toolName === 'apply_patch' ? 180_000 : 45_000;
           let execRes = await axiosWithRetry('post', targetUrl, execPayload, undefined, { timeout: execTimeoutMs });
@@ -4994,6 +5029,9 @@ export class InteractionService {
               this.logger.error(`Worktree auto-recovery failed: ${recoverErr.message}`);
             }
           }
+
+          // The agent is told its change was approved, then the edit's own result.
+          if (approvedNote && result && typeof result === 'object') result.output = `${approvedNote}${result.output || ''}`;
 
           if (result.blocked) {
             await this.events.publish('ToolCallBlocked', sessionId, {

@@ -64,8 +64,8 @@ if ! "$PYTHON" -c "import fastapi" 2>/dev/null; then
 fi
 
 if [[ "${DEV_AGENT_RELOAD:-}" == "1" || "$DEV_AGENT_RELOAD_LC" == "true" ]]; then
-  exec "$PYTHON" -m uvicorn services.dev_agent.main:app --host 0.0.0.0 --port 8008 \
+  exec "$PYTHON" -m uvicorn services.dev_agent.main:app --host "${DEV_AGENT_HOST:-127.0.0.1}" --port 8008 \
     --reload --reload-dir "$OASIS_ROOT/services/dev_agent"
 else
-  exec "$PYTHON" -m uvicorn services.dev_agent.main:app --host 0.0.0.0 --port 8008
+  exec "$PYTHON" -m uvicorn services.dev_agent.main:app --host "${DEV_AGENT_HOST:-127.0.0.1}" --port 8008
 fi

@@ -16,6 +16,13 @@ With the extension, the dev-agent gets **clean DOM text** including GitHub's `me
 4. Select this folder: `extensions/oasis-chrome-bridge`
 5. Verify the extension icon shows a green **ON** badge (means WebSocket connected to dev-agent)
 
+The dev-agent accepts the bridge only from this extension's own origin. The `key` in `manifest.json`
+fixes its id to `goelpeabljjikkngpjkjmafgdkcmafbd` wherever it is loaded unpacked. A build under another id (for example one
+published to the Chrome Web Store) connects once that id is in `OASIS_CHROME_BRIDGE_EXTENSION_IDS`
+(comma-separated) in the dev-agent's environment; a refused connection is logged with the id to add.
+This stops a web page from posing as the extension: any page can open a WebSocket to localhost, but
+not with an extension's origin.
+
 > The Computer Use panel in the Oasis UI will show "Chrome Bridge connected" (green) or a warning banner with install instructions if the extension is not detected.
 
 ## How it works

@@ -1,5 +1,6 @@
 {
   "manifest_version": 3,
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAwxBSH7PLydotVSK9XSN0fDiOmOC6QUvRsLPvnDymmSpiZGPiDBTaMHjlAS+thKbcc/lt1ptz8/KGS+5BbBxVwQfh9cvX9eLiZw5ih9gjbio5THFEoK5qDW5/3jfzhVgRVBlBOMZo7fmhXwS6u+Ro7pRSlnjoxZF8rcO4JpEI6NT9YhbxHbKFeduWiEZj5NLA8jMv4SvLquFDB33vPNOnzlKsfGWcM18+G6wI4ZqsfEoNMkQW7ytLHl+hKeC2lChh7zF1Oha3LXIRdmU2R+o1+1n2xE2mv20Ck29CkYq2p3iBx1Z3FKn4Zp03fUDwaRKONxZdoClY+nme7VeQamelAQIDAQAB",
   "name": "Oasis Chrome Bridge",
   "version": "1.0.0",
   "description": "Bridges Chrome to the Oasis dev-agent for computer-use page extraction, navigation, and element interaction.",

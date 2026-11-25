@@ -12,12 +12,37 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import uuid
 from typing import Any
 
 from fastapi import WebSocket
 
 logger = logging.getLogger(__name__)
+
+# The id Chrome gives extensions/oasis-chrome-bridge when loaded unpacked: fixed by the
+# "key" in its manifest.json, so it is the same on every machine.
+BRIDGE_EXTENSION_ID = "goelpeabljjikkngpjkjmafgdkcmafbd"
+
+
+def allowed_origins() -> set[str]:
+    """Origins that may connect as the extension: the bundled build, plus any listed in
+    OASIS_CHROME_BRIDGE_EXTENSION_IDS (comma-separated ids, e.g. a build published under another id)."""
+    ids = {BRIDGE_EXTENSION_ID}
+    for item in os.environ.get("OASIS_CHROME_BRIDGE_EXTENSION_IDS", "").split(","):
+        item = item.strip().removeprefix("chrome-extension://").strip("/")
+        if item:
+            ids.add(item)
+    return {f"chrome-extension://{i}" for i in ids}
+
+
+def origin_allowed(origin: str | None) -> bool:
+    """Only the extension may drive the browser through the bridge. Any web page can open a
+    WebSocket to localhost, but the browser sets its Origin, which a page can't fake: without this,
+    a page could pose as the extension, receive what the agent types (passwords included) and
+    feed it forged page text."""
+    return bool(origin) and origin.rstrip("/") in allowed_origins()
+
 
 
 class ChromeBridge:

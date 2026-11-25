@@ -24,7 +24,8 @@ from fastapi import FastAPI, Query, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-from services.dev_agent.chrome_bridge import chrome_bridge
+from services.dev_agent.chrome_bridge import chrome_bridge, origin_allowed as bridge_origin_allowed
+from services.dev_agent.origin_guard import OriginGuard, cors_origin_regex
 
 from services.dev_agent.service import (
     DevAgentService,
@@ -231,10 +232,12 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Oasis Dev Agent", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origin_regex=cors_origin_regex(),
     allow_methods=["*"],
     allow_headers=["*"],
 )
+# Outermost: a page from another site never reaches a route (origin_guard.py).
+app.add_middleware(OriginGuard)
 
 CODE_INDEXER_URL = os.getenv("CODE_INDEXER_URL", "http://localhost:8010")
 
@@ -554,7 +557,15 @@ async def _notify_response_generator_workspace(project_path: str) -> None:
 
 @app.websocket("/ws/chrome-bridge")
 async def chrome_bridge_ws(ws: WebSocket):
-    """WebSocket endpoint for the Oasis Chrome Bridge extension."""
+    """WebSocket endpoint for the Oasis Chrome Bridge extension, and nothing else (origin_allowed)."""
+    origin = ws.headers.get("origin")
+    if not bridge_origin_allowed(origin):
+        hint = ""
+        if origin and origin.startswith("chrome-extension://"):
+            hint = f" (another build? add {origin.removeprefix('chrome-extension://')} to OASIS_CHROME_BRIDGE_EXTENSION_IDS)"
+        logger.warning("Chrome Bridge: refused a connection from %s%s", origin or "no origin", hint)
+        await ws.close(code=1008)
+        return
     await chrome_bridge.accept(ws)
     try:
         while True:
@@ -1754,4 +1765,6 @@ async def agent_forget(session_id: str):
 
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8008)
+    # Loopback only by default: the dev-agent has no login. Docker Desktop still reaches it at
+    # host.docker.internal. Set DEV_AGENT_HOST=0.0.0.0 only on a trusted network (e.g. Docker on Linux).
+    uvicorn.run(app, host=os.getenv("DEV_AGENT_HOST", "127.0.0.1"), port=8008)

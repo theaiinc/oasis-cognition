@@ -156,6 +156,15 @@ export class ProjectRolesService implements OnModuleDestroy {
       .exec();
   }
 
+  /** Delete every role of a project (project deletion). Returns how many roles. */
+  async deleteByProject(projectId: string): Promise<number> {
+    const roles = await this.listByProject(projectId);
+    for (const role of roles) await this.delete(role.role_id);
+    const r = this.r;
+    if (r) await r.del(`pr:by-project:${projectId}`);
+    return roles.length;
+  }
+
   /** Create one role per preset kind for a project, skipping kinds that
    *  already exist. Returns the full, updated list for the project. */
   async seedPresets(projectId: string): Promise<ProjectRole[]> {

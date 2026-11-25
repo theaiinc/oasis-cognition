@@ -95,6 +95,8 @@ export function ProjectsPanel({
 
   const handleDelete = async (id: string, e: React.MouseEvent) => {
     e.stopPropagation();
+    const name = projects.find((p) => p.project_id === id)?.name || 'this project';
+    if (!window.confirm(`Delete project "${name}"? Its roles, missions, workflows and agent sessions go with it. This can't be undone.`)) return;
     try {
       await deleteProject(id);
       if (id === activeProjectId) onActiveProjectChange?.(undefined);

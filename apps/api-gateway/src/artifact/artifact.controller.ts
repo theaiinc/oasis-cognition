@@ -1,12 +1,14 @@
 import {
   Controller, Get, Post, Delete, Patch, Body, Param, Query, Res, Req,
-  Logger, HttpException, HttpStatus,
+  Logger, HttpException, HttpStatus, Optional,
   UploadedFile, UseInterceptors,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import axios from 'axios';
 import * as FormData from 'form-data';
 import type { Request, Response } from 'express';
+import { ModuleRef } from '@nestjs/core';
+import { cleanupProject, httpAgentSessions, type ProjectCleanupDeps } from '../project/project-cleanup';
 
 const ARTIFACT_URL = process.env.ARTIFACT_SERVICE_URL || 'http://localhost:8012';
 const MEMORY_URL = process.env.MEMORY_URL || 'http://localhost:8004';
@@ -255,6 +257,8 @@ export class ArtifactController {
 export class ProjectsController {
   private readonly logger = new Logger(ProjectsController.name);
 
+  constructor(@Optional() private readonly moduleRef?: ModuleRef) {}
+
   @Post()
   async create(@Body() body: { name: string; description?: string; project_path?: string }) {
     const name = typeof body.name === 'string' ? body.name.trim() : '';
@@ -319,17 +323,51 @@ export class ProjectsController {
     }
   }
 
+  /**
+   * Delete a project and what is kept for it elsewhere (project-cleanup.ts): roles,
+   * missions, workflows with their triggers and runs, external-agent sessions in its folder.
+   * 404 when there is no such project, also on a repeat delete.
+   */
   @Delete(':project_id')
   async delete(@Param('project_id') projectId: string) {
+    let projectPath: string | undefined;
     try {
-      const res = await axios.delete(`${MEMORY_URL}/internal/memory/projects/${projectId}`);
-      return res.data;
+      const res = await axios.get(`${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}`, { timeout: 10_000 });
+      projectPath = res.data?.project_path || res.data?.project?.project_path || undefined;
     } catch (err: any) {
-      throw new HttpException(
-        { error: 'Delete project failed', detail: err.message },
-        HttpStatus.INTERNAL_SERVER_ERROR,
-      );
+      if (err.response?.status === 404) throw new HttpException('Project not found', HttpStatus.NOT_FOUND);
+      throw new HttpException({ error: 'Delete project failed', detail: err.message }, HttpStatus.INTERNAL_SERVER_ERROR);
     }
+    let deleted = false;
+    try {
+      const res = await axios.delete(`${MEMORY_URL}/internal/memory/projects/${encodeURIComponent(projectId)}`, { timeout: 10_000 });
+      deleted = res.data?.deleted !== false;
+    } catch (err: any) {
+      throw new HttpException({ error: 'Delete project failed', detail: err.message }, HttpStatus.INTERNAL_SERVER_ERROR);
+    }
+    if (!deleted) throw new HttpException('Project not found', HttpStatus.NOT_FOUND);
+
+    const cleaned = await cleanupProject(projectId, projectPath, await this.cleanupDeps());
+    if (cleaned.errors.length) this.logger.warn(`Project ${projectId} deleted; cleanup incomplete: ${cleaned.errors.join('; ')}`);
+    return { status: 'ok', deleted: true, cleaned };
+  }
+
+  /** Resolved lazily: these modules don't import this one, and an optional service may be absent. */
+  private async cleanupDeps(): Promise<ProjectCleanupDeps> {
+    const resolve = <T>(cls: new (...args: any[]) => T): T | null => {
+      try { return this.moduleRef?.get(cls, { strict: false }) ?? null; } catch { return null; }
+    };
+    const [{ ProjectRolesService }, { MissionsService }, { WorkflowsService }] = await Promise.all([
+      import('../project-roles/project-roles.service'),
+      import('../missions/missions.service'),
+      import('../workflows/workflows.service'),
+    ]);
+    return {
+      roles: resolve(ProjectRolesService),
+      missions: resolve(MissionsService),
+      workflows: resolve(WorkflowsService),
+      agentSessions: httpAgentSessions(),
+    };
   }
 
   // ── Linking: artifacts ───────────────────────────────────────────────

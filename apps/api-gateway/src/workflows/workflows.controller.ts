@@ -12,7 +12,7 @@ import type { Request, Response } from 'express';
 
 import { WorkflowsService } from './workflows.service';
 import { TriggersService } from './triggers/triggers.service';
-import { listRegisteredTypes } from './node-registry';
+import { listParamSchemas, listRegisteredTypes } from './node-registry';
 import type {
   CreateTriggerDto, CreateWorkflowDto, RunWorkflowDto, UpdateWorkflowDto,
 } from './workflows.types';
@@ -30,7 +30,7 @@ export class WorkflowsController {
 
   @Get('node-catalog')
   async nodeCatalog() {
-    return { node_types: listRegisteredTypes() };
+    return { node_types: listRegisteredTypes(), params: listParamSchemas() };
   }
 
   /* ── Workflow CRUD ───────────────────────────────────────────── */

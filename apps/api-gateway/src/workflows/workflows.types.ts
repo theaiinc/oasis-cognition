@@ -12,6 +12,7 @@ export type NodeType =
   | 'trigger'    // visual start node: when the attached cron/event/manual trigger fires, this is the graph's entry point
   | 'mcp_tool'   // dispatches a call to the Oasis MCP server
   | 'http'       // generic HTTP request
+  | 'web_search' // web search with the deployment's provider; emits [{title, url, snippet}]
   | 'delay'      // waits N milliseconds
   | 'branch'     // routes to `true` or `false` port based on a JEXL expression
   | 'filter'     // pass-through if condition is true, else emits nothing

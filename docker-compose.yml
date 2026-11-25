@@ -231,6 +231,7 @@ services:
       - OASIS_HOST_HOME=${HOME:-/Users}
       - OASIS_LOG_LEVEL=${OASIS_LOG_LEVEL:-INFO}
       - OASIS_WEB_SEARCH_PROVIDER=${OASIS_WEB_SEARCH_PROVIDER:-duckduckgo}
+      - OASIS_TAVILY_API_KEY=${OASIS_TAVILY_API_KEY:-}
     healthcheck:
       test: ["CMD-SHELL", "python -c \"import urllib.request; urllib.request.urlopen('http://localhost:8006/health')\""]
       interval: 10s
@@ -350,6 +351,10 @@ services:
       - TEACHING_URL=http://teaching-service:8006
       - TOOL_EXECUTOR_URL=http://tool-executor:8007
       - DEV_AGENT_URL=http://host.docker.internal:8008
+      # Web search for /web-search and the web_search workflow node: duckduckgo | tavily | brave.
+      - OASIS_WEB_SEARCH_PROVIDER=${OASIS_WEB_SEARCH_PROVIDER:-duckduckgo}
+      - OASIS_TAVILY_API_KEY=${OASIS_TAVILY_API_KEY:-}
+      - OASIS_BRAVE_SEARCH_API_KEY=${OASIS_BRAVE_SEARCH_API_KEY:-}
       - MOBILE_RELAY_URL=http://host.docker.internal:8015
       - OBSERVER_URL=http://observer-service:8009
       - CODE_INDEXER_URL=http://code-indexer:8010

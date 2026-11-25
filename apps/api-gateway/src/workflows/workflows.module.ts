@@ -12,10 +12,12 @@ import { WorkflowStore } from './store/redis-store';
 import { registerBuiltins } from './nodes/builtin';
 import { registerHttpNode } from './nodes/http';
 import { registerMcpToolNode } from './nodes/mcp-tool';
+import { registerWebSearchNode } from './nodes/web-search';
 
 registerBuiltins();
 registerHttpNode();
 registerMcpToolNode();
+registerWebSearchNode();
 
 function parseRedisUrl(url: string): { host: string; port: number; db?: number } {
   try {

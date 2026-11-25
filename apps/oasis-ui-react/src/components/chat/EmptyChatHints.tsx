@@ -1,4 +1,5 @@
 import { Sparkles, ArrowRight } from 'lucide-react';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 interface Props {
   onPick: (prompt: string) => void;
@@ -50,10 +51,10 @@ export function EmptyChatHints({ onPick, hasMissions }: Props) {
     <div className="flex flex-col items-center justify-center gap-6 py-10 px-4">
       <div className="flex items-center gap-2">
         <div className="w-12 h-12 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-center shadow-lg shadow-blue-900/10">
-          <img src="/favicon.svg" alt="Oasis" className="w-9 h-9" draggable={false} />
+          <img src="/favicon.svg" alt={BRAND_SHORT_NAME} className="w-9 h-9" draggable={false} />
         </div>
         <div>
-          <h3 className="text-base font-semibold text-slate-200">Ask Oasis anything.</h3>
+          <h3 className="text-base font-semibold text-slate-200">Ask {BRAND_SHORT_NAME} anything.</h3>
           <p className="text-[12px] text-slate-500 leading-snug">One-shot answers, code edits, or recurring background tasks — all from this chat.</p>
         </div>
       </div>
@@ -74,7 +75,7 @@ export function EmptyChatHints({ onPick, hasMissions }: Props) {
       </div>
 
       <p className="text-[10px] text-slate-600 max-w-md text-center leading-relaxed">
-        Missions run on a cron schedule, post digest cards back to this chat, and you can pause / resume / delete them inline. Ask the chat normally and Oasis will turn your goal into a mission for you — no separate UI needed.
+        Missions run on a cron schedule, post digest cards back to this chat, and you can pause / resume / delete them inline. Ask the chat normally and {BRAND_SHORT_NAME} will turn your goal into a mission for you — no separate UI needed.
       </p>
     </div>
   );

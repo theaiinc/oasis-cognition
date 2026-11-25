@@ -7,6 +7,7 @@ import { cn } from '@/lib/utils';
 import { useArtifactMention } from '@/hooks/useArtifactMention';
 import { ArtifactMentionDropdown } from './ArtifactMentionDropdown';
 import type { PendingFile } from '@/hooks/useQuickUpload';
+import { BRAND_SHORT_NAME } from '@/lib/brand';
 
 const ACCEPTED_FILE_TYPES = [
   // Documents
@@ -176,7 +177,7 @@ export function ChatInputArea({
           }}
           onClick={updateCursorPosition}
           onKeyUp={updateCursorPosition}
-          placeholder="Ask Oasis anything... (@ to mention artifacts)"
+          placeholder={`Ask ${BRAND_SHORT_NAME} anything... (@ to mention artifacts)`}
           onKeyDown={(e: KeyboardEvent<HTMLTextAreaElement>) => {
             // Let mention dropdown handle keys first
             if (mention.showDropdown) {

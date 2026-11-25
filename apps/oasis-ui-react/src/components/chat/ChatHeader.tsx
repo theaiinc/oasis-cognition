@@ -10,8 +10,8 @@ import type { ProjectConfig } from '@/lib/types';
 import { TokenUsageDonut } from './TokenUsageDonut';
 import type { ContextBudget } from '@/lib/types';
 import { MobilePairingStatus } from '../mobile/MobilePairingStatus';
-import oasisLogo from '@/assets/oasis-logo.svg';
 import { SessionBudgetPill, type SessionUsage, type SessionBudget } from './SessionBudgetPill';
+import { BRAND_LOGO, BRAND_NAME } from '@/lib/brand';
 
 interface ChatHeaderProps {
   statusText: string;
@@ -100,7 +100,7 @@ export function ChatHeader({
           <Menu className="w-5 h-5" />
         </Button>
         <h1 className="flex items-center gap-2">
-          <img src={oasisLogo} alt="Oasis Cognition" className="h-11 w-auto select-none" draggable={false} />
+          <img src={BRAND_LOGO} alt={BRAND_NAME} className="h-11 w-auto select-none" draggable={false} />
           <span className="text-[10px] text-slate-600 font-mono">v2 ({__BUILD_NUMBER__})</span>
         </h1>
         <Badge variant="outline" className={cn(

@@ -68,6 +68,12 @@ export class WorkflowsController {
     return this.workflows.runNow(id, dto);
   }
 
+  /** Apply run retention now (TTL + per-workflow cap); for ops. */
+  @Post(':id/runs/sweep')
+  async sweepRuns(@Param('id') id: string) {
+    return this.workflows.sweepRuns(id);
+  }
+
   @Get(':id/runs')
   async listRuns(@Param('id') id: string, @Query('limit') limitStr?: string) {
     const limit = Math.max(1, Math.min(200, parseInt(limitStr || '50', 10) || 50));

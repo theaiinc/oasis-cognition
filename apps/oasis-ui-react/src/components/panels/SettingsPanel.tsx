@@ -450,6 +450,7 @@ export function SettingsPanel({
 
   const handleDeleteProject = async () => {
     if (!activeProjectId) return;
+    if (!window.confirm(`Delete project "${activeProjectName || 'this project'}"? Its roles, missions, workflows and agent sessions go with it. This can't be undone.`)) return;
     await deleteProject(activeProjectId);
     onActiveProjectChange?.(undefined);
     await refreshProjects();

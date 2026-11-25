@@ -4,13 +4,13 @@
  * bookkeeping) has more moving parts.
  */
 
-import { HttpException, HttpStatus, Injectable, Logger, OnModuleInit } from '@nestjs/common';
+import { HttpException, HttpStatus, Injectable, Logger, OnModuleDestroy, OnModuleInit } from '@nestjs/common';
 import { InjectQueue } from '@nestjs/bullmq';
 import { Queue } from 'bullmq';
 import { v4 as uuidv4 } from 'uuid';
 
 import { executeRun } from './engine';
-import { WorkflowStore } from './store/redis-store';
+import { WorkflowStore, type RunSweepResult } from './store/redis-store';
 import type {
   CreateWorkflowDto,
   RunWorkflowDto,
@@ -36,11 +36,15 @@ interface RunJobData {
 const LIVE: Map<string, AbortController> = new Map();
 
 @Injectable()
-export class WorkflowsService implements OnModuleInit {
+export class WorkflowsService implements OnModuleInit, OnModuleDestroy {
   private readonly logger = new Logger(WorkflowsService.name);
   // Lazy-resolved to avoid the WorkflowsService ↔ TriggersService circular
   // DI (TriggersService depends on WorkflowsService for enqueueRun).
-  private _triggers: { syncTriggerNodes: (wf: Workflow) => Promise<void> } | null = null;
+  private _triggers: {
+    syncTriggerNodes: (wf: Workflow) => Promise<void>;
+    deleteTrigger: (id: string) => Promise<void>;
+  } | null = null;
+  private sweepTimer: NodeJS.Timeout | null = null;
 
   constructor(
     private readonly store: WorkflowStore,
@@ -50,6 +54,19 @@ export class WorkflowsService implements OnModuleInit {
 
   async onModuleInit() {
     this.logger.log('WorkflowsService ready');
+    // Runs also expire on their own (TTL); the periodic sweep removes index entries and
+    // runs past the per-workflow cap, including those of workflows deleted since.
+    const hours = Number(process.env.OASIS_WORKFLOW_RUN_SWEEP_HOURS || 6);
+    if (Number.isFinite(hours) && hours > 0) {
+      this.sweepTimer = setInterval(() => {
+        this.sweepAllRuns().catch(err => this.logger.warn(`run sweep failed: ${err?.message || err}`));
+      }, hours * 3_600_000);
+      this.sweepTimer.unref?.();
+    }
+  }
+
+  onModuleDestroy() {
+    if (this.sweepTimer) clearInterval(this.sweepTimer);
   }
 
   private async triggersSvc() {
@@ -126,8 +143,16 @@ export class WorkflowsService implements OnModuleInit {
   async deleteWorkflow(id: string): Promise<void> {
     await this.getWorkflow(id);  // 404 if missing
     // Cascade: triggers + runs
+    // Through TriggersService, so a cron trigger's schedule is removed too, not only its record.
     const triggers = await this.store.listTriggers(id);
-    for (const t of triggers) await this.store.deleteTrigger(t.trigger_id);
+    for (const t of triggers) {
+      try {
+        await (await this.triggersSvc()).deleteTrigger(t.trigger_id);
+      } catch (err: any) {
+        this.logger.warn(`deleteTrigger ${t.trigger_id} via TriggersService failed (${err?.message}); removing the record`);
+        await this.store.deleteTrigger(t.trigger_id);
+      }
+    }
     await this.store.deleteRunsForWorkflow(id);
     await this.store.deleteWorkflow(id);
   }
@@ -184,6 +209,27 @@ export class WorkflowsService implements OnModuleInit {
     const run = await this.store.getRun(runId);
     if (!run) throw new HttpException('run not found', HttpStatus.NOT_FOUND);
     return run;
+  }
+
+  /** Apply run retention to one workflow now (POST /workflows/:id/runs/sweep). */
+  async sweepRuns(workflowId: string): Promise<RunSweepResult> {
+    await this.getWorkflow(workflowId);  // 404 if missing
+    return this.store.sweepRuns(workflowId);
+  }
+
+  /** Apply run retention to every workflow with runs, deleted workflows included. */
+  async sweepAllRuns(): Promise<{ workflows: number; removed: number }> {
+    let removed = 0;
+    const ids = await this.store.workflowIdsWithRuns();
+    for (const id of ids) {
+      if (!(await this.store.getWorkflow(id))) {
+        await this.store.deleteRunsForWorkflow(id);
+        continue;
+      }
+      removed += (await this.store.sweepRuns(id)).removed;
+    }
+    if (removed) this.logger.log(`run sweep: removed ${removed} run(s) across ${ids.length} workflow(s)`);
+    return { workflows: ids.length, removed };
   }
 
   async listRuns(workflowId: string, limit = 50): Promise<WorkflowRun[]> {

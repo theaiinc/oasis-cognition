@@ -720,9 +720,13 @@ delegate_tasks: use for 3+ independent files/modifications. Each task runs in ow
   NOT for: simple single-file edits, tightly-coupled work.
 mission_create: recurring background goal with cron schedule. PARAM_GOAL + PARAM_SCHEDULE (5-field cron).
   mission_id auto-inherited after creation: omit on subsequent mission_* calls.
-workflow_create: DAG of nodes (input, output, mcp_tool, http, delay, branch, filter, transform).
+workflow_create: DAG of nodes (input, output, mcp_tool, http, web_search, delay, branch, filter, transform).
   Prefer incremental: workflow_create(PARAM_NAME only) then workflow_add_node / workflow_add_edge.
-  workflow_id auto-inherited after creation.
+  workflow_id auto-inherited after creation. node_catalog lists each type's params.
+  Param placeholders: {{input.x}} = the run's input, {{value.x}} = what the upstream node sent.
+  web_search node: params {query, limit?}, e.g. {"query": "{{input.topic}} news", "limit": 5}.
+    Emits [{title, url, snippet}] on `out` (and {query, provider, count} on `meta`), so a transform
+    can use value[0].url or value|length. Example: input -> web_search -> transform -> output.
 """
 
 # ── MEMORY_RULES: knowledge graph, self-teaching rules ──

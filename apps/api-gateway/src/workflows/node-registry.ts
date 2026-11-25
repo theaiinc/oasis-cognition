@@ -24,10 +24,20 @@ export interface ExecutorCtx {
 
 export type NodeExecutor = (ctx: ExecutorCtx) => Promise<Record<string, any>>;
 
-const EXECUTORS = new Map<NodeType, NodeExecutor>();
+/** JSON Schema for a node's params, shown in the node catalog. */
+export type NodeParamSchema = Record<string, any>;
 
-export function registerNode(type: NodeType, executor: NodeExecutor): void {
+const EXECUTORS = new Map<NodeType, NodeExecutor>();
+const PARAM_SCHEMAS = new Map<NodeType, NodeParamSchema>();
+
+export function registerNode(type: NodeType, executor: NodeExecutor, params?: NodeParamSchema): void {
   EXECUTORS.set(type, executor);
+  if (params) PARAM_SCHEMAS.set(type, params);
+}
+
+/** Param schemas of the node types that declare one. */
+export function listParamSchemas(): Record<string, NodeParamSchema> {
+  return Object.fromEntries(PARAM_SCHEMAS);
 }
 
 export function getExecutor(type: NodeType): NodeExecutor | undefined {

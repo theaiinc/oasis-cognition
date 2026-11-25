@@ -1,3 +1,4 @@
+import { EditApprovalController } from './edit-approval.controller';
 import { Module } from '@nestjs/common';
 import { InteractionController } from './interaction.controller';
 import { InteractionService } from './interaction.service';
@@ -7,7 +8,7 @@ import { ProjectRolesModule } from '../project-roles/project-roles.module';
 
 @Module({
   imports: [SessionModule, AgentProfilesModule, ProjectRolesModule],
-  controllers: [InteractionController],
+  controllers: [InteractionController, EditApprovalController],
   providers: [InteractionService],
   exports: [InteractionService],
 })

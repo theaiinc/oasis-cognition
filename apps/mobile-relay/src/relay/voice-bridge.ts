@@ -3,21 +3,11 @@ import { WebSocketServer, WebSocket } from 'ws';
 import axios from 'axios';
 import { v4 as uuidv4 } from 'uuid';
 import { SessionService } from '../session/session.service';
+import { followTurn, FollowOptions, FollowResult } from './timeline-follower';
 
-const GATEWAY_URL = process.env.GATEWAY_URL || 'http://localhost:8000';
+import { GATEWAY_URL } from '../gateway';
 const TRANSCRIPTION_URL = process.env.TRANSCRIPTION_URL || 'http://localhost:8099/transcribe';
 const TRANSCRIPT_CLEANUP_URL = process.env.TRANSCRIPT_CLEANUP_URL || 'http://localhost:8005/internal/response/transcript-cleanup';
-
-// Timeline event types worth forwarding to mobile (same as relay.service.ts)
-const FORWARD_EVENT_TYPES = new Set([
-  'ResponseChunkGenerated',
-  'ToolCallStarted',
-  'ToolCallCompleted',
-  'ToolReasoningChunkGenerated',
-  'ThoughtChunkGenerated',
-  'ThoughtLayerGenerated',
-  'ThoughtsValidated',
-]);
 
 // VAD constants
 const VAD_FRAME_SIZE = 1600; // 100ms at 16kHz
@@ -58,6 +48,87 @@ function computeRMS(samples: Float32Array): number {
   return Math.sqrt(sum / samples.length);
 }
 
+export interface VoiceTurnOptions {
+  transcript: string;
+  sessionId: string;
+  clientMessageId: string;
+  send: (msg: Record<string, any>) => void;
+  signal: AbortSignal;
+  follow?: (opts: FollowOptions) => Promise<FollowResult>;
+}
+
+/** A Redis stream id, the gateway's event cursor. */
+const CURSOR = /^\d+-\d+$/;
+
+/**
+ * Send one spoken message and relay the turn to the phone.
+ *
+ * The gateway accepts a message with a small JSON acknowledgement (and a replay
+ * cursor) and runs the turn in the background, so the reply comes only from the
+ * timeline: follow it from that cursor, pass each event on, send the text so far
+ * as `response-chunk` (the phone expects the whole text, which
+ * ResponseChunkGenerated carries as full_text), and finish with `response`.
+ */
+export async function runVoiceTurn(opts: VoiceTurnOptions): Promise<void> {
+  const { send, clientMessageId } = opts;
+  const follow = opts.follow || followTurn;
+  const fail = (message: string) => send({ type: 'error', message, client_message_id: clientMessageId });
+
+  let accepted: { event_cursor?: string };
+  try {
+    const response = await axios.post(
+      `${GATEWAY_URL}/api/v1/interaction`,
+      {
+        user_message: opts.transcript,
+        session_id: opts.sessionId,
+        context: { source: 'mobile-voice', client_message_id: clientMessageId },
+      },
+      { headers: { 'Content-Type': 'application/json' }, timeout: 30_000, signal: opts.signal },
+    );
+    accepted = response.data || {};
+  } catch (err: any) {
+    if (opts.signal.aborted) return;
+    const status: number | undefined = err?.response?.status;
+    const detail = err?.response?.data?.message || err?.response?.data?.error;
+    fail(typeof detail === 'string' ? detail : (status ? `Gateway refused the message (${status})` : 'Desktop is unreachable'));
+    return;
+  }
+
+  const after = typeof accepted.event_cursor === 'string' && CURSOR.test(accepted.event_cursor) ? accepted.event_cursor : null;
+  let textSoFar = '';
+  const result = await follow({
+    sessionId: opts.sessionId,
+    clientMessageId,
+    after,
+    signal: opts.signal,
+    onEvent: (event) => {
+      if (event.event_type === 'ResponseChunkGenerated') {
+        const full = typeof event.payload.full_text === 'string' ? event.payload.full_text
+          : textSoFar + (typeof event.payload.chunk === 'string' ? event.payload.chunk : '');
+        if (full && full !== textSoFar) {
+          textSoFar = full;
+          send({ type: 'response-chunk', text: full, client_message_id: clientMessageId });
+        }
+      }
+      send({ type: 'stream-event', event_type: event.event_type, payload: event.payload, client_message_id: clientMessageId });
+    },
+  });
+
+  switch (result.outcome) {
+    case 'completed':
+      send({ type: 'response', text: result.response || textSoFar, confidence: 1.0, client_message_id: clientMessageId });
+      break;
+    case 'failed':
+    case 'cancelled':
+    case 'unreachable':
+    case 'timeout':
+      fail(result.error);
+      break;
+    case 'aborted':
+      break;
+  }
+}
+
 interface VoiceSessionConfig {
   ws: WebSocket;
   pairingId: string;
@@ -86,6 +157,8 @@ class VoiceSession {
 
   // Processing lock to avoid overlapping transcriptions
   private processing = false;
+  /** Aborted when the socket closes, so a running turn stops being followed. */
+  private readonly closed = new AbortController();
 
   constructor(config: VoiceSessionConfig) {
     this.ws = config.ws;
@@ -103,6 +176,7 @@ class VoiceSession {
 
     this.ws.on('close', () => {
       console.log(`[VoiceBridge] Session closed: ${this.pairingId}`);
+      this.closed.abort();
       this.cleanup();
     });
 
@@ -382,154 +456,13 @@ class VoiceSession {
   }
 
   private async callInteraction(transcript: string, clientMessageId: string): Promise<void> {
-    const interactionBody = {
-      message: transcript,
-      session_id: this.mobileSessionId,
-      context: {
-        source: 'mobile-voice',
-        client_message_id: clientMessageId,
-      },
-    };
-
-    // Start SSE timeline listener BEFORE sending the interaction
-    const sseCleanup = this.subscribeToTimeline(clientMessageId);
-
-    try {
-      const response = await axios.post(
-        `${GATEWAY_URL}/api/v1/interaction`,
-        interactionBody,
-        {
-          responseType: 'stream',
-          headers: {
-            'Content-Type': 'application/json',
-            Accept: 'application/x-ndjson',
-          },
-          timeout: 300_000,
-        },
-      );
-
-      let fullResponse = '';
-
-      await new Promise<void>((resolve, reject) => {
-        let buffer = '';
-
-        response.data.on('data', (chunk: Buffer) => {
-          buffer += chunk.toString();
-          const lines = buffer.split('\n');
-          buffer = lines.pop() || '';
-
-          for (const line of lines) {
-            const trimmed = line.trim();
-            if (!trimmed) continue;
-
-            try {
-              const parsed = JSON.parse(trimmed);
-
-              // Forward response chunks
-              if (parsed.response || parsed.text) {
-                const text = parsed.response || parsed.text || '';
-                fullResponse += text;
-                this.send({
-                  type: 'response-chunk',
-                  text,
-                  client_message_id: clientMessageId,
-                });
-              }
-
-              // Check for final response
-              if (parsed.status === 'completed' || parsed.done) {
-                if (parsed.response) {
-                  fullResponse = parsed.response;
-                }
-              }
-            } catch {
-              // Skip unparseable lines
-            }
-          }
-        });
-
-        response.data.on('end', () => {
-          // Process remaining buffer
-          if (buffer.trim()) {
-            try {
-              const parsed = JSON.parse(buffer.trim());
-              if (parsed.response || parsed.text) {
-                fullResponse = parsed.response || parsed.text || fullResponse;
-              }
-            } catch { /* ignore */ }
-          }
-          resolve();
-        });
-
-        response.data.on('error', (err: Error) => reject(err));
-      });
-
-      // Send final response
-      this.send({
-        type: 'response',
-        text: fullResponse,
-        confidence: 1.0,
-        client_message_id: clientMessageId,
-      });
-    } finally {
-      sseCleanup();
-    }
-  }
-
-  /**
-   * Subscribe to the gateway SSE timeline for streaming events.
-   * Reuses the same pattern from relay.service.ts.
-   */
-  private subscribeToTimeline(clientMessageId: string): () => void {
-    let req: http.ClientRequest | null = null;
-    let closed = false;
-
-    const url = new URL(`${GATEWAY_URL}/api/v1/events/timeline`);
-    url.searchParams.set('session_id', this.mobileSessionId);
-    url.searchParams.set('backlog', '0');
-
-    req = http.get(url.toString(), (res) => {
-      let sseBuffer = '';
-
-      res.on('data', (chunk: Buffer) => {
-        if (closed) return;
-        sseBuffer += chunk.toString();
-        const lines = sseBuffer.split('\n');
-        sseBuffer = lines.pop() || '';
-
-        for (const line of lines) {
-          if (!line.startsWith('data: ')) continue;
-          const data = line.slice(6).trim();
-          if (!data) continue;
-
-          try {
-            const event = JSON.parse(data);
-            if (!FORWARD_EVENT_TYPES.has(event.event_type)) continue;
-
-            this.send({
-              type: 'stream-event',
-              event_type: event.event_type,
-              payload: event.payload || {},
-              client_message_id: clientMessageId,
-            });
-          } catch {
-            // Skip unparseable events
-          }
-        }
-      });
-
-      res.on('error', () => { /* ignore SSE errors */ });
+    await runVoiceTurn({
+      transcript,
+      sessionId: this.mobileSessionId,
+      clientMessageId,
+      send: (msg) => this.send(msg),
+      signal: this.closed.signal,
     });
-
-    req.on('error', () => { /* ignore connection errors */ });
-
-    return () => {
-      closed = true;
-      if (req) {
-        req.destroy();
-        req = null;
-      }
-    };
   }
 
   private cleanup(): void {

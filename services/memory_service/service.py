@@ -2149,6 +2149,11 @@ class MemoryService:
 
     async def scope_rule_to_project(self, rule_id: str, project_id: str) -> bool:
         if self._use_fallback:
+            for r in self._fallback_rules:
+                if r.get("rule_id") == rule_id:
+                    pids = r.setdefault("project_ids", [])
+                    if project_id not in pids:
+                        pids.append(project_id)
             return True
         with self._driver.session() as session:
             session.run(
@@ -2158,6 +2163,52 @@ class MemoryService:
                 """, rid=rule_id, pid=project_id,
             )
             return True
+
+    async def project_own_rules(self, project_id: str) -> list[dict[str, Any]]:
+        """Only the rules scoped to this project: no global ones.
+
+        What a knowledge pack exports, unlike retrieve_rules_for_project, which adds the
+        global rules a turn may also use.
+        """
+        if not project_id:
+            return []
+        if self._use_fallback:
+            return [r for r in self._fallback_rules if project_id in (r.get("project_ids") or [])]
+        with self._driver.session() as session:
+            result = session.run(
+                """
+                MATCH (:Project {project_id: $pid})<-[:SCOPED_TO]-(r:Rule)
+                RETURN DISTINCT r
+                ORDER BY r.confidence DESC
+                """,
+                pid=project_id,
+            )
+            return [self._rule_node_to_dict(record["r"]) for record in result]
+
+    async def find_rule(self, condition: str, conclusion: str) -> dict[str, Any] | None:
+        """The stored rule with this wording (fingerprint), with the projects it is scoped to
+        (`project_ids`, empty for a global rule), or None."""
+        fingerprint = self._rule_fingerprint(condition, conclusion)
+        if self._use_fallback:
+            for r in self._fallback_rules:
+                fp = r.get("fingerprint") or self._rule_fingerprint(r.get("condition", ""), r.get("conclusion", ""))
+                if fp == fingerprint:
+                    return {**r, "project_ids": list(r.get("project_ids") or [])}
+            return None
+        with self._driver.session() as session:
+            record = session.run(
+                """
+                MATCH (r:Rule {fingerprint: $fp})
+                OPTIONAL MATCH (r)-[:SCOPED_TO]->(p:Project)
+                RETURN r, collect(p.project_id) AS project_ids
+                ORDER BY r.confidence DESC
+                LIMIT 1
+                """,
+                fp=fingerprint,
+            ).single()
+            if not record or not record["r"]:
+                return None
+            return {**self._rule_node_to_dict(record["r"]), "project_ids": list(record["project_ids"] or [])}
 
     async def retrieve_rules_for_project(self, project_id: str, keywords: list[str] | None = None) -> list[dict[str, Any]]:
         """Return global rules (no SCOPED_TO) + rules scoped to this project."""

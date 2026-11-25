@@ -1,6 +1,8 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Sparkles, Pause, Play, RefreshCw, Trash2, Clock, Loader2, ChevronDown, ChevronRight } from 'lucide-react';
 import { OASIS_BASE_URL } from '@/lib/constants';
+import { listProjects } from '@/lib/artifact-api';
+import { ALL_MISSIONS, NO_PROJECT, NO_ROLE, bulkBody, filterMissions, filterOptions, type MissionFilter } from '@/lib/mission-filters';
 
 export interface MissionRow {
   mission_id: string;
@@ -11,6 +13,8 @@ export interface MissionRow {
   last_run_at?: string;
   next_run_at?: string;
   run_count?: number;
+  project_id?: string;
+  role_id?: string;
 }
 
 interface Props {
@@ -28,7 +32,63 @@ interface Props {
 export function ActiveMissionsBar({ missions, onMutated }: Props) {
   const [expanded, setExpanded] = useState(true);
   const [busyId, setBusyId] = useState<string | null>(null);
+  const [filter, setFilter] = useState<MissionFilter>(ALL_MISSIONS);
+  const [bulkNote, setBulkNote] = useState<string | null>(null);
+  const [projectNames, setProjectNames] = useState<Record<string, string>>({});
+  const options = useMemo(() => filterOptions(missions || []), [missions]);
+  const hasProjects = options.projects.length > 0;
+
+  // Project names for the filter menu, once there is a project to name.
+  useEffect(() => {
+    if (!hasProjects) return;
+    let cancelled = false;
+    listProjects()
+      .then((ps) => { if (!cancelled) setProjectNames(Object.fromEntries((ps || []).map((p) => [p.project_id, p.name]))); })
+      .catch(() => { /* ids are shown instead */ });
+    return () => { cancelled = true; };
+  }, [hasProjects]);
+
+  // A filter whose project or role no longer has missions falls back to "all".
+  useEffect(() => {
+    if (filter.project && filter.project !== NO_PROJECT && !options.projects.includes(filter.project)) setFilter((f) => ({ ...f, project: '' }));
+    if (filter.role && filter.role !== NO_ROLE && !options.roles.includes(filter.role)) setFilter((f) => ({ ...f, role: '' }));
+  }, [filter, options]);
+
   if (!missions || missions.length === 0) return null;
+  const shown = filterMissions(missions, filter);
+  const showProjectFilter = options.projects.length > 1 || (hasProjects && options.hasUnprojected);
+  const showRoleFilter = options.roles.length > 1 || (options.roles.length > 0 && options.hasRoleless);
+
+  const bulk = async (op: 'pause' | 'resume') => {
+    setBusyId(`bulk-${op}`);
+    setBulkNote(null);
+    try {
+      const body = bulkBody(filter);
+      if (body) {
+        const r = await fetch(`${OASIS_BASE_URL}/api/v1/missions/${op}-all`, {
+          method: 'POST', credentials: 'include', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+        });
+        if (!r.ok) throw new Error(await r.text());
+        const res = await r.json() as { changed: unknown[] };
+        const n = res.changed?.length ?? 0;
+        setBulkNote(`${op === 'pause' ? 'Paused' : 'Resumed'} ${n} mission${n === 1 ? '' : 's'}`);
+      } else {
+        // "No project" / "no role" can't be said to the bulk endpoint: one by one.
+        const targets = shown.filter((m) => (op === 'pause' ? m.enabled || m.state !== 'paused' : !m.enabled || m.state === 'paused'));
+        for (const m of targets) {
+          const r = await fetch(`${OASIS_BASE_URL}/api/v1/missions/${m.mission_id}/${op}`, { method: 'POST', credentials: 'include' });
+          if (!r.ok) throw new Error(await r.text());
+        }
+        setBulkNote(`${op === 'pause' ? 'Paused' : 'Resumed'} ${targets.length} mission${targets.length === 1 ? '' : 's'}`);
+      }
+    } catch (err) {
+      console.warn(`mission ${op}-all failed`, err);
+      setBulkNote(`Couldn't ${op} the missions. Try again.`);
+    } finally {
+      setBusyId(null);
+      onMutated();
+    }
+  };
 
   const action = async (id: string, path: string, method: 'POST' | 'DELETE' = 'POST') => {
     setBusyId(id + path);
@@ -68,7 +128,57 @@ export function ActiveMissionsBar({ missions, onMutated }: Props) {
       </button>
       {expanded && (
         <div className="px-2 pb-2 space-y-1">
-          {missions.map((m) => (
+          {missions.length > 1 && (
+            <div className="flex flex-wrap items-center gap-1.5 px-0.5 pb-1 text-[11px]">
+              {showProjectFilter && (
+                <select
+                  aria-label="Filter missions by project"
+                  value={filter.project}
+                  onChange={(e) => setFilter((f) => ({ ...f, project: e.target.value }))}
+                  className="h-6 rounded border border-slate-800 bg-slate-900 px-1.5 text-slate-300"
+                >
+                  <option value="">All projects</option>
+                  {options.projects.map((p) => <option key={p} value={p}>{projectNames[p] || p}</option>)}
+                  {options.hasUnprojected && <option value={NO_PROJECT}>No project</option>}
+                </select>
+              )}
+              {showRoleFilter && (
+                <select
+                  aria-label="Filter missions by role"
+                  value={filter.role}
+                  onChange={(e) => setFilter((f) => ({ ...f, role: e.target.value }))}
+                  className="h-6 rounded border border-slate-800 bg-slate-900 px-1.5 text-slate-300"
+                >
+                  <option value="">All roles</option>
+                  {options.roles.map((r) => <option key={r} value={r}>{r}</option>)}
+                  {options.hasRoleless && <option value={NO_ROLE}>No role</option>}
+                </select>
+              )}
+              <div className="ml-auto flex items-center gap-1">
+                <button
+                  type="button"
+                  disabled={!!busyId || shown.every((m) => !m.enabled && m.state === 'paused')}
+                  onClick={() => void bulk('pause')}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-40"
+                  title={!filter.project && !filter.role ? 'Pause all missions' : 'Pause the missions shown'}
+                >
+                  {busyId === 'bulk-pause' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Pause className="w-3 h-3" />} Pause all
+                </button>
+                <button
+                  type="button"
+                  disabled={!!busyId || shown.every((m) => m.enabled && m.state !== 'paused')}
+                  onClick={() => void bulk('resume')}
+                  className="flex items-center gap-1 rounded px-1.5 py-0.5 text-slate-400 hover:text-white hover:bg-slate-800 disabled:opacity-40"
+                  title={!filter.project && !filter.role ? 'Resume all missions' : 'Resume the missions shown'}
+                >
+                  {busyId === 'bulk-resume' ? <Loader2 className="w-3 h-3 animate-spin" /> : <Play className="w-3 h-3" />} Resume all
+                </button>
+              </div>
+            </div>
+          )}
+          {bulkNote && <div className="px-1 pb-1 text-[10px] text-slate-500" role="status">{bulkNote}</div>}
+          {shown.length === 0 && <div className="px-1 py-1 text-[11px] text-slate-500">No missions match this filter.</div>}
+          {shown.map((m) => (
             <MissionRowView key={m.mission_id} m={m} busyId={busyId} onAction={action} />
           ))}
         </div>

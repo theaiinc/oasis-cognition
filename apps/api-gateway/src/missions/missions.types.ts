@@ -70,3 +70,18 @@ export interface UpdateMissionDto {
   connector_id?: string;
   enabled?: boolean;
 }
+
+/** POST /missions/pause-all and /missions/resume-all: which missions (all when empty). */
+export interface BulkMissionFilter {
+  project_id?: string;
+  role_id?: string;
+}
+
+export type BulkMissionsDto = BulkMissionFilter;
+
+export interface BulkMissionsResult {
+  /** Missions whose state changed. */
+  changed: Mission[];
+  /** Matching missions that were already paused (or already running on schedule). */
+  unchanged: number;
+}

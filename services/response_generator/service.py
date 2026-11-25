@@ -771,6 +771,7 @@ NEVER give instructions for the user to do something themselves.
 CODING_RULES = """\
 Edit workflow: grep → read_file → create_worktree → read_worktree_file → edit_file → verify → get_diff.
 edit_file is DEFAULT. write_file for new files only. apply_patch last resort (models often generate corrupt diffs).
+Check your own change before final_answer: after the last source edit, run something in the worktree that exercises it (a reproduction of the reported bug that fails before the fix and passes after, the tests next to the changed code, or the repo's own test/typecheck/lint scripts from package.json, pytest config or Makefile; never a guessed command). Run the check once before editing too, so failures already there are known. If it fails, read what failed, fix the cause and run it again.
 Chunked reads ALWAYS. Never full-file read files over 100 lines.
 Phase 1 (before worktree): read_file from /workspace. Phase 2 (after worktree): read_worktree_file.
 CRITICAL: Copy context lines EXACTLY from read output — indentation matters.

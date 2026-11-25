@@ -1,9 +1,16 @@
-import { Sparkles, ArrowRight } from 'lucide-react';
+import { useState } from 'react';
+import { Sparkles, ArrowRight, LayoutGrid } from 'lucide-react';
 import { BRAND_SHORT_NAME } from '@/lib/brand';
+import { MISSION_TEMPLATES } from '@/lib/mission-templates';
+import { MissionTemplateGallery } from './MissionTemplateGallery';
 
 interface Props {
   onPick: (prompt: string) => void;
   hasMissions: boolean;
+  /** For missions created from the template gallery: the chat's project and session. */
+  projectId?: string | null;
+  sessionId?: string | null;
+  onMissionCreated?: () => void;
 }
 
 /**
@@ -15,7 +22,8 @@ interface Props {
  * immediately — that way the user can edit before committing, and the LLM
  * doesn't fire on a half-baked prompt.
  */
-export function EmptyChatHints({ onPick, hasMissions }: Props) {
+export function EmptyChatHints({ onPick, hasMissions, projectId, sessionId, onMissionCreated }: Props) {
+  const [showTemplates, setShowTemplates] = useState(false);
   // Two columns of suggestions. Left = "what Oasis can do for you in one shot",
   // right = "what Oasis can run for you in the background" (missions).
   const oneShot: Array<{ label: string; prompt: string }> = [
@@ -73,6 +81,24 @@ export function EmptyChatHints({ onPick, hasMissions }: Props) {
           violet
         />
       </div>
+
+      {showTemplates ? (
+        <MissionTemplateGallery
+          onPick={onPick}
+          projectId={projectId}
+          sessionId={sessionId}
+          onCreated={onMissionCreated}
+          onClose={() => setShowTemplates(false)}
+        />
+      ) : (
+        <button
+          type="button"
+          onClick={() => setShowTemplates(true)}
+          className="flex items-center gap-1.5 rounded-md border border-violet-900/40 px-3 py-1.5 text-[12px] text-violet-300 hover:text-violet-100 hover:bg-violet-950/30"
+        >
+          <LayoutGrid className="w-3.5 h-3.5" /> Browse {MISSION_TEMPLATES.length} mission templates
+        </button>
+      )}
 
       <p className="text-[10px] text-slate-600 max-w-md text-center leading-relaxed">
         Missions run on a cron schedule, post digest cards back to this chat, and you can pause / resume / delete them inline. Ask the chat normally and {BRAND_SHORT_NAME} will turn your goal into a mission for you — no separate UI needed.

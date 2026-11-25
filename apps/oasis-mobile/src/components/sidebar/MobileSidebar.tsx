@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'framer-motion';
-import { X, QrCode, MessageSquare, Unplug, FolderOpen, Check, Loader2, Clock, Plus, FileStack, FileText, FileAudio, FileImage, Search, ChevronDown, Monitor } from 'lucide-react';
+import { X, QrCode, MessageSquare, Unplug, FolderOpen, Check, Loader2, Clock, Plus, FileStack, FileText, FileAudio, FileImage, Search, ChevronDown, Monitor, Bell, BellOff } from 'lucide-react';
+import type { PushState } from '../../hooks/usePushNotifications';
 import type { ProjectConfig, ChatSession } from '../../lib/types';
 
 interface ProjectInfo {
@@ -36,6 +37,7 @@ interface MobileSidebarProps {
   onSessionSelect: (session: ChatSession) => void;
   onNewChat: () => void;
   onOpenComputerUse?: () => void;
+  push?: PushState & { toggle: () => void; test: () => void };
 }
 
 export function MobileSidebar({
@@ -52,6 +54,7 @@ export function MobileSidebar({
   onSessionSelect,
   onNewChat,
   onOpenComputerUse,
+  push,
 }: MobileSidebarProps) {
   const [projects, setProjects] = useState<ProjectInfo[]>([]);
   const [sessions, setSessions] = useState<ChatSession[]>([]);
@@ -405,6 +408,35 @@ export function MobileSidebar({
             {/* Footer */}
             {paired && (
               <div className="px-3 py-4 border-t border-slate-800">
+                {push?.supported && (
+                  <div className="mb-2 px-3 py-2">
+                    <div className="flex items-center gap-3">
+                      {push.enabled ? <Bell className="w-5 h-5 text-cyan-400" /> : <BellOff className="w-5 h-5 text-slate-500" />}
+                      <div className="flex-1 min-w-0">
+                        <p className="text-sm text-slate-200">Mission notifications</p>
+                        <p className="text-[11px] text-slate-500">
+                          {push.available ? 'Get notified when a mission run finishes' : 'Not set up on the desktop'}
+                        </p>
+                      </div>
+                      <button
+                        role="switch"
+                        aria-checked={push.enabled}
+                        aria-label="Mission notifications"
+                        disabled={push.busy || (!push.available && !push.enabled)}
+                        onClick={push.toggle}
+                        className={`relative w-10 h-6 rounded-full transition-colors disabled:opacity-40 ${push.enabled ? 'bg-cyan-600' : 'bg-slate-700'}`}
+                      >
+                        <span className={`absolute top-0.5 w-5 h-5 rounded-full bg-white transition-all ${push.enabled ? 'left-[18px]' : 'left-0.5'}`} />
+                      </button>
+                    </div>
+                    {push.enabled && (
+                      <button onClick={push.test} className="mt-1 ml-8 text-[11px] text-slate-400 underline underline-offset-2 hover:text-slate-200">
+                        Send a test notification
+                      </button>
+                    )}
+                    {push.error && <p className="mt-1 ml-8 text-[11px] text-red-400">{push.error}</p>}
+                  </div>
+                )}
                 <button
                   onClick={() => { onDisconnect(); onClose(); }}
                   className="flex items-center gap-3 px-3 py-2.5 rounded-lg text-left text-sm text-red-400 hover:bg-red-900/20 w-full transition-colors"

@@ -98,6 +98,9 @@ export function usePairing() {
         return;
       }
 
+      // Offline says nothing about the desktop session: don't count it against the pairing.
+      if (navigator.onLine === false) return;
+
       const isValid = await verifySession(pairing.tunnelUrl!);
       if (isValid) {
         // Reset failure counter on success

@@ -14,6 +14,8 @@ const ACTIVE_SESSION_STALE_AFTER_MS = 30 * 60 * 1000;
 
 export interface OasisEvent {
   event_id: string;
+  /** The Redis stream entry id: a cursor a reader can resume after. */
+  stream_id?: string;
   event_type: string;
   session_id: string;
   project_id?: string;
@@ -58,6 +60,14 @@ export class RedisEventService implements OnModuleDestroy {
     }
   }
 
+  private readonly listeners = new Set<(event: OasisEvent) => void>();
+
+  /** Calls `listener` with every event this gateway publishes (in-process); returns the unsubscribe. */
+  onEvent(listener: (event: OasisEvent) => void): () => void {
+    this.listeners.add(listener);
+    return () => this.listeners.delete(listener);
+  }
+
   async publish(eventType: string, sessionId: string, payload: Record<string, any>): Promise<void> {
     const projectId = this.projectContext.get()?.project_id || payload.project_id;
     const event: OasisEvent = {
@@ -71,6 +81,9 @@ export class RedisEventService implements OnModuleDestroy {
     };
 
     this.logger.debug(`Event: ${eventType} (session=${sessionId})`);
+    for (const listener of this.listeners) {
+      try { listener(event); } catch { /* a subscriber never breaks publishing */ }
+    }
 
     // Track per-session active state so other tabs can show a "🟢 working" dot.
     // Boundary events only — InteractionReceived starts, ResponseGenerated /
@@ -173,15 +186,27 @@ export class RedisEventService implements OnModuleDestroy {
     }
   }
 
-  async getBacklog(sessionId: string, limit: number = 50): Promise<OasisEvent[]> {
+  /** The newest entry id in the event stream ('0-0' when empty or Redis is down): a cursor to resume after. */
+  async latestStreamId(): Promise<string> {
+    if (!this.redis || !(await this.ensureRedisReady())) return '0-0';
+    try {
+      const rows = await this.redis.xrevrange(STREAM_KEY, '+', '-', 'COUNT', 1);
+      return rows[0]?.[0] || '0-0';
+    } catch {
+      return '0-0';
+    }
+  }
+
+  /** The session's latest events up to `upperId` (inclusive), oldest first, each with its stream_id. */
+  async getBacklog(sessionId: string, limit: number = 50, upperId: string = '+'): Promise<OasisEvent[]> {
     const r = this.redis;
     if (!r || !(await this.ensureRedisReady())) return [];
     // Fetch more than needed since we filter by session_id after parsing.
     const fetchCount = Math.min(Math.max(limit, 1) * 4, MAX_BACKLOG_EVENTS * 2);
     try {
-      const rows = await r.xrevrange(STREAM_KEY, '+', '-', 'COUNT', fetchCount);
+      const rows = await r.xrevrange(STREAM_KEY, upperId, '-', 'COUNT', fetchCount);
       const events = rows
-        .map(([_id, fields]) => this._parseStreamFields(fields))
+        .map(([id, fields]): OasisEvent | null => { const e = this._parseStreamFields(fields); return e ? { ...e, stream_id: id } : null; })
         .filter((e): e is OasisEvent => e !== null && e.session_id === sessionId)
         .reverse();
       // Return at most `limit` events.

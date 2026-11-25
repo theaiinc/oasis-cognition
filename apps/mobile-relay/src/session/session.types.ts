@@ -11,6 +11,8 @@ export interface MobilePairingSession {
   mobileSessionId: string;
   screenShareGranted: boolean;
   lastToolRequest: ToolRequestInfo | null;
+  /** The paired phone's push registration on the gateway, removed when the pairing ends. */
+  pushDeviceId?: string | null;
 }
 
 export interface ToolRequestInfo {

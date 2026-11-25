@@ -41,6 +41,14 @@ const sessionService = new SessionService();
 const pairingService = new PairingService(sessionService);
 const relayService = new RelayService(sessionService);
 
+// A phone that is no longer paired gets no more push notifications.
+sessionService.onSessionEnded(({ pushDeviceId }) => {
+  if (!pushDeviceId) return;
+  relayService.unregisterPush(pushDeviceId).catch((err) =>
+    console.warn('[MobileRelay] Could not remove push registration:', err.message),
+  );
+});
+
 // API routes
 app.use('/pair', createPairingRouter(pairingService));
 app.use('/relay', createRelayRouter(relayService));
@@ -55,7 +63,7 @@ app.get('/health', (_req, res) => {
 });
 
 // SW and manifest must not be cached — they control updates
-app.get(['/sw.js', '/workbox-*.js', '/registerSW.js', '/manifest.webmanifest'], (_req, res, next) => {
+app.get(['/sw.js', '/push-sw.js', '/workbox-*.js', '/registerSW.js', '/manifest.webmanifest'], (_req, res, next) => {
   res.setHeader('Cache-Control', 'no-cache, no-store, must-revalidate');
   res.setHeader('Pragma', 'no-cache');
   res.setHeader('Expires', '0');

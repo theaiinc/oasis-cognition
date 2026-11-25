@@ -12,6 +12,8 @@ import { AgentProfilesService } from '../agent-profiles/agent-profiles.service';
 import { ProjectRolesService } from '../project-roles/project-roles.service';
 import { lookupVariant } from '../models/model-variants';
 import { ProjectContextService } from '../context/project-context.service';
+import { DEFAULT_APPROVAL_TIMEOUT_MS, GATED_TOOLS, editApprovalGate, editPreview, verdictOutput, type GateVerdict } from './edit-approval';
+import { discoverChecks, MAX_SELF_VALIDATION_NUDGES, selfValidationGate, selfValidationNote, selfValidationState } from './self-validation';
 
 export interface InteractionRequest {
   user_message: string;
@@ -2722,6 +2724,34 @@ export class InteractionService {
     let observerFeedback: string | null = null;
     let validatedThoughts: any[] = [];
     const wallsHit: string[] = [];
+    // Times this turn was sent back to exercise its source edits before ending (self-validation.ts).
+    let selfValidationNudges = 0;
+    /** The send-back when this turn changed source files and nothing since shows the change works; null to let it end. */
+    const selfValidationHold = async (stepsLeft: number): Promise<string | null> => {
+      if (req.context?.chat_channel || !req.context?.project_path) return null;
+      const worktreeId = this._getSessionWorktreeId(sessionId) || undefined;
+      const state = selfValidationState(toolResults as any, worktreeId);
+      const gate = selfValidationGate(state, selfValidationNudges, stepsLeft);
+      if (!gate.hold) {
+        if (gate.why === 'bound' || gate.why === 'no-room') this.logger.warn(`Self-validation: ending with the change not exercised (${state.status}, ${gate.why})`);
+        return null;
+      }
+      const checks = await discoverChecks(async (path) => {
+        try {
+          const res = await axios.get(`${DEV_AGENT_URL}/internal/dev-agent/file/read`, {
+            params: { path, ...(worktreeId ? { worktree_id: worktreeId } : {}) },
+            timeout: 5_000,
+          });
+          if (res.data?.success) return String(res.data.content ?? '');
+          return res.data?.error === 'binary' ? '' : null;
+        } catch {
+          return null;
+        }
+      }, state.edited).catch(() => []);
+      selfValidationNudges++;
+      this.logger.warn(`Self-validation: source edits not exercised (${state.status}) — sending the turn back (${selfValidationNudges}/${MAX_SELF_VALIDATION_NUDGES})`);
+      return selfValidationNote(state, checks, selfValidationNudges);
+    };
     let consecutiveFailures = 0;
     let consecutiveDuplicates = 0;
     let teachingForced = false;
@@ -3590,6 +3620,16 @@ export class InteractionService {
             validated_thoughts: validatedThoughts.length > 0 ? validatedThoughts : undefined,
             proposed_final_answer: plan.answer || undefined,
           }, undefined, { timeout: OBSERVER_VALIDATE_TIMEOUT_MS });
+          // A coding turn that changed source files has run something that exercises the change (self-validation.ts).
+          if (obsRes.data.goal_met) {
+            const note = await selfValidationHold(maxIterations - iteration);
+            if (note) {
+              observerFeedback = note;
+              toolResults.push({ tool: '_system', success: true, blocked: false, output: note, reasoning: 'System: exercise the change' } as any);
+              updateThoughtsOnlyStreak();
+              continue;
+            }
+          }
           if (obsRes.data.goal_met) {
             // Gateway-side punt guard: even if observer says goal_met, reject if the agent
             // is punting an implementation task to the user without making any code changes.
@@ -4910,6 +4950,40 @@ export class InteractionService {
             }
           }
 
+          // ── Per-edit approval (opt-in per chat, edit-approval.ts) ──
+          // With "Review edits" on, the change waits here for the user's approve/reject; off, nothing changes.
+          let approvedNote = '';
+          if (GATED_TOOLS.has(execPayload.tool) && isDevAgentTool && (await editApprovalGate().enabledFor(sessionId))) {
+            const gateTool = execPayload.tool as 'edit_file' | 'write_file';
+            const gatePath = String(execPayload.path || path || '');
+            const preview = editPreview(gateTool, execPayload);
+            const timeoutMs = DEFAULT_APPROVAL_TIMEOUT_MS;
+            const verdict: GateVerdict = await editApprovalGate().request({
+              sessionId, tool: gateTool, path: gatePath, diff: preview.diff, truncated: preview.truncated,
+              reasoning: plan.reasoning || undefined, interactionId, clientMessageId,
+            }, {
+              timeoutMs, signal, isAborted,
+              publish: (type, payload) => this.events.publish(type, sessionId, payload),
+            });
+            this.logger.log(`Edit approval for ${gateTool} ${gatePath}: ${verdict.outcome}`);
+            if (verdict.outcome !== 'approved') {
+              const output = verdictOutput(gateTool, gatePath, verdict, timeoutMs);
+              toolResults.push({
+                tool: toolName, path: gatePath || undefined, success: false, blocked: true,
+                output, reasoning: plan.reasoning || '',
+              } as any);
+              await this.events.publish('ToolCallCompleted', sessionId, {
+                tool: toolName, success: false, output, output_length: output.length, path: gatePath || undefined,
+                approval: verdict.outcome,
+                iteration: iteration + 1, step_index: activeStepIndex, plan_revision: planRevision,
+                interaction_id: interactionId, client_message_id: clientMessageId,
+              });
+              updateThoughtsOnlyStreak();
+              continue;
+            }
+            approvedNote = `${verdictOutput(gateTool, gatePath, verdict, timeoutMs)} `;
+          }
+
           const execTimeoutMs =
             toolName === 'bash' ? 600_000 : toolName === 'apply_patch' ? 180_000 : 45_000;
           let execRes = await axiosWithRetry('post', targetUrl, execPayload, undefined, { timeout: execTimeoutMs });
@@ -4955,6 +5029,9 @@ export class InteractionService {
               this.logger.error(`Worktree auto-recovery failed: ${recoverErr.message}`);
             }
           }
+
+          // The agent is told its change was approved, then the edit's own result.
+          if (approvedNote && result && typeof result === 'object') result.output = `${approvedNote}${result.output || ''}`;
 
           if (result.blocked) {
             await this.events.publish('ToolCallBlocked', sessionId, {
@@ -5297,6 +5374,16 @@ export class InteractionService {
             }
           } catch {
             // best-effort
+          }
+        }
+        // ...and the change it made has been exercised (self-validation.ts).
+        if (obsRes.data.goal_met) {
+          const note = await selfValidationHold(maxIterations - iteration);
+          if (note) {
+            observerFeedback = note;
+            toolResults.push({ tool: '_system', success: true, blocked: false, output: note, reasoning: 'System: exercise the change' } as any);
+            updateThoughtsOnlyStreak();
+            continue;
           }
         }
         if (obsRes.data.goal_met) {

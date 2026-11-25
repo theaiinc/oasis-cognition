@@ -42,6 +42,8 @@ import { MobilePairingPanel } from '@/components/mobile/MobilePairingPanel';
 import { useVoiceConnection } from '@/hooks/useVoiceConnection';
 import { TokenUsageDonut } from '@/components/chat/TokenUsageDonut';
 import { BRAND_SHORT_NAME } from '@/lib/brand';
+import { EditApprovalBar, ReviewEditsChip } from '@/components/chat/EditApprovalBar';
+import { useEditApproval } from '@/hooks/useEditApproval';
 
 function isUserAbort(e: unknown): boolean {
   if (axios.isAxiosError(e) && e.code === 'ERR_CANCELED') return true;
@@ -68,6 +70,9 @@ export default function App() {
     return id;
   });
   const [timelineByClientMessageId, setTimelineByClientMessageId] = useState<Record<string, TimelineEvent[]>>({});
+  // The chat's per-edit approvals ("Review edits"), live from the timeline stream below.
+  const editApproval = useEditApproval(textSessionId);
+  const { applyEvent: applyApprovalEvent } = editApproval;
   const [liveReasoningByClientId, setLiveReasoningByClientId] = useState<Record<string, string>>({});
   const [selectedTimelineMessageId, setSelectedTimelineMessageId] = useState<string | null>(null);
   const [activeClientMessageId, setActiveClientMessageId] = useState<string | null>(null);
@@ -858,6 +863,10 @@ export default function App() {
     es.onmessage = (evt) => {
       try {
         const data = JSON.parse(evt.data) as TimelineEvent;
+        if (data.event_type === 'EditApprovalRequested' || data.event_type === 'EditApprovalResolved') {
+          applyApprovalEvent(data);
+          return;
+        }
 
         // ── Mission lifecycle events (created / updated / deleted / paused / resumed):
         //    refresh the active-missions bar from the canonical list. Optimistic
@@ -1598,6 +1607,9 @@ export default function App() {
               {messages.filter((m) => m.sender === 'user' || m.sender === 'assistant').length === 0 && !voice.micEnabled && (
                 <EmptyChatHints
                   hasMissions={Object.keys(missionsById).length > 0}
+                  projectId={activeProjectId}
+                  sessionId={textSessionId}
+                  onMissionCreated={() => { void reloadMissions(); }}
                   onPick={(prompt) => { setInputText(prompt); inputRef.current?.focus(); }}
                 />
               )}
@@ -1651,6 +1663,7 @@ export default function App() {
             )}
           </AnimatePresence>
 
+          <EditApprovalBar pending={editApproval.pending} onDecide={editApproval.decide} />
           <ChatInputArea
             inputText={inputText}
             setInputText={setInputText}
@@ -1664,11 +1677,16 @@ export default function App() {
             onFileAdd={(files) => quickUpload.addFiles(files, activeProjectId)}
             onFileRemove={quickUpload.removeFile}
             topToolbar={
-              <RolePicker
-                activeProjectId={activeProjectId}
-                value={activeRoleId}
-                onChange={setActiveRoleId}
-              />
+              <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
+                {editApproval.available && (
+                  <ReviewEditsChip on={editApproval.enabled} onToggle={() => void editApproval.setEnabled(!editApproval.enabled)} />
+                )}
+                <RolePicker
+                  activeProjectId={activeProjectId}
+                  value={activeRoleId}
+                  onChange={setActiveRoleId}
+                />
+              </div>
             }
           >
             <motion.div initial={{ opacity: 0, height: 0 }} animate={{ opacity: 1, height: 'auto' }} exit={{ opacity: 0, height: 0 }} className="mb-4 rounded-2xl bg-slate-900/50 border border-slate-800 overflow-hidden">

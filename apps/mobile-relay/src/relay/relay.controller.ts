@@ -3,11 +3,13 @@ import axios from 'axios';
 import { RelayService, RelayError } from './relay.service';
 import { EncryptedPayload } from '../crypto/crypto.types';
 
-export function createRelayRouter(relayService: RelayService): Router {
+export function createRelayRouter(relayService: RelayService, keepAliveMs = 15_000): Router {
   const router = Router();
 
-  /** Mobile sends an encrypted chat message. */
+  /** Mobile sends an encrypted chat message (or resends one to resume its stream). */
   router.post('/interaction', async (req: Request, res: Response) => {
+    let keepAlive: ReturnType<typeof setInterval> | null = null;
+    const stop = new AbortController();
     try {
       const payload = req.body as EncryptedPayload;
       if (!payload.pid || !payload.iv || !payload.ct || !payload.tag) {
@@ -24,25 +26,85 @@ export function createRelayRouter(relayService: RelayService): Router {
       res.status(200);
       res.flushHeaders();
 
+      // The phone went away (network drop, app closed): stop following the turn.
+      // It keeps running on the desktop and the phone can resume it.
+      res.on('close', () => { if (!res.writableEnded) stop.abort(); });
+
+      const write = (encrypted: EncryptedPayload) => {
+        if (!res.writableEnded && !res.destroyed) res.write(JSON.stringify(encrypted) + '\n');
+      };
+      // A quiet turn (long thinking, a slow tool) sends nothing for minutes, and
+      // the tunnel drops connections idle for ~100 s. Keep-alives hold it open and
+      // tell the phone the stream is alive.
+      keepAlive = setInterval(() => {
+        try {
+          write(relayService.encryptResponse(JSON.stringify({ _oasis_keepalive: true }), payload.pid));
+        } catch { /* session ended; the stream ends below */ }
+      }, keepAliveMs);
+
       await relayService.streamInteraction(
         decryptedBody,
         payload.pid,
         session!.mobileSessionId,
-        (encrypted: EncryptedPayload) => {
-          if (!res.writableEnded) {
-            res.write(JSON.stringify(encrypted) + '\n');
-          }
-        },
+        write,
         () => {
-          if (!res.writableEnded) {
-            res.end();
-          }
+          if (!res.writableEnded) res.end();
         },
+        stop.signal,
       );
     } catch (err: any) {
-      handleRelayError(err, res);
+      if (res.headersSent) {
+        // Too late for a status code; end the stream so the phone isn't left waiting.
+        console.error('[Relay] Interaction stream failed:', err?.message || err);
+        if (!res.writableEnded) res.end();
+      } else {
+        handleRelayError(err, res);
+      }
+    } finally {
+      if (keepAlive) clearInterval(keepAlive);
     }
   });
+
+  // ── Push notifications ─────────────────────────────────────────────────
+  // Registering needs the encrypted channel, so only the paired phone can add
+  // or remove a device; the public key itself is not secret.
+
+  router.get('/push/config', async (_req: Request, res: Response) => {
+    try {
+      res.json(await relayService.getPushConfig());
+    } catch {
+      res.json({ enabled: false, public_key: null });
+    }
+  });
+
+  for (const action of ['subscribe', 'unsubscribe', 'test'] as const) {
+    router.post(`/push/${action}`, async (req: Request, res: Response) => {
+      try {
+        const payload = req.body as EncryptedPayload;
+        if (!payload?.pid || !payload.iv || !payload.ct || !payload.tag) {
+          res.status(400).json({ error: 'Invalid encrypted payload' });
+          return;
+        }
+        const { body } = relayService.decryptRequest(payload);
+        const deviceId = body?.device_id;
+        if (typeof deviceId !== 'string' || !/^[A-Za-z0-9_-]{8,64}$/.test(deviceId)) {
+          res.status(400).json({ error: 'device_id is invalid' });
+          return;
+        }
+        if (action === 'subscribe') await relayService.registerPush(deviceId, body.subscription);
+        else if (action === 'unsubscribe') await relayService.unregisterPush(deviceId);
+        else await relayService.testPush(deviceId);
+        res.json({ ok: true });
+      } catch (err: any) {
+        if (err?.response?.status) {
+          const data = err.response.data || {};
+          res.status(err.response.status).json({ error: data.message || data.error || 'push_failed' });
+          return;
+        }
+        handleRelayError(err, res);
+      }
+    });
+  }
 
   /** Mobile fetches encrypted session list. */
   router.get('/history/sessions', async (req: Request, res: Response) => {
